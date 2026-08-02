@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
@@ -52,22 +52,50 @@ pub async fn run(
     .await
 }
 
-/// Re-register the workspace's Caddy routes from its declared `forwardPorts`.
+/// Re-register the workspace's Caddy routes when reusing an existing container.
 ///
 /// `dev down` deletes the project's Caddy fragment unconditionally, but the
-/// container-reuse branches of `dev up` (start-existing / already-running)
-/// return before the create path's registration, so a plain `down` → `up`
-/// otherwise leaves the container running with no `.test` routes (issue #52).
-/// Calling this in those branches makes `up` self-healing. Registration mirrors
-/// the create path: no-op when no ports are declared, and a failed Caddy reload
-/// warns rather than failing `dev up`.
+/// start-existing branch of `dev up` returns before the create path's
+/// registration, so a plain `down` → `up` otherwise leaves the container
+/// running with no `.test` routes (issue #52). Calling this on restart makes
+/// `up` self-healing.
+///
+/// The route set is the union of the declared `forwardPorts` and any live
+/// `dev forward` entries — deduped by host port, with the live entry winning so
+/// its custom name / keepalive survive the rewrite. `register_site` overwrites
+/// the whole fragment (`caddy.rs`), so registering declared ports alone would
+/// silently drop ad-hoc forwards; merging restores them too (issue #53).
+/// No-op when nothing is forwarded, and a failed Caddy reload warns rather than
+/// failing `dev up`.
 fn register_caddy_routes(workspace: &Path, config: &DevcontainerConfig) {
-    let ports = caddy_ports_from_config(config);
+    let declared = caddy_ports_from_config(config);
+    let active = crate::commands::forward::active_entries_for_workspace(workspace);
+    let ports = merge_caddy_ports(declared, active);
     if !ports.is_empty()
         && let Err(e) = crate::caddy::register_site(workspace, &ports)
     {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
+}
+
+/// Union of declared and live Caddy port entries, deduped by host port.
+///
+/// The live entry wins on conflict because it carries the custom name /
+/// keepalive that `dev forward` persisted, which a declared-only entry lacks.
+/// Keyed by port in a `BTreeMap`, so the result is sorted by host port to match
+/// the ordering `dev forward` uses before `register_site`.
+fn merge_caddy_ports(
+    declared: Vec<crate::caddy::PortEntry>,
+    active: Vec<crate::caddy::PortEntry>,
+) -> Vec<crate::caddy::PortEntry> {
+    let mut by_port: BTreeMap<u16, crate::caddy::PortEntry> = BTreeMap::new();
+    for entry in declared {
+        by_port.insert(entry.port, entry);
+    }
+    for entry in active {
+        by_port.insert(entry.port, entry);
+    }
+    by_port.into_values().collect()
 }
 
 /// The Caddy port entries implied by a project's declared `forwardPorts`.
@@ -224,9 +252,6 @@ pub(crate) async fn run_with_runtime(
                     Some(&workspace_folder),
                 )
                 .await?;
-                // `down` may have torn down the Caddy fragment while the
-                // container kept running; restore it here (issue #52).
-                register_caddy_routes(workspace, &config);
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
@@ -457,14 +482,7 @@ pub(crate) async fn run_with_runtime(
     }
 
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
-    let caddy_host_ports: Vec<crate::caddy::PortEntry> = ports
-        .iter()
-        .map(|p| crate::caddy::PortEntry {
-            port: p.host,
-            custom_name: None,
-            keepalive: None,
-        })
-        .collect();
+    let caddy_host_ports = caddy_ports_from_config(&config);
 
     // Resolve the effective remote user from config or image metadata.
     let effective_user =
@@ -1377,14 +1395,7 @@ async fn run_compose(
         .collect();
 
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
-    let caddy_host_ports_compose: Vec<crate::caddy::PortEntry> = ports
-        .iter()
-        .map(|p| crate::caddy::PortEntry {
-            port: p.host,
-            custom_name: None,
-            keepalive: None,
-        })
-        .collect();
+    let caddy_host_ports_compose = caddy_ports_from_config(config);
 
     // 8. Labels + merged feature capabilities.
     let labels_list = workspace_labels(workspace, Some(config_path));
@@ -1709,8 +1720,8 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 mod tests {
     use super::{
         apply_cli_overrides, apply_run_args_capabilities, caddy_ports_from_config,
-        ensure_image_present, parse_mounts, parse_single_mount, project_declares_run_args,
-        reject_project_run_args_for_compose, substitute_mounts,
+        ensure_image_present, merge_caddy_ports, parse_mounts, parse_single_mount,
+        project_declares_run_args, reject_project_run_args_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
@@ -1805,6 +1816,58 @@ mod tests {
             serde_json::from_str(r#"{"image": "ubuntu:24.04"}"#).unwrap();
 
         assert!(caddy_ports_from_config(&config).is_empty());
+    }
+
+    #[test]
+    fn merge_caddy_ports_unions_and_sorts_disjoint_entries() {
+        // Declared port from config plus a live ad-hoc `dev forward` on a
+        // different port must both survive, sorted by host port.
+        let declared = vec![crate::caddy::PortEntry {
+            port: 3000,
+            custom_name: None,
+            keepalive: None,
+        }];
+        let active = vec![crate::caddy::PortEntry {
+            port: 8080,
+            custom_name: Some("admin.myapp.test".to_string()),
+            keepalive: None,
+        }];
+
+        let merged = merge_caddy_ports(declared, active);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].port, 3000);
+        assert_eq!(merged[1].port, 8080);
+        assert_eq!(merged[1].custom_name.as_deref(), Some("admin.myapp.test"));
+    }
+
+    #[test]
+    fn merge_caddy_ports_prefers_live_entry_on_conflict() {
+        // A declared port that also has a live forwarder must keep the live
+        // entry's custom name / keepalive rather than the declared-only nulls —
+        // this is the regression the reuse path would otherwise cause.
+        let declared = vec![crate::caddy::PortEntry {
+            port: 3000,
+            custom_name: None,
+            keepalive: None,
+        }];
+        let active = vec![crate::caddy::PortEntry {
+            port: 3000,
+            custom_name: Some("web.myapp.test".to_string()),
+            keepalive: Some("30s".to_string()),
+        }];
+
+        let merged = merge_caddy_ports(declared, active);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].port, 3000);
+        assert_eq!(merged[0].custom_name.as_deref(), Some("web.myapp.test"));
+        assert_eq!(merged[0].keepalive.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn merge_caddy_ports_empty_when_nothing_declared_or_active() {
+        assert!(merge_caddy_ports(vec![], vec![]).is_empty());
     }
 
     #[test]
