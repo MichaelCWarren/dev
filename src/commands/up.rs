@@ -52,6 +52,43 @@ pub async fn run(
     .await
 }
 
+/// Re-register the workspace's Caddy routes from its declared `forwardPorts`.
+///
+/// `dev down` deletes the project's Caddy fragment unconditionally, but the
+/// container-reuse branches of `dev up` (start-existing / already-running)
+/// return before the create path's registration, so a plain `down` → `up`
+/// otherwise leaves the container running with no `.test` routes (issue #52).
+/// Calling this in those branches makes `up` self-healing. Registration mirrors
+/// the create path: no-op when no ports are declared, and a failed Caddy reload
+/// warns rather than failing `dev up`.
+fn register_caddy_routes(workspace: &Path, config: &DevcontainerConfig) {
+    let ports = caddy_ports_from_config(config);
+    if !ports.is_empty()
+        && let Err(e) = crate::caddy::register_site(workspace, &ports)
+    {
+        eprintln!("Warning: Caddy setup failed: {e}");
+    }
+}
+
+/// The Caddy port entries implied by a project's declared `forwardPorts`.
+///
+/// Empty when nothing is forwarded, which makes registration a no-op. Kept
+/// separate from [`register_caddy_routes`] so the mapping is unit-testable
+/// without the filesystem/Caddy side effects of `register_site`.
+fn caddy_ports_from_config(config: &DevcontainerConfig) -> Vec<crate::caddy::PortEntry> {
+    config
+        .forward_ports
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| crate::caddy::PortEntry {
+            port: p.host,
+            custom_name: None,
+            keepalive: None,
+        })
+        .collect()
+}
+
 /// `dev up` body once the runtime has been selected.
 ///
 /// Split from [`run`] so the create/start/readiness flow can be driven with a
@@ -187,6 +224,9 @@ pub(crate) async fn run_with_runtime(
                     Some(&workspace_folder),
                 )
                 .await?;
+                // `down` may have torn down the Caddy fragment while the
+                // container kept running; restore it here (issue #52).
+                register_caddy_routes(workspace, &config);
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
@@ -218,6 +258,9 @@ pub(crate) async fn run_with_runtime(
                     )
                     .await?;
                 }
+                // A plain `dev down` deletes the Caddy fragment but leaves the
+                // container stopped, so restore the routes on restart (issue #52).
+                register_caddy_routes(workspace, &config);
                 println!("Container '{}' started.", container.name);
                 return Ok(());
             }
@@ -1665,9 +1708,9 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, apply_run_args_capabilities, ensure_image_present, parse_mounts,
-        parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
-        substitute_mounts,
+        apply_cli_overrides, apply_run_args_capabilities, caddy_ports_from_config,
+        ensure_image_present, parse_mounts, parse_single_mount, project_declares_run_args,
+        reject_project_run_args_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
@@ -1736,6 +1779,32 @@ mod tests {
         assert_eq!(ports[0].container, 90);
         assert_eq!(ports[1].host, 7070);
         assert_eq!(ports[1].container, 7070);
+    }
+
+    #[test]
+    fn caddy_ports_map_declared_forward_ports_by_host() {
+        // A stopped-container reuse `dev up` restores exactly these routes
+        // (issue #52), so the mapping must key on the host-side port.
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image": "ubuntu:24.04", "forwardPorts": ["9090:90", 7070]}"#)
+                .unwrap();
+
+        let ports = caddy_ports_from_config(&config);
+
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 9090);
+        assert_eq!(ports[1].port, 7070);
+        assert!(ports.iter().all(|p| p.custom_name.is_none()));
+    }
+
+    #[test]
+    fn caddy_ports_empty_without_forward_ports() {
+        // Empty means `register_caddy_routes` is a no-op — a project with no
+        // forwarded ports must not touch Caddy on reuse.
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image": "ubuntu:24.04"}"#).unwrap();
+
+        assert!(caddy_ports_from_config(&config).is_empty());
     }
 
     #[test]
