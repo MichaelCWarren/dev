@@ -39,6 +39,8 @@ const MARKER_PREFIX: &str = "/tmp/.dev-session-";
 pub enum SessionKind {
     /// An interactive `dev shell`.
     Shell,
+    /// A one-off command run by `dev exec`.
+    Exec,
     /// One connection's netcat relay, started by `dev forward`.
     Forward,
 }
@@ -47,6 +49,7 @@ impl SessionKind {
     fn as_str(self) -> &'static str {
         match self {
             SessionKind::Shell => "shell",
+            SessionKind::Exec => "exec",
             SessionKind::Forward => "forward",
         }
     }
@@ -54,6 +57,7 @@ impl SessionKind {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "shell" => Some(SessionKind::Shell),
+            "exec" => Some(SessionKind::Exec),
             "forward" => Some(SessionKind::Forward),
             _ => None,
         }
@@ -148,6 +152,28 @@ pub fn register_script(kind: SessionKind, host: &HostIdentity) -> String {
         kind = kind.as_str(),
         tty = sanitize(&host.tty),
     )
+}
+
+/// Wrap a command so it records itself, then becomes that command.
+///
+/// The caller's words are passed to the shell as arguments and reached through
+/// `"$@"`, never pasted into the script — so a command holding spaces, quotes
+/// or `;` arrives exactly as it was written, with no quoting for this to get
+/// wrong. `exec` then replaces the shell, which keeps the recorded pid the
+/// command's own and leaves its exit status, signals and streams untouched.
+///
+/// Costs an image with `/bin/sh`. Callers that may run without one should be
+/// ready to fall back to the bare command, recording nothing.
+pub fn registered_command(cmd: &[String], kind: SessionKind, host: &HostIdentity) -> Vec<String> {
+    let register = register_script(kind, host);
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("{register}exec \"$@\""),
+        format!("dev-{}", kind.as_str()),
+    ];
+    wrapped.extend_from_slice(cmd);
+    wrapped
 }
 
 /// Remove a session's own marker on the way out.
