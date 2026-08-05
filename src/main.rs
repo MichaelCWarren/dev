@@ -6,6 +6,7 @@ mod devcontainer;
 mod error;
 mod oci;
 mod runtime;
+mod session;
 mod tui;
 mod util;
 
