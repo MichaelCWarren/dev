@@ -54,6 +54,15 @@ pub(crate) async fn run_with_runtime(
         None => format!("/workspaces/{}", workspace_folder_name(workspace)),
     };
 
+    // Collected here as well as in `dev shell`, so a container is tidied by
+    // whichever command reaches it first. The cost is one round trip when
+    // there is nothing to collect.
+    match session::sweep(runtime, &container.id, effective_user).await {
+        Ok(0) => {}
+        Ok(reaped) => eprintln!("dev: reaped {reaped} orphaned container session(s)"),
+        Err(e) => eprintln!("Warning: could not check for orphaned sessions: {e}"),
+    }
+
     let host = session::host_identity().await;
     let outcome =
         attend_command(runtime, &container.id, cmd, effective_user, &workdir, &host).await?;
@@ -251,8 +260,24 @@ mod tests {
             self
         }
 
+        /// The commands somebody asked for, without `dev`'s own bookkeeping.
         fn execs(&self) -> Vec<ExecCall> {
-            self.execs.lock().unwrap().clone()
+            self.execs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(cmd, _, _)| !crate::session::is_session_machinery(cmd))
+                .cloned()
+                .collect()
+        }
+
+        /// Whether this container was swept for orphaned sessions.
+        fn was_swept(&self) -> bool {
+            self.execs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(cmd, _, _)| crate::session::is_session_machinery(cmd))
         }
     }
 
@@ -427,10 +452,24 @@ mod tests {
         assert_eq!(execs[0].2.as_deref(), Some("/srv/app/packages/api"));
     }
 
+    /// Every `dev exec` collects this container's abandoned sessions, so a
+    /// container stays tidy for whoever reaches it first.
+    #[tokio::test]
+    async fn a_one_off_command_sweeps_before_it_runs() {
+        let (workspace, config_path) = workspace_with_config();
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
+            .await
+            .expect("dev exec should run the command");
+
+        assert!(runtime.was_swept());
+    }
+
     /// The command is recorded so that a `dev exec` whose client dies can be
     /// found and ended, rather than running on in the container forever.
     #[tokio::test]
-    async fn a_one_off_command_records_itself_before_becoming_the_command() {
+    async fn a_one_off_command_records_itself_and_clears_the_record() {
         let (workspace, config_path) = workspace_with_config();
         let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
 
@@ -441,11 +480,13 @@ mod tests {
         let cmd = &runtime.execs()[0].0;
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
-        assert!(cmd[2].contains("/tmp/.dev-session-$$"));
+        assert!(cmd[2].contains("> /tmp/.dev-session-$$"));
         assert!(cmd[2].contains("'exec'"), "recorded as an exec session");
-        // `exec` so the recorded pid stays the command's own, and the status,
-        // signals and streams remain the command's.
-        assert!(cmd[2].ends_with(r#"exec "$@""#));
+        // The record is cleared on the way out rather than left for whatever
+        // reads this container next, and the command's status still reports.
+        assert!(cmd[2].contains("\n\"$@\"\n"));
+        assert!(cmd[2].contains("rm -f /tmp/.dev-session-$$"));
+        assert!(cmd[2].ends_with("exit $__dev_rc"));
     }
 
     /// The caller's words reach the command as arguments, never as script text,

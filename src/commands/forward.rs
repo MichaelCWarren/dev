@@ -349,11 +349,7 @@ async fn run_forwarder(
     let runtime: Arc<dyn ContainerRuntime> = Arc::from(runtime);
 
     // Resolved once: every connection records the same forwarder.
-    let host = crate::session::host_identity().await;
-    let register = Arc::new(crate::session::register_script(
-        crate::session::SessionKind::Forward,
-        &host,
-    ));
+    let host = Arc::new(crate::session::host_identity().await);
 
     let accept_loop = async {
         loop {
@@ -363,7 +359,7 @@ async fn run_forwarder(
             let runtime = Arc::clone(&runtime);
             let container_id = container_id.clone();
             let nc_binary = nc_binary.clone();
-            let register = Arc::clone(&register);
+            let host = Arc::clone(&host);
 
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(
@@ -372,7 +368,7 @@ async fn run_forwarder(
                     &container_id,
                     container_port,
                     &nc_binary,
-                    &register,
+                    &host,
                 )
                 .await
                 {
@@ -424,11 +420,15 @@ async fn find_netcat(runtime: &dyn ContainerRuntime, container_id: &str) -> anyh
 /// so it can clear its own record — which matters here, where a busy forward
 /// would otherwise leave one file per connection behind. The relay's status is
 /// kept across the cleanup so a failing netcat still reports as one.
-fn relay_script(register: &str, nc_binary: &str, container_port: u16) -> String {
-    let unregister = crate::session::unregister_script();
-    format!(
-        "{register}{nc_binary} 127.0.0.1 {container_port}; \
-         __dev_rc=$?; {unregister}exit $__dev_rc"
+fn relay_script(
+    host: &crate::session::HostIdentity,
+    nc_binary: &str,
+    container_port: u16,
+) -> String {
+    crate::session::recorded_script(
+        &format!("{nc_binary} 127.0.0.1 {container_port}"),
+        crate::session::SessionKind::Forward,
+        host,
     )
 }
 
@@ -438,12 +438,12 @@ async fn handle_connection(
     container_id: &str,
     container_port: u16,
     nc_binary: &str,
-    register: &str,
+    host: &crate::session::HostIdentity,
 ) -> anyhow::Result<()> {
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
-        relay_script(register, nc_binary, container_port),
+        relay_script(host, nc_binary, container_port),
     ];
     let attached = runtime.exec_attached(container_id, &cmd, None).await?;
 
@@ -474,24 +474,21 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::relay_script;
-    use crate::session::{HostIdentity, SessionKind, register_script};
+    use crate::session::HostIdentity;
 
-    fn register() -> String {
-        register_script(
-            SessionKind::Forward,
-            &HostIdentity {
-                pid: 4131,
-                start: "Tue Aug  5 08:56:01 2026".to_string(),
-                tty: "-".to_string(),
-            },
-        )
+    fn host() -> HostIdentity {
+        HostIdentity {
+            pid: 4131,
+            start: "Tue Aug  5 08:56:01 2026".to_string(),
+            tty: "-".to_string(),
+        }
     }
 
     /// A relay records itself before connecting and clears the record after, so
     /// a long-running forward does not leave one file per connection behind.
     #[test]
     fn a_relay_records_itself_around_the_connection() {
-        let script = relay_script(&register(), "nc", 5432);
+        let script = relay_script(&host(), "nc", 5432);
         let recorded = script.find("> /tmp/.dev-session-$$").expect("recorded");
         let connected = script.find("nc 127.0.0.1 5432").expect("connected");
         let cleared = script.find("rm -f /tmp/.dev-session-$$").expect("cleared");
@@ -502,8 +499,8 @@ mod tests {
     /// must not stand in for it.
     #[test]
     fn a_relay_still_reports_its_own_status() {
-        let script = relay_script(&register(), "nc", 5432);
-        assert!(script.contains("__dev_rc=$?;"));
+        let script = relay_script(&host(), "nc", 5432);
+        assert!(script.contains("__dev_rc=$?"));
         assert!(script.ends_with("exit $__dev_rc"));
     }
 }

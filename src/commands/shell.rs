@@ -132,9 +132,16 @@ async fn attend_session(
 
     let mut exec = runtime.exec_interactive(container_id, cmd, user, Some(workdir));
     let signalled = tokio::select! {
-        // A session that ended on its own has nothing left to hang up, and its
-        // record is cleared by the next read of this container.
-        exited = &mut exec => return Ok(exited?),
+        // A session that ended on its own has nothing left to hang up, but its
+        // record outlives it: the login shell `exec`s, so nothing of `dev`'s is
+        // left in the container to clear it. Doing that here rather than
+        // leaving it for the next read keeps a closed shell from showing up as
+        // an abandoned one in the meantime.
+        exited = &mut exec => {
+            let code = exited?;
+            session::release_own_sessions(runtime, container_id, user, host_pid).await;
+            return Ok(code);
+        }
         // Closing the terminal is the common case, and the one that leaves no
         // other trace: the tty's foreground group is hung up, `dev` included.
         _ = hangup.recv() => libc::SIGHUP,

@@ -2517,7 +2517,12 @@ mod tests {
             let refusals_left = self.exec_refusals_before_silence.clone();
             let execs = self.execs.clone();
             Box::pin(async move {
-                execs.lock().unwrap().push((cmd, user, workdir));
+                // Session bookkeeping is `dev`'s own traffic. Recording it here
+                // would make every count in these tests — of probes, of hooks —
+                // depend on how often sessions happen to be swept.
+                if !crate::session::is_session_machinery(&cmd) {
+                    execs.lock().unwrap().push((cmd, user, workdir));
+                }
                 // A real exec talks to a daemon, so it is Pending on its first
                 // poll. Answering synchronously would let this fake succeed
                 // inside a zero-length timeout that a real runtime could never
@@ -3906,10 +3911,13 @@ mod tests {
             4,
             "two transient probe failures, one successful probe, then the lifecycle hook"
         );
-        assert_eq!(
-            execs.last().map(|(cmd, _, _)| cmd.join(" ")),
-            Some("sh -c touch ready".to_string()),
-            "the lifecycle hook must not race ahead of the successful readiness probe"
+        let last = execs
+            .last()
+            .map(|(cmd, _, _)| cmd.join(" "))
+            .unwrap_or_default();
+        assert!(
+            last.starts_with("sh -c ") && last.contains("\ntouch ready\n"),
+            "the lifecycle hook must not race ahead of the successful readiness probe, got: {last}"
         );
     }
 

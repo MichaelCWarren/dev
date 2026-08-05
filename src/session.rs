@@ -33,6 +33,24 @@ use crate::runtime::ContainerRuntime;
 /// created and no ownership arrangement between users sharing a container.
 const MARKER_PREFIX: &str = "/tmp/.dev-session-";
 
+/// The `$0` every exec this module runs for its own bookkeeping carries.
+///
+/// Reading and reaping are `dev`'s own traffic, not the user's, and something
+/// has to be able to tell them apart from the commands they are about — a test
+/// counting what a container was asked to run, most of all.
+const MACHINERY_ARGV0: &str = "dev-session";
+
+/// Whether a command is this module's own bookkeeping rather than a command
+/// somebody asked for.
+///
+/// Only tests ask: a fake runtime records everything a container was told to
+/// run, and a test about probes or hooks should not have its counts move
+/// because sweeping happens to visit the same container.
+#[cfg(test)]
+pub fn is_session_machinery(cmd: &[String]) -> bool {
+    cmd.get(3).is_some_and(|arg| arg == MACHINERY_ARGV0)
+}
+
 /// What a marker's process is for, so a reap can be reported in the terms the
 /// user recognises and `dev status` can separate a shell from plumbing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +59,8 @@ pub enum SessionKind {
     Shell,
     /// A one-off command run by `dev exec`.
     Exec,
+    /// A lifecycle hook run by `dev up`.
+    Hook,
     /// One connection's netcat relay, started by `dev forward`.
     Forward,
 }
@@ -50,6 +70,7 @@ impl SessionKind {
         match self {
             SessionKind::Shell => "shell",
             SessionKind::Exec => "exec",
+            SessionKind::Hook => "hook",
             SessionKind::Forward => "forward",
         }
     }
@@ -58,6 +79,7 @@ impl SessionKind {
         match value {
             "shell" => Some(SessionKind::Shell),
             "exec" => Some(SessionKind::Exec),
+            "hook" => Some(SessionKind::Hook),
             "forward" => Some(SessionKind::Forward),
             _ => None,
         }
@@ -159,29 +181,43 @@ pub fn register_script(kind: SessionKind, host: &HostIdentity) -> String {
 /// The caller's words are passed to the shell as arguments and reached through
 /// `"$@"`, never pasted into the script — so a command holding spaces, quotes
 /// or `;` arrives exactly as it was written, with no quoting for this to get
-/// wrong. `exec` then replaces the shell, which keeps the recorded pid the
-/// command's own and leaves its exit status, signals and streams untouched.
+/// wrong.
 ///
 /// Costs an image with `/bin/sh`. Callers that may run without one should be
 /// ready to fall back to the bare command, recording nothing.
 pub fn registered_command(cmd: &[String], kind: SessionKind, host: &HostIdentity) -> Vec<String> {
-    let register = register_script(kind, host);
     let mut wrapped = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        format!("{register}exec \"$@\""),
+        recorded_script("\"$@\"", kind, host),
         format!("dev-{}", kind.as_str()),
     ];
     wrapped.extend_from_slice(cmd);
     wrapped
 }
 
-/// Remove a session's own marker on the way out.
+/// A script that records the session, runs `body`, and clears the record.
 ///
-/// A session that can run this is one that never `exec`s away, so it is the
-/// only kind that can clean up after itself. Anything else leaves its marker
-/// for a sweep to collect once its process is gone.
-pub fn unregister_script() -> String {
+/// The wrapper stays for the duration rather than `exec`ing the body, which is
+/// what lets it clean up after itself: a record that outlives its process is
+/// litter until something reads it, and the reads that would collect it can be
+/// hours apart. `dev shell` is the exception — the user's login shell has to
+/// *be* the process, so it `exec`s and leaves its record behind.
+///
+/// The body is given a line of its own. Joining with `;` would put the cleanup
+/// inside a trailing comment for any command that ends with one, and lifecycle
+/// hooks are written by hand.
+///
+/// The body's status is carried across the cleanup, so what the caller ran is
+/// still what reports.
+pub fn recorded_script(body: &str, kind: SessionKind, host: &HostIdentity) -> String {
+    let register = register_script(kind, host);
+    let unregister = unregister_script();
+    format!("{register}\n{body}\n__dev_rc=$?\n{unregister}exit $__dev_rc")
+}
+
+/// Remove a session's own marker on the way out.
+fn unregister_script() -> String {
     format!("rm -f {MARKER_PREFIX}$$ 2>/dev/null || :; ")
 }
 
@@ -195,8 +231,8 @@ pub fn unregister_script() -> String {
 /// be asked which records still mean something — which keeps `dev status` from
 /// showing a shell the user closed themselves as abandoned, and keeps a sweep
 /// from counting it as reaped.
-pub async fn read_markers(
-    runtime: &dyn ContainerRuntime,
+pub async fn read_markers<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
     container_id: &str,
     user: Option<&str>,
 ) -> Result<Vec<SessionMarker>, DevError> {
@@ -204,7 +240,12 @@ pub async fn read_markers(
         "for f in {MARKER_PREFIX}*; do [ -f \"$f\" ] || continue; \
          if [ -d \"/proc/${{f#{MARKER_PREFIX}}}\" ]; then cat \"$f\"; else rm -f \"$f\"; fi; done"
     );
-    let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+    let cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        script,
+        MACHINERY_ARGV0.to_string(),
+    ];
     let result = runtime.exec(container_id, &cmd, user, None).await?;
     Ok(parse_markers(&result.stdout))
 }
@@ -234,8 +275,8 @@ pub fn partition_by_liveness(
 /// Answers how many sessions were still running to be signalled — which is not
 /// the number asked about, since a marker can outlive its process and only the
 /// container can tell the difference.
-pub async fn kill_sessions(
-    runtime: &dyn ContainerRuntime,
+pub async fn kill_sessions<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
     container_id: &str,
     user: Option<&str>,
     sessions: &[SessionMarker],
@@ -248,7 +289,7 @@ pub async fn kill_sessions(
         "/bin/sh".to_string(),
         "-c".to_string(),
         KILL_SCRIPT.to_string(),
-        "dev-reap".to_string(),
+        MACHINERY_ARGV0.to_string(),
         if escalate { "1" } else { "0" }.to_string(),
     ];
     cmd.extend(sessions.iter().map(SessionMarker::target));
@@ -272,8 +313,8 @@ fn parse_reaped(stdout: &str) -> usize {
 /// Reap every session in this container whose client is gone.
 ///
 /// Returns how many were reaped, for the caller to report.
-pub async fn sweep(
-    runtime: &dyn ContainerRuntime,
+pub async fn sweep<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
     container_id: &str,
     user: Option<&str>,
 ) -> Result<usize, DevError> {
@@ -301,8 +342,8 @@ pub async fn sweep(
 ///
 /// Failure is not worth reporting: the process is on its way out, and a sweep
 /// collects whatever this missed.
-pub async fn release_own_sessions(
-    runtime: &dyn ContainerRuntime,
+pub async fn release_own_sessions<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
     container_id: &str,
     user: Option<&str>,
     host_pid: u32,
@@ -318,8 +359,8 @@ pub async fn release_own_sessions(
 }
 
 /// Pair every recorded session with whether its client is still running.
-pub async fn list_sessions(
-    runtime: &dyn ContainerRuntime,
+pub async fn list_sessions<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
     container_id: &str,
     user: Option<&str>,
 ) -> Result<Vec<(SessionMarker, bool)>, DevError> {
