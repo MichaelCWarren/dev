@@ -742,9 +742,17 @@ impl ReadinessPolls {
 
     /// What is left of the budget, for bounding an attempt rather than the gap
     /// between two of them.
+    ///
+    /// Never shorter than [`READINESS_MIN_ATTEMPT`]. Phases share one deadline,
+    /// so a phase can start with the budget an earlier one already spent: its
+    /// first attempt would then be handed a zero-length window and report the
+    /// runtime as unresponsive without ever having asked it. [`Self::wait`]
+    /// declines to grant *later* attempts that short, so this floor only ever
+    /// applies to a phase's first one.
     fn remaining(&self) -> std::time::Duration {
         self.deadline
             .saturating_duration_since(tokio::time::Instant::now())
+            .max(READINESS_MIN_ATTEMPT)
     }
 }
 
@@ -1525,40 +1533,13 @@ async fn verify_compose_service_ready(
     container_id: &str,
     remote_user: Option<&str>,
 ) -> anyhow::Result<()> {
-    let container_id = container_id.trim();
-    if container_id.is_empty() {
-        anyhow::bail!(
-            "Compose service '{service}' did not resolve to a target container id after \
-             compose up; `compose ps -q {service}` returned nothing."
-        );
-    }
-
     let deadline = tokio::time::Instant::now() + READINESS_BUDGET;
-    let inspected = tokio::time::timeout_at(deadline, runtime.inspect_container(container_id))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Compose service '{service}' container '{container_id}' could not be \
-                 inspected within {:.1}s after compose up.",
-                READINESS_BUDGET.as_secs_f64()
-            )
-        })?
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Compose service '{service}' container '{container_id}' could not be \
-                 inspected after compose up: {e}"
-            )
-        })?;
+    verify_compose_service_running(runtime, service, container_id, deadline).await?;
 
-    if inspected.state != ContainerState::Running {
-        anyhow::bail!(
-            "Compose service '{service}' container '{container_id}' is {:?}, not running. \
-             Check `compose logs {service}` for why the service exited before Dev could \
-             run workspace commands or lifecycle hooks.",
-            inspected.state
-        );
-    }
-
+    // The cause already names the container and how long its own phase waited,
+    // so this adds the Compose context the caller has and the cause does not.
+    // It deliberately does not claim a budget-length wait: the phases below
+    // fail for reasons other than running out of it.
     verify_container_usable_until(
         runtime,
         container_id,
@@ -1570,11 +1551,54 @@ async fn verify_compose_service_ready(
     .await
     .map_err(|e| {
         anyhow::anyhow!(
-            "Compose service '{service}' container '{container_id}' did not become usable \
-                 within {:.1}s after compose up: {e}",
-            READINESS_BUDGET.as_secs_f64()
+            "Compose service '{service}' did not become usable for workspace commands \
+             after compose up: {e}"
         )
     })
+}
+
+/// Wait for the resolved Compose service container to report itself running.
+///
+/// A state the runtime *answered with* is a verdict: Compose has already
+/// started the service, so a container it reports as not running has exited,
+/// and lifecycle hooks would fail the same way. That is worth failing on at
+/// once, with the service context needed to go read its logs.
+///
+/// An inspect that fails or does not answer is not a verdict — it is this
+/// gate's own window, where a daemon settling after `compose up` is most
+/// likely to blip — so it is retried on the shared schedule for the same
+/// reason [`verify_container_discoverable_until`] retries its list, and only
+/// reported once the budget is spent.
+async fn verify_compose_service_running(
+    runtime: &dyn ContainerRuntime,
+    service: &str,
+    container_id: &str,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    let mut polls = ReadinessPolls::until(deadline);
+    let mut last_error;
+
+    loop {
+        let window = polls.remaining();
+        match tokio::time::timeout(window, runtime.inspect_container(container_id)).await {
+            Ok(Ok(info)) if info.state == ContainerState::Running => return Ok(()),
+            Ok(Ok(info)) => anyhow::bail!(
+                "Compose service '{service}' container '{container_id}' is {:?}, not running. \
+                 Check `compose logs {service}` for why the service exited before Dev could \
+                 run workspace commands or lifecycle hooks.",
+                info.state
+            ),
+            Ok(Err(e)) => last_error = e.to_string(),
+            Err(_) => last_error = format!("it did not answer within {:.1}s", window.as_secs_f64()),
+        }
+
+        if !polls.wait().await {
+            anyhow::bail!(
+                "Compose service '{service}' container '{container_id}' could not be inspected \
+                 after compose up: {last_error}."
+            );
+        }
+    }
 }
 
 /// Substitute variables in each mount entry (string or object form) and emit
@@ -2180,6 +2204,9 @@ mod tests {
         /// Every list call hangs, standing in for a daemon that accepted the
         /// query and dropped its reply.
         list_never_answers: bool,
+        /// Number of inspect calls that fail before the runtime answers at
+        /// all, standing in for a daemon still settling after `compose up`.
+        inspect_errors_before_success: Arc<AtomicUsize>,
         /// `exec` errors, standing in for a container whose create → start →
         /// wait sequence never reports a command's exit.
         exec_fails: bool,
@@ -2221,6 +2248,7 @@ mod tests {
                 list_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 list_always_fails: false,
                 list_never_answers: false,
+                inspect_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 exec_fails: false,
                 exec_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 exec_command_missing: false,
@@ -2585,7 +2613,16 @@ mod tests {
         fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
             let id = id.to_string();
             let containers = self.containers.clone();
+            let errors_left = self.inspect_errors_before_success.clone();
             Box::pin(async move {
+                let transient = errors_left
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+                if transient {
+                    return Err(DevError::Runtime(
+                        "inspect_container failed (test-injected)".to_string(),
+                    ));
+                }
                 containers
                     .lock()
                     .unwrap()
@@ -3802,25 +3839,56 @@ mod tests {
         );
     }
 
-    /// If Compose reports no target container id after `up`, there is no
-    /// service container for lifecycle hooks or workspace commands to use.
+    /// An inspect that fails is this gate's own settling window, not a verdict
+    /// on the service: the daemon is most likely to blip in exactly the moment
+    /// after `compose up` that readiness polls. Retried like every other
+    /// runtime query here, so a healthy service is not failed on a blip.
     #[tokio::test(start_paused = true)]
-    async fn compose_readiness_fails_missing_target_service_promptly() {
+    async fn compose_readiness_retries_a_transient_inspect_failure() {
         let workspace = TempDir::new().unwrap();
-        let rt = UpFakeRuntime::ok();
+        let rt = UpFakeRuntime {
+            inspect_errors_before_success: Arc::new(AtomicUsize::new(3)),
+            ..UpFakeRuntime::ok()
+        }
+        .compose_target(workspace.path(), ContainerState::Running);
+
+        super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
+            .await
+            .expect("a blipping inspect must be retried, not treated as a failed service");
+    }
+
+    /// A runtime that never answers an inspect cannot be asked whether the
+    /// service is running, so readiness must spend its budget and then report
+    /// what the runtime last said — not hang, and not run hooks.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_fails_when_the_service_can_never_be_inspected() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime {
+            inspect_errors_before_success: Arc::new(AtomicUsize::new(usize::MAX)),
+            ..UpFakeRuntime::ok()
+        }
+        .compose_target(workspace.path(), ContainerState::Running);
         let started = tokio::time::Instant::now();
 
-        let err = super::verify_compose_service_ready(&rt, workspace.path(), "app", "", None)
-            .await
-            .expect_err("a missing Compose target service id must fail readiness");
+        let err =
+            super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
+                .await
+                .expect_err("an uninspectable Compose service must fail readiness");
         let msg = format!("{err}");
 
-        assert!(msg.contains("Compose service 'app'"), "{msg}");
-        assert!(msg.contains("container id"), "{msg}");
-        assert!(rt.execs().is_empty(), "missing service must not be probed");
         assert!(
-            tokio::time::Instant::now().duration_since(started) < super::READINESS_FIRST_POLL,
-            "missing service must not spend the readiness retry budget"
+            tokio::time::Instant::now().duration_since(started) <= super::READINESS_BUDGET,
+            "an uninspectable service must not outlive the readiness budget"
+        );
+        assert!(msg.contains("Compose service 'app'"), "{msg}");
+        assert!(msg.contains("could not be inspected"), "{msg}");
+        assert!(
+            msg.contains("inspect_container failed (test-injected)"),
+            "{msg}"
+        );
+        assert!(
+            rt.execs().is_empty(),
+            "a service that cannot be inspected must not be probed"
         );
     }
 
@@ -3876,9 +3944,13 @@ mod tests {
             elapsed <= super::READINESS_BUDGET,
             "readiness must not exceed the shared budget; elapsed {elapsed:?}"
         );
+        assert!(
+            elapsed >= super::READINESS_BUDGET - super::READINESS_MIN_ATTEMPT,
+            "both phases share one budget, so a run that fails in both must spend \
+             nearly all of it rather than stopping at one phase's share; elapsed {elapsed:?}"
+        );
         assert!(msg.contains("Compose service 'app'"), "{msg}");
         assert!(msg.contains("fake-id"), "{msg}");
-        assert!(msg.contains("15.0s"), "{msg}");
         assert!(
             msg.contains("did not report an exit") || msg.contains("exec failed (test-injected)"),
             "the timeout should retain the exec-side last cause after discovery consumed budget: {msg}"

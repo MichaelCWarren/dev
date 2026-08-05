@@ -236,10 +236,12 @@ container, `dev up` waits up to 15 seconds for that target container to become
 usable for Dev-controlled execs before it runs lifecycle hooks or reports
 success. It returns as soon as the target container is running, discoverable by
 the workspace labels `dev exec` uses, and able to start and report a trivial
-command. A stopped/exited target service, missing service container id, or
-inspect failure fails promptly with the Compose service and container context;
-a service that keeps running but never accepts usable execs fails with the
-bounded readiness timeout. This is not an application-health gate: Compose
+command. A target service the runtime reports as stopped or exited fails
+straight away, with the Compose service and container context needed to go read
+its logs, since lifecycle hooks would fail the same way. A runtime that cannot
+be asked about the service, and a service that keeps running but never accepts
+usable execs, are both retried within that same 15-second budget and reported
+only once it is spent. This is not an application-health gate: Compose
 healthchecks and `depends_on` remain the project's mechanism for waiting on
 databases, web servers, or other service-level readiness.
 
