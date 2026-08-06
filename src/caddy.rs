@@ -1,9 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::util::paths::dev_home;
 
 const TLD: &str = "test";
+
+/// How long to wait for `caddy start` to hand back control before giving up.
+///
+/// `caddy start` bounds itself with a pingback handshake, so this only fires if
+/// Caddy is wedged. It exists so a stuck Caddy can never block `dev` outright.
+const START_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Root dir for dev-managed Caddy config: `~/.dev/caddy/`
 fn caddy_dir() -> PathBuf {
@@ -13,6 +20,11 @@ fn caddy_dir() -> PathBuf {
 /// Main Caddyfile that imports all fragments: `~/.dev/caddy/Caddyfile`
 fn caddyfile_path() -> PathBuf {
     caddy_dir().join("Caddyfile")
+}
+
+/// Where the detached Caddy daemon's output goes: `~/.dev/caddy/caddy.log`
+fn caddy_log_path() -> PathBuf {
+    caddy_dir().join("caddy.log")
 }
 
 /// Per-project fragment: `~/.dev/caddy/sites/<app_name>.caddy`
@@ -143,11 +155,9 @@ fn reload_caddy() {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("dial") || stderr.contains("connection refused") {
+            if is_caddy_not_running(&stderr) {
                 eprintln!("Caddy not running, starting...");
-                let _ = Command::new("caddy")
-                    .args(["start", "--config", &caddyfile.to_string_lossy()])
-                    .output();
+                start_caddy(&caddyfile);
             } else {
                 eprintln!("Warning: caddy reload failed: {stderr}");
             }
@@ -155,6 +165,89 @@ fn reload_caddy() {
         Err(e) => {
             eprintln!("Warning: could not run caddy: {e}");
         }
+    }
+}
+
+/// Whether a failed `caddy reload` means "no Caddy is listening" rather than a
+/// real config error. Reload talks to the admin API over a socket, so a dead
+/// Caddy surfaces as a dial/connection failure.
+fn is_caddy_not_running(stderr: &str) -> bool {
+    stderr.contains("dial") || stderr.contains("connection refused")
+}
+
+/// Stdout/stderr handles pointing at the Caddy log, truncated per daemon.
+///
+/// Falls back to a null sink if the file can't be opened — the log is a
+/// diagnostic convenience, never a reason to skip starting Caddy.
+fn log_stdio() -> (Stdio, Stdio) {
+    let _ = std::fs::create_dir_all(caddy_dir());
+    match std::fs::File::create(caddy_log_path()) {
+        Ok(file) => match file.try_clone() {
+            Ok(clone) => (Stdio::from(file), Stdio::from(clone)),
+            Err(_) => (Stdio::from(file), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    }
+}
+
+/// Launch a detached Caddy daemon via `caddy start`. Best-effort — warns on failure.
+///
+/// Deliberately does not use `.output()`: `caddy start` spawns a long-lived
+/// `caddy run` daemon that inherits these stdout/stderr handles, so piped
+/// handles never reach EOF and the wait deadlocks against our own successfully
+/// started server. Pointing the daemon at a log file leaves nothing to wait on
+/// but `caddy start` itself.
+fn start_caddy(caddyfile: &Path) {
+    let (stdout, stderr) = log_stdio();
+    let child = Command::new("caddy")
+        .args(["start", "--config", &caddyfile.to_string_lossy()])
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn();
+
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Warning: could not start caddy: {e}");
+            return;
+        }
+    };
+
+    let log = caddy_log_path();
+    match wait_bounded(&mut child, START_TIMEOUT) {
+        Some(status) if status.success() => eprintln!("Caddy started."),
+        Some(status) => eprintln!(
+            "Warning: caddy start failed ({status}); see {}",
+            log.display()
+        ),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "Warning: caddy start did not finish within {}s; the daemon is detached \
+                 and may still be coming up — see {}",
+                START_TIMEOUT.as_secs(),
+                log.display()
+            );
+        }
+    }
+}
+
+/// Wait for `child` to exit, giving up after `timeout`. `None` means it was
+/// still running (or could not be polled) when the deadline passed.
+fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -201,4 +294,49 @@ pub fn unregister_site(workspace: &Path) -> anyhow::Result<()> {
     remove_site_config(&app_name)?;
     reload_caddy();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_failure_means_caddy_is_down() {
+        assert!(is_caddy_not_running(
+            "dial tcp 127.0.0.1:2019: connect: connection refused"
+        ));
+        assert!(is_caddy_not_running(
+            "Error: performing request: Post \"http://localhost:2019/load\": dial unix /tmp/x: connect: no such file or directory"
+        ));
+    }
+
+    #[test]
+    fn config_errors_do_not_mean_caddy_is_down() {
+        assert!(!is_caddy_not_running(
+            "Error: adapting config using caddyfile: /Users/x/.dev/caddy/Caddyfile:3: unrecognized directive: reverse_prox"
+        ));
+        assert!(!is_caddy_not_running(""));
+    }
+
+    #[test]
+    fn wait_bounded_returns_status_when_child_exits() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let status = wait_bounded(&mut child, Duration::from_secs(5));
+        assert!(status.expect("exited within timeout").success());
+    }
+
+    #[test]
+    fn wait_bounded_gives_up_on_a_long_running_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let status = wait_bounded(&mut child, Duration::from_millis(300));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(status.is_none(), "should not have waited for the child");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
