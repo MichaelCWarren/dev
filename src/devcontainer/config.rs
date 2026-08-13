@@ -178,6 +178,14 @@ pub struct DevcontainerConfig {
     pub post_attach_command: Option<LifecycleCommand>,
     pub initialize_command: Option<LifecycleCommand>,
     pub customize: Option<serde_json::Value>,
+    /// Hostnames for the `.test` routes Caddy serves, keyed by **host** port.
+    ///
+    /// A dev-only extension, not part of the devcontainer spec — other tooling
+    /// ignores it. Without an entry a port falls back to the derived name
+    /// (`<folder>.test` for the first port, `<folder>-<port>.test` for the
+    /// rest). See `crate::caddy::qualify_hostname` for how a value becomes a
+    /// hostname.
+    pub caddy: Option<HashMap<String, String>>,
     /// Whether to update the remote user's UID/GID to match the host user.
     #[serde(rename = "updateRemoteUserUID")]
     pub update_remote_user_uid: Option<bool>,
@@ -341,6 +349,7 @@ mod workspace_mount_tests {
             post_attach_command: None,
             initialize_command: None,
             customize: None,
+            caddy: None,
             update_remote_user_uid: None,
             dotfiles: None,
         }

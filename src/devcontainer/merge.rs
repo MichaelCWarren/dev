@@ -25,7 +25,7 @@ const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts"];
 const ARRAY_CONCAT_FIELDS: &[&str] = &["runArgs"];
 
 /// Fields that are key-value maps and should be merged (base keys override template keys).
-const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv"];
+const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy"];
 
 /// Fields that are feature maps (special merge: union of keys).
 const FEATURE_FIELDS: &[&str] = &["features"];
@@ -296,6 +296,24 @@ mod tests {
         assert_eq!(env["NODE_ENV"], "development");
         assert_eq!(env["POSH_THEME"], "/home/vscode/.config/omp/theme.omp.json");
         assert_eq!(env["SHARED"], "base"); // base wins
+    }
+
+    /// A per-port map, so a recipe naming one service's host doesn't wipe the
+    /// names a lower layer gave the others.
+    #[test]
+    fn test_merge_caddy_hostnames_per_port() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"caddy": {"5163": "api.chuckos"}}"#,
+            r#"{"caddy": {"5247": "chuckos", "5163": "template"}}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let caddy = json["caddy"].as_object().unwrap();
+        assert_eq!(caddy["5247"], "chuckos");
+        assert_eq!(caddy["5163"], "api.chuckos"); // base wins
     }
 
     #[test]

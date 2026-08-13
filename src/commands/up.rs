@@ -100,10 +100,15 @@ fn merge_caddy_ports(
 
 /// The Caddy port entries implied by a project's declared `forwardPorts`.
 ///
+/// A port named in the config's `caddy` map gets that hostname; the rest keep
+/// the derived `<folder>.test` / `<folder>-<port>.test` names. The map is keyed
+/// by **host** port, matching the side Caddy proxies to.
+///
 /// Empty when nothing is forwarded, which makes registration a no-op. Kept
 /// separate from [`register_caddy_routes`] so the mapping is unit-testable
 /// without the filesystem/Caddy side effects of `register_site`.
 fn caddy_ports_from_config(config: &DevcontainerConfig) -> Vec<crate::caddy::PortEntry> {
+    let names = config.caddy.clone().unwrap_or_default();
     config
         .forward_ports
         .clone()
@@ -111,7 +116,9 @@ fn caddy_ports_from_config(config: &DevcontainerConfig) -> Vec<crate::caddy::Por
         .iter()
         .map(|p| crate::caddy::PortEntry {
             port: p.host,
-            custom_name: None,
+            custom_name: names
+                .get(&p.host.to_string())
+                .map(|n| crate::caddy::qualify_hostname(n)),
             keepalive: None,
         })
         .collect()
@@ -252,6 +259,11 @@ pub(crate) async fn run_with_runtime(
                     Some(&workspace_folder),
                 )
                 .await?;
+                // Same self-healing as the restart path below: a route set
+                // edited in config (renamed host, added port) has no other
+                // moment to reach Caddy, since a running container never takes
+                // that path.
+                register_caddy_routes(workspace, &config);
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
@@ -1830,6 +1842,45 @@ mod tests {
         assert_eq!(ports[0].port, 9090);
         assert_eq!(ports[1].port, 7070);
         assert!(ports.iter().all(|p| p.custom_name.is_none()));
+    }
+
+    #[test]
+    fn caddy_ports_take_hostnames_from_the_config_caddy_map() {
+        // The point of the map: a multi-service project gets readable names
+        // instead of `<folder>-<port>.test`, and unnamed ports still fall back.
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{
+                "image": "ubuntu:24.04",
+                "forwardPorts": [5247, 5163, 5001],
+                "caddy": {"5247": "chuckos", "5163": "api.chuckos"}
+            }"#,
+        )
+        .unwrap();
+
+        let ports = caddy_ports_from_config(&config);
+
+        assert_eq!(ports[0].custom_name.as_deref(), Some("chuckos.test"));
+        assert_eq!(ports[1].custom_name.as_deref(), Some("api.chuckos.test"));
+        assert!(ports[2].custom_name.is_none());
+    }
+
+    #[test]
+    fn caddy_map_keys_are_host_ports_not_container_ports() {
+        // `"3001:3000"` publishes on host 3001, which is what Caddy proxies to,
+        // so keying the map on the container port must NOT match.
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{
+                "image": "ubuntu:24.04",
+                "forwardPorts": ["3001:3000"],
+                "caddy": {"3000": "wrong", "3001": "right"}
+            }"#,
+        )
+        .unwrap();
+
+        let ports = caddy_ports_from_config(&config);
+
+        assert_eq!(ports[0].port, 3001);
+        assert_eq!(ports[0].custom_name.as_deref(), Some("right.test"));
     }
 
     #[test]

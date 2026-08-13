@@ -49,6 +49,21 @@ fn app_name_from_workspace(workspace: &Path) -> String {
         .to_string()
 }
 
+/// Turn a configured name into a full `.test` hostname.
+///
+/// Accepts either a bare name (`chuckos` → `chuckos.test`) or a subdomain
+/// (`api.chuckos` → `api.chuckos.test`), and leaves an already-qualified name
+/// alone. Lowercased, because Caddy matches site addresses literally and a
+/// capitalised host in the config would never be hit by a browser.
+pub fn qualify_hostname(name: &str) -> String {
+    let name = name.trim().trim_matches('.').to_lowercase();
+    if name.ends_with(&format!(".{TLD}")) {
+        name
+    } else {
+        format!("{name}.{TLD}")
+    }
+}
+
 /// A single port→hostname mapping.
 #[derive(Debug, Clone)]
 pub struct SiteEntry {
@@ -299,6 +314,21 @@ pub fn unregister_site(workspace: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_and_subdomain_names_both_qualify() {
+        assert_eq!(qualify_hostname("chuckos"), "chuckos.test");
+        assert_eq!(qualify_hostname("api.chuckos"), "api.chuckos.test");
+    }
+
+    #[test]
+    fn an_already_qualified_name_is_left_alone() {
+        assert_eq!(
+            qualify_hostname("suggest.chuckos.test"),
+            "suggest.chuckos.test"
+        );
+        assert_eq!(qualify_hostname(" Api.ChuckOS.test "), "api.chuckos.test");
+    }
 
     #[test]
     fn dial_failure_means_caddy_is_down() {

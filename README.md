@@ -166,7 +166,7 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
 | Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
-| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
+| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
@@ -413,6 +413,30 @@ dev up
 | ---------------- | -------------------------------------- |
 | `[3000]`         | `appname.test`                         |
 | `[3000, 8080]`   | `appname.test`, `appname-8080.test`    |
+
+### Naming the hostnames
+
+Port-number hostnames stop reading well once a project runs several services. A `caddy` map in
+the merged config names them instead, keyed by **host** port (the side Caddy proxies to, so for
+`"3001:3000"` the key is `3001`):
+
+```jsonc
+{
+  "forwardPorts": [5247, 5163, 5001],
+  "caddy": {
+    "5247": "chuckos",          // → https://chuckos.test
+    "5163": "api.chuckos",      // → https://api.chuckos.test
+    "5001": "suggest.chuckos"   // → https://suggest.chuckos.test
+  }
+}
+```
+
+A bare name becomes `<name>.test` and a dotted one becomes a subdomain; the `.test` suffix is
+added if you leave it off. Ports you don't name keep the derived `appname.test` /
+`appname-<port>.test` form, so naming one service doesn't rename the rest. The key is a dev
+extension, not part of the devcontainer spec — VS Code and the reference CLI ignore it. It merges
+per port across layers (like `remoteEnv`), so a recipe can name one service without dropping the
+names a global template gave the others.
 
 For ad-hoc forwarding (a port not in `forwardPorts`, or a custom subdomain like `admin.appname.test`), use `dev forward`:
 

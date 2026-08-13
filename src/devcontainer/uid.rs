@@ -149,6 +149,7 @@ mod tests {
             post_attach_command: None,
             initialize_command: None,
             customize: None,
+            caddy: None,
             update_remote_user_uid: update_uid,
             dotfiles: None,
         }
