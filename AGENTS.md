@@ -31,6 +31,11 @@
   Apple accepts only the env subset. Compose rejects project-declared `runArgs` but ignores
   inherited lower-layer `runArgs`. `extra_args` on `ContainerConfig` is now always empty
   (kept for struct compatibility).
+- Lifecycle hooks are split by moment in `src/devcontainer/lifecycle.rs`: `run_create_hooks`
+  (onCreate/updateContent/postCreate/postStart) versus `run_start_hooks` (postStart only).
+  Pick by whether the container already existed — never re-run create-time hooks on reuse.
+  Compose has no reuse branch of its own, so `run_compose` probes `compose ps -q` before
+  `compose up` and feeds `compose_hooks_owed` in `src/commands/up.rs`.
 
 ## Maintaining this file
 

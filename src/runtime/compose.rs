@@ -81,17 +81,14 @@ pub async fn compose_up(
     project_name: &str,
     env: &HashMap<String, String>,
     verbose: bool,
+    force_recreate: bool,
 ) -> Result<(), DevError> {
     let (bin, sub) = compose_cmd(runtime_name);
     let file_args = compose_file_args(compose_files, project_dir);
 
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg(sub)
-        .args(&file_args)
-        .arg("--project-name")
-        .arg(project_name)
-        .arg("up")
-        .arg("-d");
+        .args(compose_up_args(&file_args, project_name, force_recreate));
 
     for (k, v) in env {
         cmd.env(k, v);
@@ -113,6 +110,45 @@ pub async fn compose_up(
         )));
     }
     Ok(())
+}
+
+/// Argv for `compose up`, after the `-f` file args.
+///
+/// `--force-recreate` is what makes `dev up --rebuild` mean something on this
+/// path: Compose otherwise reattaches to the existing container, and a container
+/// that was never recreated is owed no create-time lifecycle hooks.
+fn compose_up_args(file_args: &[String], project_name: &str, force_recreate: bool) -> Vec<String> {
+    let mut args = file_args.to_vec();
+    args.push("--project-name".to_string());
+    args.push(project_name.to_string());
+    args.push("up".to_string());
+    args.push("-d".to_string());
+    if force_recreate {
+        args.push("--force-recreate".to_string());
+    }
+    args
+}
+
+/// Argv for `compose ps -q`, after the `-f` file args.
+///
+/// `--all` is what lets a caller ask "does this service have a container at
+/// all", stopped included; without it Compose only reports running ones.
+fn compose_ps_args(
+    file_args: &[String],
+    project_name: &str,
+    service: &str,
+    include_stopped: bool,
+) -> Vec<String> {
+    let mut args = file_args.to_vec();
+    args.push("--project-name".to_string());
+    args.push(project_name.to_string());
+    args.push("ps".to_string());
+    args.push("-q".to_string());
+    if include_stopped {
+        args.push("--all".to_string());
+    }
+    args.push(service.to_string());
+    args
 }
 
 /// Stop compose services without removing them.
@@ -178,18 +214,19 @@ pub async fn compose_container_id(
     project_dir: &Path,
     project_name: &str,
     service: &str,
+    include_stopped: bool,
 ) -> Result<String, DevError> {
     let (bin, sub) = compose_cmd(runtime_name);
     let file_args = compose_file_args(compose_files, project_dir);
 
     let output = tokio::process::Command::new(bin)
         .arg(sub)
-        .args(&file_args)
-        .arg("--project-name")
-        .arg(project_name)
-        .arg("ps")
-        .arg("-q")
-        .arg(service)
+        .args(compose_ps_args(
+            &file_args,
+            project_name,
+            service,
+            include_stopped,
+        ))
         .output()
         .await
         .map_err(|e| DevError::Runtime(format!("Failed to run {bin} {sub} ps: {e}")))?;
@@ -203,7 +240,7 @@ pub async fn compose_container_id(
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if id.is_empty() {
         return Err(DevError::ContainerNotFound(format!(
-            "No running container for compose service '{service}'"
+            "No container for compose service '{service}'"
         )));
     }
     Ok(id)
@@ -550,6 +587,54 @@ pub fn write_override_file(content: &str) -> Result<PathBuf, DevError> {
 mod tests {
     use super::*;
     use crate::devcontainer::features::MergedCapabilities;
+
+    /// `dev up` without `--rebuild` must leave an existing container alone, so
+    /// that a reused container can be told from a created one.
+    #[test]
+    fn compose_up_forces_recreation_only_when_asked() {
+        let files = vec!["-f".to_string(), "/p/compose.yml".to_string()];
+        let plain = compose_up_args(&files, "proj", false);
+        assert_eq!(
+            plain,
+            vec!["-f", "/p/compose.yml", "--project-name", "proj", "up", "-d"]
+        );
+        assert_eq!(
+            compose_up_args(&files, "proj", true).last().unwrap(),
+            "--force-recreate"
+        );
+    }
+
+    /// The pre-`up` probe asks whether the service has a container at all, so
+    /// it needs `--all`; a stopped container is still an existing one.
+    #[test]
+    fn compose_ps_includes_stopped_containers_only_when_asked() {
+        let files = vec!["-f".to_string(), "/p/compose.yml".to_string()];
+        assert_eq!(
+            compose_ps_args(&files, "proj", "app", false),
+            vec![
+                "-f",
+                "/p/compose.yml",
+                "--project-name",
+                "proj",
+                "ps",
+                "-q",
+                "app"
+            ]
+        );
+        assert_eq!(
+            compose_ps_args(&files, "proj", "app", true),
+            vec![
+                "-f",
+                "/p/compose.yml",
+                "--project-name",
+                "proj",
+                "ps",
+                "-q",
+                "--all",
+                "app"
+            ]
+        );
+    }
 
     #[test]
     fn test_compose_file_args_relative() {

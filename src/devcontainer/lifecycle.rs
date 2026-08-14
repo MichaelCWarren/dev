@@ -1,30 +1,86 @@
 use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
-use crate::devcontainer::features::ResolvedFeature;
+use crate::devcontainer::features::{FeatureLifecycleHooks, ResolvedFeature};
 use crate::error::DevError;
 use crate::runtime::{ContainerRuntime, ExecResult};
 use crate::session::{HostIdentity, SessionKind, host_identity, recorded_script};
 
-/// Execute all lifecycle hooks in the devcontainer spec order.
+/// Which hooks a container is owed at this moment.
 ///
-/// Container lifecycle hooks are workspace-scoped commands: callers pass the
-/// resolved `workspaceFolder` so a reused container with a stale `WorkingDir`
-/// does not run hooks in an unrelated directory.
+/// A container is created once and started many times, and the spec splits the
+/// hooks along that line. Callers pick a variant by naming the moment they are
+/// at, so the decision cannot drift from what actually runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stages {
+    CreateAndStart,
+    StartOnly,
+}
+
+/// Execute the hooks a freshly created container is owed.
 ///
-/// Hooks run in order:
-/// 1. onCreateCommand  (feature hooks first, then devcontainer.json)
-/// 2. updateContentCommand
-/// 3. postCreateCommand (feature hooks first, then devcontainer.json)
-/// 4. postStartCommand  (feature hooks first, then devcontainer.json)
+/// Runs, in spec order: `onCreateCommand`, `updateContentCommand`,
+/// `postCreateCommand`, `postStartCommand` — feature hooks before config hooks
+/// at each stage. Use [`run_start_hooks`] for a container that already existed.
 ///
 /// `postAttachCommand` is not run here as it requires an attached session.
 /// Use [`run_post_attach_hooks`] for that.
-pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
+pub async fn run_create_hooks<R: ContainerRuntime + ?Sized>(
     runtime: &R,
     container_id: &str,
     config: &DevcontainerConfig,
     user: Option<&str>,
     workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
+) -> Result<(), DevError> {
+    run_hooks(
+        runtime,
+        container_id,
+        config,
+        user,
+        workdir,
+        features,
+        Stages::CreateAndStart,
+    )
+    .await
+}
+
+/// Execute the hooks a container that already existed is owed on restart.
+///
+/// Runs `postStartCommand` only. The create-time hooks ran when the container
+/// was created, and re-running them would repeat work that is rarely idempotent
+/// — `postCreateCommand` is where toolchains get installed and databases get
+/// seeded.
+pub async fn run_start_hooks<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
+    container_id: &str,
+    config: &DevcontainerConfig,
+    user: Option<&str>,
+    workdir: Option<&str>,
+    features: Option<&[ResolvedFeature]>,
+) -> Result<(), DevError> {
+    run_hooks(
+        runtime,
+        container_id,
+        config,
+        user,
+        workdir,
+        features,
+        Stages::StartOnly,
+    )
+    .await
+}
+
+/// Container lifecycle hooks are workspace-scoped commands: callers pass the
+/// resolved `workspaceFolder` so a reused container with a stale `WorkingDir`
+/// does not run hooks in an unrelated directory.
+#[allow(clippy::too_many_arguments)]
+async fn run_hooks<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
+    container_id: &str,
+    config: &DevcontainerConfig,
+    user: Option<&str>,
+    workdir: Option<&str>,
+    features: Option<&[ResolvedFeature]>,
+    stages: Stages,
 ) -> Result<(), DevError> {
     // Before adding sessions of its own, this collects the ones whose client is
     // gone — a container being brought up is one nothing else has looked at yet.
@@ -43,6 +99,7 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
         workdir,
         features,
         &host,
+        stages,
     );
     attend_hooks(runtime, container_id, user, &host, hooks).await
 }
@@ -96,59 +153,31 @@ async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
     workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
     host: &HostIdentity,
+    stages: Stages,
 ) -> Result<(), DevError> {
     let empty = Vec::new();
     let features = features.unwrap_or(&empty);
 
-    // onCreateCommand: features first (in dependency order), then config
-    for f in features {
-        if let Some(ref cmd) = f.lifecycle_hooks.on_create_command {
-            run_hook(
-                runtime,
-                container_id,
-                &format!("onCreateCommand [{}]", f.id),
-                cmd,
-                user,
-                workdir,
-                host,
-            )
-            .await?;
-        }
-    }
-    if let Some(ref cmd) = config.on_create_command {
-        run_hook(
+    if stages == Stages::CreateAndStart {
+        run_stage(
             runtime,
             container_id,
             "onCreateCommand",
-            cmd,
+            features,
+            |h| h.on_create_command.as_ref(),
+            config.on_create_command.as_ref(),
             user,
             workdir,
             host,
         )
         .await?;
-    }
 
-    // updateContentCommand: config only (features don't declare this)
-    if let Some(ref cmd) = config.update_content_command {
-        run_hook(
-            runtime,
-            container_id,
-            "updateContentCommand",
-            cmd,
-            user,
-            workdir,
-            host,
-        )
-        .await?;
-    }
-
-    // postCreateCommand: features first, then config
-    for f in features {
-        if let Some(ref cmd) = f.lifecycle_hooks.post_create_command {
+        // updateContentCommand: config only, features don't declare this.
+        if let Some(cmd) = config.update_content_command.as_ref() {
             run_hook(
                 runtime,
                 container_id,
-                &format!("postCreateCommand [{}]", f.id),
+                "updateContentCommand",
                 cmd,
                 user,
                 workdir,
@@ -156,13 +185,14 @@ async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
             )
             .await?;
         }
-    }
-    if let Some(ref cmd) = config.post_create_command {
-        run_hook(
+
+        run_stage(
             runtime,
             container_id,
             "postCreateCommand",
-            cmd,
+            features,
+            |h| h.post_create_command.as_ref(),
+            config.post_create_command.as_ref(),
             user,
             workdir,
             host,
@@ -170,13 +200,44 @@ async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
         .await?;
     }
 
-    // postStartCommand: features first, then config
+    run_stage(
+        runtime,
+        container_id,
+        "postStartCommand",
+        features,
+        |h| h.post_start_command.as_ref(),
+        config.post_start_command.as_ref(),
+        user,
+        workdir,
+        host,
+    )
+    .await
+}
+
+/// Run one lifecycle stage: every feature's hook in dependency order, then the
+/// devcontainer.json hook.
+#[allow(clippy::too_many_arguments)]
+async fn run_stage<R, F>(
+    runtime: &R,
+    container_id: &str,
+    stage: &str,
+    features: &[ResolvedFeature],
+    feature_hook: F,
+    config_hook: Option<&LifecycleCommand>,
+    user: Option<&str>,
+    workdir: Option<&str>,
+    host: &HostIdentity,
+) -> Result<(), DevError>
+where
+    R: ContainerRuntime + ?Sized,
+    F: Fn(&FeatureLifecycleHooks) -> Option<&LifecycleCommand>,
+{
     for f in features {
-        if let Some(ref cmd) = f.lifecycle_hooks.post_start_command {
+        if let Some(cmd) = feature_hook(&f.lifecycle_hooks) {
             run_hook(
                 runtime,
                 container_id,
-                &format!("postStartCommand [{}]", f.id),
+                &format!("{stage} [{}]", f.id),
                 cmd,
                 user,
                 workdir,
@@ -185,19 +246,9 @@ async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
             .await?;
         }
     }
-    if let Some(ref cmd) = config.post_start_command {
-        run_hook(
-            runtime,
-            container_id,
-            "postStartCommand",
-            cmd,
-            user,
-            workdir,
-            host,
-        )
-        .await?;
+    if let Some(cmd) = config_hook {
+        run_hook(runtime, container_id, stage, cmd, user, workdir, host).await?;
     }
-
     Ok(())
 }
 
@@ -217,36 +268,19 @@ pub async fn run_post_attach_hooks<R: ContainerRuntime + ?Sized>(
     let empty = Vec::new();
     let features = features.unwrap_or(&empty);
     let host = host_identity().await;
-    let host = &host;
 
-    for f in features {
-        if let Some(ref cmd) = f.lifecycle_hooks.post_attach_command {
-            run_hook(
-                runtime,
-                container_id,
-                &format!("postAttachCommand [{}]", f.id),
-                cmd,
-                user,
-                workdir,
-                host,
-            )
-            .await?;
-        }
-    }
-    if let Some(ref cmd) = config.post_attach_command {
-        run_hook(
-            runtime,
-            container_id,
-            "postAttachCommand",
-            cmd,
-            user,
-            workdir,
-            host,
-        )
-        .await?;
-    }
-
-    Ok(())
+    run_stage(
+        runtime,
+        container_id,
+        "postAttachCommand",
+        features,
+        |h| h.post_attach_command.as_ref(),
+        config.post_attach_command.as_ref(),
+        user,
+        workdir,
+        &host,
+    )
+    .await
 }
 
 async fn run_hook<R: ContainerRuntime + ?Sized>(

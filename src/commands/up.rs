@@ -13,7 +13,7 @@ use crate::devcontainer::features::{
 use crate::devcontainer::uid;
 use crate::devcontainer::{
     DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features,
-    run_lifecycle_hooks, stage_feature_context, substitute_variables,
+    run_create_hooks, run_start_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
 use crate::runtime::{
@@ -284,17 +284,19 @@ pub(crate) async fn run_with_runtime(
                     Some(&workspace_folder),
                 )
                 .await?;
-                if config.post_start_command.is_some() {
-                    run_lifecycle_hooks(
-                        runtime,
-                        &container.id,
-                        &config,
-                        user.as_deref(),
-                        Some(&workspace_folder),
-                        None,
-                    )
-                    .await?;
-                }
+                // Only the start-time hooks: the create-time ones ran when this
+                // container was created, and `postCreateCommand` is where
+                // toolchains get installed and databases get seeded.
+                let features = restart_feature_hooks(&config, &config_path).await?;
+                run_start_hooks(
+                    runtime,
+                    &container.id,
+                    &config,
+                    user.as_deref(),
+                    Some(&workspace_folder),
+                    Some(&features),
+                )
+                .await?;
                 // A plain `dev down` deletes the Caddy fragment but leaves the
                 // container stopped, so restore the routes on restart (issue #52).
                 register_caddy_routes(workspace, &config);
@@ -595,7 +597,7 @@ pub(crate) async fn run_with_runtime(
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(
+    run_create_hooks(
         runtime,
         &container_id,
         &config,
@@ -619,6 +621,51 @@ pub(crate) async fn run_with_runtime(
     }
 
     Ok(())
+}
+
+/// Which lifecycle hooks a compose service is owed.
+#[derive(Debug, PartialEq, Eq)]
+enum ComposeHooks {
+    /// The container is new: the create-time hooks, then postStart.
+    Create,
+    /// The container existed and was started: postStart only.
+    Start,
+    /// The container was already running, so nothing started.
+    None,
+}
+
+/// Decide from what was there before `compose up` ran.
+///
+/// Compose reattaches to an existing container and reports success either way,
+/// so this is the only moment the distinction is visible. `--rebuild` recreates
+/// the container, which makes it new.
+fn compose_hooks_owed(running_before: bool, existed_before: bool, rebuild: bool) -> ComposeHooks {
+    if rebuild || !existed_before {
+        ComposeHooks::Create
+    } else if running_before {
+        ComposeHooks::None
+    } else {
+        ComposeHooks::Start
+    }
+}
+
+/// Resolve the feature hooks a restarted container is owed.
+///
+/// The create path gets its ordered features from the image build it just ran.
+/// A reused container builds nothing, so a `postStartCommand` declared by a
+/// feature has to be resolved on its own. Projects without features skip this
+/// entirely and keep an offline restart.
+async fn restart_feature_hooks(
+    config: &DevcontainerConfig,
+    config_path: &Path,
+) -> anyhow::Result<Vec<ResolvedFeature>> {
+    let mut features = resolve_features(config)?;
+    if features.is_empty() {
+        return Ok(features);
+    }
+    let devcontainer_dir = config_path.parent();
+    download_features(&mut features, devcontainer_dir).await?;
+    Ok(order_features(&features))
 }
 
 fn config_file_declares_run_args(config_path: &Path) -> anyhow::Result<bool> {
@@ -1196,7 +1243,7 @@ async fn run_compose(
     config: &DevcontainerConfig,
     config_path: &Path,
     runtime: &dyn ContainerRuntime,
-    _rebuild: bool,
+    rebuild: bool,
     no_cache: bool,
     verbose: bool,
     update_remote_user_uid_default: &str,
@@ -1463,6 +1510,23 @@ async fn run_compose(
     up_files.push(override_path_str.clone());
     let up_file_refs: Vec<&str> = up_files.iter().map(|s| s.as_str()).collect();
 
+    // Compose reattaches to an existing container instead of reporting that it
+    // did so, so the only way to tell creation from reuse is to look before it
+    // runs. `--rebuild` recreates the container, which makes it new again.
+    let probe = |include_stopped| {
+        crate::runtime::compose::compose_container_id(
+            runtime_name,
+            &up_file_refs,
+            devcontainer_dir,
+            &project_name,
+            service,
+            include_stopped,
+        )
+    };
+    let running_before = probe(false).await.is_ok();
+    let existed_before = running_before || probe(true).await.is_ok();
+    let owed = compose_hooks_owed(running_before, existed_before, rebuild);
+
     eprintln!("Starting compose services...");
     crate::runtime::compose::compose_up(
         runtime_name,
@@ -1471,6 +1535,7 @@ async fn run_compose(
         &project_name,
         &compose_env,
         verbose,
+        rebuild,
     )
     .await?;
 
@@ -1481,6 +1546,7 @@ async fn run_compose(
         devcontainer_dir,
         &project_name,
         service,
+        false,
     )
     .await?;
 
@@ -1494,15 +1560,31 @@ async fn run_compose(
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(
-        runtime,
-        &container_id,
-        config,
-        remote_user,
-        None,
-        feature_hooks,
-    )
-    .await?;
+    match owed {
+        ComposeHooks::Create => {
+            run_create_hooks(
+                runtime,
+                &container_id,
+                config,
+                remote_user,
+                None,
+                feature_hooks,
+            )
+            .await?;
+        }
+        ComposeHooks::Start => {
+            run_start_hooks(
+                runtime,
+                &container_id,
+                config,
+                remote_user,
+                None,
+                feature_hooks,
+            )
+            .await?;
+        }
+        ComposeHooks::None => {}
+    }
 
     // 14. Install dotfiles.
     if let Some(ref dotfiles) = config.dotfiles {
@@ -3335,6 +3417,167 @@ mod tests {
         );
     }
 
+    /// Collect the hook bodies from recorded execs. `hook_args` wraps each hook
+    /// in `recorded_script`, so the body appears between newlines inside the
+    /// `sh -c` argument.
+    fn hook_bodies(execs: &[ExecCall]) -> Vec<String> {
+        execs
+            .iter()
+            .filter_map(|(cmd, _, _)| {
+                // `recorded_script` is what wraps a hook body, and only hooks
+                // go through it — the readiness probe execs a bare script.
+                let (before_status, _) = cmd.get(2)?.split_once("\n__dev_rc=$?")?;
+                Some(before_status.lines().last()?.to_string())
+            })
+            .collect()
+    }
+
+    /// The reported bug: `postCreateCommand` belongs to container creation, so
+    /// restarting a container that already exists must not run it again. Most
+    /// setup scripts are not idempotent — this is where toolchains get
+    /// installed and databases get seeded.
+    #[tokio::test(start_paused = true)]
+    async fn post_create_does_not_re_run_when_a_stopped_container_is_reused() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "onCreateCommand": "touch on-create",
+                "updateContentCommand": "touch update-content",
+                "postCreateCommand": "touch post-create",
+                "postStartCommand": "touch post-start"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a stopped reusable container should be started in place");
+
+        let bodies = hook_bodies(&rt.execs());
+        assert_eq!(
+            bodies,
+            vec!["touch post-start"],
+            "reuse owes postStartCommand and nothing else, got: {bodies:?}"
+        );
+    }
+
+    /// The other half of the same rule: a container that really is new is owed
+    /// every create-time hook, in spec order, before postStart.
+    #[tokio::test(start_paused = true)]
+    async fn a_created_container_runs_every_hook_in_spec_order() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "onCreateCommand": "touch on-create",
+                "updateContentCommand": "touch update-content",
+                "postCreateCommand": "touch post-create",
+                "postStartCommand": "touch post-start"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a fresh container should come up");
+
+        let bodies = hook_bodies(&rt.execs());
+        assert_eq!(
+            bodies,
+            vec![
+                "touch on-create",
+                "touch update-content",
+                "touch post-create",
+                "touch post-start",
+            ],
+            "a created container is owed the full sequence in spec order, got: {bodies:?}"
+        );
+    }
+
+    /// Reuse used to be gated on `postStartCommand` being present, which meant
+    /// a config with only a `postCreateCommand` decided the question by
+    /// accident. It must run nothing here for the right reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_reused_container_runs_nothing_when_only_post_create_is_declared() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "postCreateCommand": "touch post-create"}"#,
+        );
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a stopped reusable container should be started in place");
+
+        let bodies = hook_bodies(&rt.execs());
+        assert!(
+            bodies.is_empty(),
+            "no hook is owed on reuse when only postCreateCommand is declared, got: {bodies:?}"
+        );
+    }
+
+    /// Feature-declared `postStartCommand`s run on every start, same as the
+    /// config's. The restart path builds no image, so it has to resolve the
+    /// feature hooks itself or they never fire.
+    #[tokio::test(start_paused = true)]
+    async fn a_reused_container_runs_feature_post_start_hooks() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"./greeter": {}}}"#,
+        );
+        let feature_dir = workspace.path().join(".devcontainer").join("greeter");
+        fs::create_dir_all(&feature_dir).unwrap();
+        fs::write(
+            feature_dir.join("devcontainer-feature.json"),
+            r#"{
+                "id": "greeter",
+                "version": "1.0.0",
+                "postCreateCommand": "touch feature-post-create",
+                "postStartCommand": "touch feature-post-start"
+            }"#,
+        )
+        .unwrap();
+        fs::write(feature_dir.join("install.sh"), "#!/bin/sh\n").unwrap();
+
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a stopped reusable container should be started in place");
+
+        let bodies = hook_bodies(&rt.execs());
+        assert_eq!(
+            bodies,
+            vec!["touch feature-post-start"],
+            "a feature's postStartCommand fires on restart, its postCreateCommand does not, \
+             got: {bodies:?}"
+        );
+    }
+
+    /// Compose has no reuse branch of its own — it reattaches and reports
+    /// success either way — so this table is the whole decision.
+    #[test]
+    fn compose_hooks_follow_what_was_there_before_up() {
+        use super::{ComposeHooks, compose_hooks_owed};
+
+        let cases = [
+            // (running_before, existed_before, rebuild, owed)
+            (false, false, false, ComposeHooks::Create),
+            (false, true, false, ComposeHooks::Start),
+            (true, true, false, ComposeHooks::None),
+            (true, true, true, ComposeHooks::Create),
+            (false, true, true, ComposeHooks::Create),
+        ];
+        for (running, existed, rebuild, expected) in cases {
+            assert_eq!(
+                compose_hooks_owed(running, existed, rebuild),
+                expected,
+                "running={running} existed={existed} rebuild={rebuild}"
+            );
+        }
+    }
+
     /// What the gate certifies is the runtime's create → start → wait sequence,
     /// not the image's contents. A shell-less scratch or distroless image
     /// answers the probe with a non-zero status — which means that sequence
@@ -4024,7 +4267,7 @@ mod tests {
         super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
             .await
             .expect("readiness should wait for the target service to become usable");
-        crate::devcontainer::run_lifecycle_hooks(&rt, "fake-id", &config, None, None, None)
+        crate::devcontainer::run_create_hooks(&rt, "fake-id", &config, None, None, None)
             .await
             .expect("lifecycle hook should run after readiness");
 
