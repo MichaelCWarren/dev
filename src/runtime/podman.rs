@@ -1,10 +1,11 @@
 use std::path::Path;
 
+use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::docker::BollardRuntime;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
-    ImageMetadata,
+    ImageMetadata, env_assignments,
 };
 use std::os::unix::process::CommandExt;
 
@@ -57,6 +58,7 @@ fn podman_exec_args(
     cmd: &[String],
     user: Option<&str>,
     workdir: Option<&str>,
+    env: &[String],
 ) -> Vec<String> {
     let mut args = vec!["exec".to_string(), "-it".to_string()];
     if let Some(u) = user {
@@ -66,6 +68,10 @@ fn podman_exec_args(
     if let Some(dir) = workdir {
         args.push("--workdir".to_string());
         args.push(dir.to_string());
+    }
+    for assignment in env {
+        args.push("-e".to_string());
+        args.push(assignment.clone());
     }
     args.push(id.to_string());
     args.extend(cmd.iter().cloned());
@@ -116,8 +122,9 @@ impl ContainerRuntime for PodmanRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, ExecResult> {
-        self.0.exec(id, cmd, user, workdir)
+        self.0.exec(id, cmd, user, workdir, env)
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
@@ -130,6 +137,7 @@ impl ContainerRuntime for PodmanRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32> {
         // Podman's HTTP API doesn't reliably support interactive TTY exec via
         // bollard. Shell out to `podman exec -it` instead.
@@ -137,8 +145,9 @@ impl ContainerRuntime for PodmanRuntime {
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
+        let env = env_assignments(env);
         Box::pin(async move {
-            let args = podman_exec_args(&id, &cmd, user.as_deref(), workdir.as_deref());
+            let args = podman_exec_args(&id, &cmd, user.as_deref(), workdir.as_deref(), &env);
 
             let err = std::process::Command::new("podman").args(&args).exec();
             // exec() only returns on error
@@ -312,6 +321,7 @@ mod tests {
             &["bash".to_string()],
             Some("vscode"),
             Some("/srv/app/packages/api"),
+            &[],
         );
 
         assert_eq!(
@@ -325,6 +335,31 @@ mod tests {
                 "/srv/app/packages/api",
                 "container-id",
                 "bash",
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_exec_args_carry_one_flag_per_env_entry() {
+        let args = podman_exec_args(
+            "container-id",
+            &["bash".to_string()],
+            None,
+            None,
+            &["A=1".to_string(), "B=2".to_string()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-it",
+                "-e",
+                "A=1",
+                "-e",
+                "B=2",
+                "container-id",
+                "bash"
             ]
         );
     }

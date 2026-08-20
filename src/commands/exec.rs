@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use crate::devcontainer::compose::load_workspace_config_or_warn;
+use crate::devcontainer::secrets::validate::validate_secrets_for_config;
+use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
 use crate::error::DevError;
 use crate::runtime::{
     ContainerRuntime, ContainerState, ExecResult, detect_runtime, resolve_remote_user,
@@ -15,7 +17,8 @@ pub async fn run(
     cmd: &[String],
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    run_with_runtime(workspace, runtime.as_ref(), user, cmd).await
+    let registry = ProviderRegistry::with_builtins(workspace);
+    run_with_runtime(workspace, runtime.as_ref(), user, cmd, &registry).await
 }
 
 pub(crate) async fn run_with_runtime(
@@ -23,6 +26,7 @@ pub(crate) async fn run_with_runtime(
     runtime: &dyn crate::runtime::ContainerRuntime,
     user: Option<&str>,
     cmd: &[String],
+    registry: &ProviderRegistry,
 ) -> anyhow::Result<()> {
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -36,8 +40,8 @@ pub(crate) async fn run_with_runtime(
         })?;
 
     // Use explicit --user flag, falling back to remoteUser from config or image metadata
-    let config =
-        load_workspace_config_or_warn(workspace, runtime.runtime_name()).map(|(_, config)| config);
+    let (config_path, config) =
+        load_workspace_config_or_warn(workspace, runtime.runtime_name()).unzip();
 
     let resolved_user = if user.is_some() {
         user.map(|u| u.to_string())
@@ -54,6 +58,17 @@ pub(crate) async fn run_with_runtime(
         None => format!("/workspaces/{}", workspace_folder_name(workspace)),
     };
 
+    // Before the sweep, so a bad reference leaves the container exactly as it
+    // was found, and after the container lookup, so a workspace with nothing
+    // running never costs a provider prompt.
+    let secrets = resolve_exec_secrets(
+        config_path.as_deref(),
+        workspace,
+        config.as_ref().and_then(|c| c.remote_user.as_deref()),
+        registry,
+    )
+    .await?;
+
     // Collected here as well as in `dev shell`, so a container is tidied by
     // whichever command reaches it first. The cost is one round trip when
     // there is nothing to collect.
@@ -64,8 +79,16 @@ pub(crate) async fn run_with_runtime(
     }
 
     let host = session::host_identity().await;
-    let outcome =
-        attend_command(runtime, &container.id, cmd, effective_user, &workdir, &host).await?;
+    let outcome = attend_command(
+        runtime,
+        &container.id,
+        cmd,
+        effective_user,
+        &workdir,
+        &host,
+        &secrets,
+    )
+    .await?;
 
     let result = match outcome {
         Outcome::Finished(result) => result,
@@ -86,6 +109,28 @@ pub(crate) async fn run_with_runtime(
     }
 
     Ok(())
+}
+
+/// Resolve this workspace's secrets for one exec.
+///
+/// Every `dev exec` and `dev shell` pays one provider round trip. Dev keeps no
+/// cache of its own, so a rotated secret reaches the next command without a
+/// recreate. Providers cache their own sessions, which is what makes that
+/// affordable. Values live for the length of this command and are dropped.
+///
+/// `createTime` is not read here. It governs create-time injection only, so a
+/// secret kept out of `docker inspect` still reaches an exec.
+pub(crate) async fn resolve_exec_secrets(
+    config_path: Option<&Path>,
+    workspace: &Path,
+    remote_user: Option<&str>,
+    registry: &ProviderRegistry,
+) -> Result<Vec<(String, SecretValue)>, DevError> {
+    let Some(config_path) = config_path else {
+        return Ok(Vec::new());
+    };
+    let secrets = validate_secrets_for_config(config_path, workspace, remote_user, registry)?;
+    registry.resolve_all(secrets.entries()).await
 }
 
 /// How a `dev exec` ended.
@@ -110,6 +155,7 @@ async fn attend_command(
     user: Option<&str>,
     workdir: &str,
     host: &session::HostIdentity,
+    secrets: &[(String, SecretValue)],
 ) -> anyhow::Result<Outcome> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -127,6 +173,7 @@ async fn attend_command(
         user,
         workdir,
         host,
+        secrets,
     ));
     let signalled = tokio::select! {
         finished = &mut running => return Ok(Outcome::Finished(finished?)),
@@ -155,17 +202,22 @@ async fn run_recorded(
     user: Option<&str>,
     workdir: &str,
     host: &session::HostIdentity,
+    secrets: &[(String, SecretValue)],
 ) -> Result<ExecResult, DevError> {
     let recorded = session::registered_command(cmd, SessionKind::Exec, host);
     match runtime
-        .exec(container_id, &recorded, user, Some(workdir))
+        .exec(container_id, &recorded, user, Some(workdir), secrets)
         .await
     {
         Err(e) if runtime.exec_reports_missing_command(&e) => {
-            runtime.exec(container_id, cmd, user, Some(workdir)).await
+            runtime
+                .exec(container_id, cmd, user, Some(workdir), secrets)
+                .await
         }
         Ok(result) if reports_missing_shell(&result) => {
-            runtime.exec(container_id, cmd, user, Some(workdir)).await
+            runtime
+                .exec(container_id, cmd, user, Some(workdir), secrets)
+                .await
         }
         other => other,
     }
@@ -205,6 +257,8 @@ fn reports_missing_shell(result: &ExecResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::run_with_runtime;
+    use crate::devcontainer::secrets::SecretValue;
+    use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
@@ -212,6 +266,7 @@ mod tests {
     };
     use crate::util::workspace_labels;
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -220,7 +275,12 @@ mod tests {
         Box::pin(async { Err(DevError::Runtime("unused fake runtime method".into())) })
     }
 
-    type ExecCall = (Vec<String>, Option<String>, Option<String>);
+    type ExecCall = (
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+    );
 
     struct ExecFakeRuntime {
         containers: Vec<ContainerInfo>,
@@ -266,7 +326,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(cmd, _, _)| !crate::session::is_session_machinery(cmd))
+                .filter(|(cmd, ..)| !crate::session::is_session_machinery(cmd))
+                .cloned()
+                .collect()
+        }
+
+        /// `dev`'s own bookkeeping execs, which must carry no secret.
+        fn session_execs(&self) -> Vec<ExecCall> {
+            self.execs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(cmd, ..)| crate::session::is_session_machinery(cmd))
                 .cloned()
                 .collect()
         }
@@ -277,7 +348,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(cmd, _, _)| crate::session::is_session_machinery(cmd))
+                .any(|(cmd, ..)| crate::session::is_session_machinery(cmd))
         }
     }
 
@@ -324,11 +395,17 @@ mod tests {
             cmd: &[String],
             user: Option<&str>,
             workdir: Option<&str>,
+            env: &[(String, SecretValue)],
         ) -> BoxFut<'_, ExecResult> {
             self.execs.lock().unwrap().push((
                 cmd.to_vec(),
                 user.map(str::to_string),
                 workdir.map(str::to_string),
+                // Exposing inside a test double is the only way to prove the
+                // value arrived. Production code never does this.
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.expose().to_string()))
+                    .collect(),
             ));
             let no_shell = self.without_a_shell && cmd.first().is_some_and(|arg| arg == "/bin/sh");
             let as_status = self.shell_missing_as_status;
@@ -369,6 +446,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'_, i32> {
             unused()
         }
@@ -434,6 +512,32 @@ mod tests {
         (workspace, config_path)
     }
 
+    /// [`workspace_with_config`] with a `secrets.json` beside the config, so the
+    /// sidecar is found through the real discovery rule rather than a stub.
+    fn workspace_with_secrets(file_contents: &str) -> (TempDir, std::path::PathBuf) {
+        let (workspace, config_path) = workspace_with_config();
+        std::fs::write(
+            config_path.parent().unwrap().join("secrets.json"),
+            file_contents,
+        )
+        .unwrap();
+        (workspace, config_path)
+    }
+
+    /// A registry holding only `provider`, with the plugin search path pointed
+    /// at nothing so no `dev-secret-*` on the real `PATH` can answer.
+    fn registry_with(workspace: &Path, provider: FakeProvider) -> ProviderRegistry {
+        let mut registry =
+            ProviderRegistry::empty(workspace, PluginPath::from_os_str(OsStr::new("")));
+        registry.register(Box::new(provider));
+        registry
+    }
+
+    /// A registry whose provider must never be asked anything.
+    fn silent_registry(workspace: &Path) -> ProviderRegistry {
+        registry_with(workspace, FakeProvider::recording())
+    }
+
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
@@ -443,9 +547,15 @@ mod tests {
         let (workspace, config_path) = workspace_with_config();
         let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
 
-        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
-            .await
-            .expect("dev exec should run the command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should run the command");
 
         let execs = runtime.execs();
         assert_eq!(execs.len(), 1);
@@ -459,9 +569,15 @@ mod tests {
         let (workspace, config_path) = workspace_with_config();
         let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
 
-        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
-            .await
-            .expect("dev exec should run the command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should run the command");
 
         assert!(runtime.was_swept());
     }
@@ -473,9 +589,15 @@ mod tests {
         let (workspace, config_path) = workspace_with_config();
         let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
 
-        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
-            .await
-            .expect("dev exec should run the command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should run the command");
 
         let cmd = &runtime.execs()[0].0;
         assert_eq!(cmd[0], "/bin/sh");
@@ -506,9 +628,15 @@ mod tests {
             "*",
         ]);
 
-        run_with_runtime(workspace.path(), &runtime, None, &hostile)
-            .await
-            .expect("dev exec should run the command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &hostile,
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should run the command");
 
         let cmd = &runtime.execs()[0].0;
         // $0 names the session, and the caller's words follow it verbatim.
@@ -525,9 +653,15 @@ mod tests {
         let runtime =
             ExecFakeRuntime::running_for(workspace.path(), &config_path).without_a_shell();
 
-        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
-            .await
-            .expect("dev exec should fall back to the bare command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should fall back to the bare command");
 
         let execs = runtime.execs();
         assert_eq!(
@@ -551,13 +685,245 @@ mod tests {
             .without_a_shell()
             .reporting_that_as_a_status();
 
-        run_with_runtime(workspace.path(), &runtime, None, &words(&["cargo", "test"]))
-            .await
-            .expect("dev exec should fall back to the bare command");
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &silent_registry(workspace.path()),
+        )
+        .await
+        .expect("dev exec should fall back to the bare command");
 
         let execs = runtime.execs();
         assert_eq!(execs.len(), 2);
         assert_eq!(execs[1].0, words(&["cargo", "test"]));
+    }
+
+    const TWO_SECRETS: &str =
+        r#"{"version":1,"secrets":{"TOKEN":"fake://token","API_KEY":"fake://api"}}"#;
+
+    fn answers() -> FakeProvider {
+        FakeProvider::answering(&[("TOKEN", "hunter2"), ("API_KEY", "s3cret")])
+    }
+
+    /// The whole point of exec-time injection: the command sees values fetched
+    /// for this invocation, not whatever was baked in at create.
+    #[tokio::test]
+    async fn a_one_off_command_carries_the_workspaces_resolved_secrets() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+        let provider = answers();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), provider.clone()),
+        )
+        .await
+        .expect("dev exec should run the command");
+
+        assert_eq!(
+            runtime.execs()[0].3,
+            vec![
+                ("TOKEN".to_string(), "hunter2".to_string()),
+                ("API_KEY".to_string(), "s3cret".to_string()),
+            ]
+        );
+    }
+
+    /// The missing-shell fallback runs the command twice. Paying for a second
+    /// biometric prompt to do it would be indefensible.
+    #[tokio::test]
+    async fn secrets_are_resolved_once_per_invocation_not_once_per_exec() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).without_a_shell();
+        let provider = answers();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), provider.clone()),
+        )
+        .await
+        .expect("dev exec should fall back to the bare command");
+
+        let execs = runtime.execs();
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[0].3, execs[1].3);
+        assert_eq!(provider.calls(), 1);
+    }
+
+    /// `createTime` governs the create path only. A secret marked false is
+    /// exec-time only, which is how it stays out of `docker inspect`.
+    #[tokio::test]
+    async fn a_secret_marked_create_time_false_still_reaches_an_exec() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"token","createTime":false}}}"#,
+        );
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), answers()),
+        )
+        .await
+        .expect("dev exec should run the command");
+
+        assert_eq!(
+            runtime.execs()[0].3,
+            vec![("TOKEN".to_string(), "hunter2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_without_secrets_calls_no_provider() {
+        let (workspace, config_path) = workspace_with_config();
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+        let provider = FakeProvider::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), provider.clone()),
+        )
+        .await
+        .expect("dev exec should run the command");
+
+        assert!(runtime.execs()[0].3.is_empty());
+        assert_eq!(provider.calls(), 0);
+    }
+
+    /// A command that would run without the secret it asked for is worse than
+    /// one that does not run, so nothing touches the container first.
+    #[tokio::test]
+    async fn a_failed_required_secret_stops_the_command_from_running() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        let err = run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), FakeProvider::failing_for("TOKEN")),
+        )
+        .await
+        .expect_err("a required secret that cannot resolve fails the command");
+
+        assert!(err.to_string().contains("TOKEN"), "{err}");
+        assert!(runtime.execs().is_empty());
+        assert!(!runtime.was_swept());
+    }
+
+    #[tokio::test]
+    async fn an_optional_secret_that_fails_is_omitted() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{
+                "TOKEN":{"provider":"fake","ref":"token","optional":true},
+                "API_KEY":"fake://api"
+            }}"#,
+        );
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+        let provider = answers().also_failing_for("TOKEN");
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), provider),
+        )
+        .await
+        .expect("an optional secret that fails is not fatal");
+
+        assert_eq!(
+            runtime.execs()[0].3,
+            vec![("API_KEY".to_string(), "s3cret".to_string())]
+        );
+    }
+
+    /// Values travel as env, outside the argv the recording shell is handed, so
+    /// nothing in the container's process table shows them.
+    #[tokio::test]
+    async fn no_secret_value_reaches_the_recorded_script() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), answers()),
+        )
+        .await
+        .expect("dev exec should run the command");
+
+        let cmd = &runtime.execs()[0].0;
+        assert!(cmd[2].contains("dev-session"), "the recording script");
+        for word in cmd {
+            assert!(!word.contains("hunter2"), "{word}");
+            assert!(!word.contains("s3cret"), "{word}");
+        }
+    }
+
+    /// Sweeping and releasing are dev's own bookkeeping. They need no secret,
+    /// so they carry none.
+    #[tokio::test]
+    async fn dev_s_own_session_commands_carry_no_secrets() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace.path(), answers()),
+        )
+        .await
+        .expect("dev exec should run the command");
+
+        let sessions = runtime.session_execs();
+        assert!(!sessions.is_empty(), "the sweep ran");
+        for session in sessions {
+            assert!(session.3.is_empty());
+        }
+    }
+
+    /// Dev keeps no cache of its own, which is what lets a rotated secret reach
+    /// the next command without a recreate.
+    #[tokio::test]
+    async fn nothing_is_remembered_between_invocations() {
+        let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+        let provider = answers();
+        let registry = registry_with(workspace.path(), provider.clone());
+
+        for _ in 0..2 {
+            run_with_runtime(
+                workspace.path(),
+                &runtime,
+                None,
+                &words(&["cargo", "test"]),
+                &registry,
+            )
+            .await
+            .expect("dev exec should run the command");
+        }
+
+        assert_eq!(provider.calls(), 2);
     }
 
     /// Falling back runs the command again, so the only thing that may trigger

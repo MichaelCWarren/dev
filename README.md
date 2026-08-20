@@ -370,6 +370,38 @@ Compose service, for example `init: true`, `privileged: true`, `cap_add`,
 `security_opt`, or service-specific namespace/network settings where your
 Compose implementation supports them.
 
+## Secrets
+
+`dev` can fetch secret values itself and inject them into the container. A
+`secrets.json` beside your devcontainer config holds *references* — a provider
+name and a locator — and never values, so nothing has to be exported in your
+shell and `dev` never writes a resolved value to disk.
+
+```json
+{
+  "version": 1,
+  "secrets": {
+    "LINEAR_API_KEY": "op://Private/Linear CLI/credential"
+  }
+}
+```
+
+Five providers are built in: `env`, `file`, `op` (1Password), `keychain`
+(macOS), and `exec` (any command's stdout). Anything else resolves to a
+`dev-secret-<name>` executable on `PATH`.
+
+Two `dev up` flags. `--secrets <path>` reads references from somewhere else
+instead of the sidecar; it replaces the sidecar and never merges with it.
+`--secrets-file <path>` takes a flat JSON map of literal values, for
+`devcontainers/cli` compatibility. `dev exec` and `dev shell` re-resolve the
+sidecar on every invocation, so a rotated secret reaches the next command with
+no rebuild.
+
+Create-time secret values are readable through `docker inspect` — that is
+inherent to environment variables, and `createTime: false` is the way out.
+
+See [docs/secrets.md](docs/secrets.md) for the full reference.
+
 ## Local `.test` domains
 
 `dev` integrates with [Caddy](https://caddyserver.com/) and dnsmasq to give each project a `.test` hostname (e.g. `appname.test`) so you don't memorize port numbers.
@@ -484,6 +516,7 @@ dev build [--tag <t>] [--no-cache] [--buildkit] [--no-base] [--frozen-lockfile]
           [--update-remote-user-uid-default never|on|off]
 dev up    [--rebuild] [--no-cache] [--buildkit] [--no-base] [--ports …] [--frozen-lockfile]
           [--update-remote-user-uid-default never|on|off]
+          [--secrets <path>] [--secrets-file <path>]
 dev down  [--remove]
 dev shell [--shell /bin/bash]
 dev exec  [-u <user>] -- <cmd>…

@@ -87,7 +87,9 @@ async fn run() -> anyhow::Result<()> {
             buildkit,
             update_remote_user_uid_default,
             port_overrides,
+            secrets_file,
             no_base,
+            secrets,
         } => {
             commands::up::run(
                 &workspace,
@@ -99,7 +101,9 @@ async fn run() -> anyhow::Result<()> {
                 buildkit,
                 &update_remote_user_uid_default,
                 &port_overrides,
+                secrets_file.as_deref(),
                 no_base,
+                secrets.as_deref(),
             )
             .await?;
         }

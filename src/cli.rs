@@ -89,9 +89,17 @@ pub enum Command {
         #[arg(long = "ports", value_delimiter = ',')]
         port_overrides: Vec<String>,
 
+        /// JSON file of literal secret values, applied like `remoteEnv`
+        #[arg(long = "secrets-file", value_name = "PATH")]
+        secrets_file: Option<PathBuf>,
+
         /// Do not apply ~/.dev/base/devcontainer.json for this run
         #[arg(long)]
         no_base: bool,
+
+        /// Read secret references from this file instead of the secrets.json beside the config
+        #[arg(long, value_name = "PATH")]
+        secrets: Option<PathBuf>,
     },
 
     /// Stop (optionally remove) container

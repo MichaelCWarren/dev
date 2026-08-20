@@ -246,7 +246,7 @@ pub async fn read_markers<R: ContainerRuntime + ?Sized>(
         script,
         MACHINERY_ARGV0.to_string(),
     ];
-    let result = runtime.exec(container_id, &cmd, user, None).await?;
+    let result = runtime.exec(container_id, &cmd, user, None, &[]).await?;
     Ok(parse_markers(&result.stdout))
 }
 
@@ -293,7 +293,7 @@ pub async fn kill_sessions<R: ContainerRuntime + ?Sized>(
         if escalate { "1" } else { "0" }.to_string(),
     ];
     cmd.extend(sessions.iter().map(SessionMarker::target));
-    let result = runtime.exec(container_id, &cmd, user, None).await?;
+    let result = runtime.exec(container_id, &cmd, user, None, &[]).await?;
     Ok(parse_reaped(&result.stdout))
 }
 

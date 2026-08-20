@@ -10,10 +10,11 @@ use apple_container::models::{
     PublishPort, Resources, RuntimeStatus, User, UserId, UserString,
 };
 
+use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, WorkspaceMount, terminal_size,
+    ExecResult, ImageMetadata, WorkspaceMount, env_assignments, terminal_size,
 };
 
 /// What a container's own processes run with.
@@ -79,9 +80,10 @@ impl AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[String],
     ) -> Result<ExecResult, DevError> {
         let defaults = self.container_process_defaults(id).await;
-        let proc_config = exec_process_config(cmd, user, false, &defaults, workdir);
+        let proc_config = exec_process_config(cmd, user, false, &defaults, workdir, env);
         run_captured_process(&self.client, id, &proc_config).await
     }
 
@@ -128,11 +130,12 @@ impl AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[String],
     ) -> Result<i32, DevError> {
         // Resolved before raw mode: this can warn, and a raw terminal needs
         // CRLF to keep such output from staircasing.
         let defaults = self.container_process_defaults(id).await;
-        let proc_config = exec_process_config(cmd, user, true, &defaults, workdir);
+        let proc_config = exec_process_config(cmd, user, true, &defaults, workdir, env);
 
         let _raw_guard = RawModeGuard::enter()?;
         let process_id = next_process_id("exec-interactive");
@@ -529,17 +532,39 @@ fn exec_process_config(
     terminal: bool,
     defaults: &ProcessDefaults,
     workdir: Option<&str>,
+    env: &[String],
 ) -> ProcessConfiguration {
     ProcessConfiguration {
         executable: cmd.first().cloned().unwrap_or_default(),
         arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
-        environment: defaults.environment.clone(),
+        environment: merged_environment(&defaults.environment, env),
         working_directory: absolute_or_root([workdir, Some(defaults.working_directory.as_str())]),
         terminal,
         user: to_apple_user(user),
         supplemental_groups: vec![],
         rlimits: vec![],
     }
+}
+
+/// The container's own environment with per-exec entries layered on top.
+///
+/// Apple's daemon takes the whole environment array and does no merging of its
+/// own, so a name given here has to be the only entry under that name.
+fn merged_environment(defaults: &[String], extra: &[String]) -> Vec<String> {
+    let key_of = |entry: &str| {
+        entry
+            .split_once('=')
+            .map_or(entry, |(key, _)| key)
+            .to_string()
+    };
+    let injected: Vec<String> = extra.iter().map(|entry| key_of(entry)).collect();
+    let mut merged: Vec<String> = defaults
+        .iter()
+        .filter(|entry| !injected.contains(&key_of(entry)))
+        .cloned()
+        .collect();
+    merged.extend(extra.iter().cloned());
+    merged
 }
 
 /// First absolute candidate, or `/` when none is usable.
@@ -1396,13 +1421,15 @@ impl ContainerRuntime for AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, ExecResult> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
+        let env = env_assignments(env);
         Box::pin(async move {
-            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref(), &env)
                 .await
         })
     }
@@ -1417,13 +1444,15 @@ impl ContainerRuntime for AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
+        let env = env_assignments(env);
         Box::pin(async move {
-            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref(), &env)
                 .await
         })
     }
@@ -1905,6 +1934,7 @@ mod tests {
                 environment: Vec::new(),
             },
             None,
+            &[],
         )
     }
 
@@ -2473,13 +2503,14 @@ mod tests {
             false,
             &defaults_in("/workspaces/demo"),
             None,
+            &[],
         );
         assert_eq!(config.executable, "sh");
         assert_eq!(config.arguments, vec!["-c", "echo hi"]);
         assert!(!config.terminal);
         assert_eq!(config.working_directory, "/workspaces/demo");
 
-        let empty = exec_process_config(&[], None, true, &defaults_in("/"), None);
+        let empty = exec_process_config(&[], None, true, &defaults_in("/"), None, &[]);
         assert_eq!(empty.executable, "");
         assert!(empty.arguments.is_empty());
         assert!(empty.terminal);
@@ -2507,11 +2538,61 @@ mod tests {
             ],
         };
 
-        let config = exec_process_config(&["npm".to_string()], None, false, &defaults, None);
+        let config = exec_process_config(&["npm".to_string()], None, false, &defaults, None, &[]);
 
         assert_eq!(
             config.environment, defaults.environment,
             "an exec must run with the container's own environment"
+        );
+    }
+
+    /// Per-exec env is layered on top of the container's own, and a name given
+    /// twice has to end up with only the injected value: the daemon takes this
+    /// array as the whole environment and does no merging of its own.
+    #[test]
+    fn per_exec_env_is_layered_over_the_containers_environment() {
+        let defaults = ProcessDefaults {
+            working_directory: "/workspaces/demo".to_string(),
+            environment: vec![
+                "PATH=/usr/local/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string(),
+            ],
+        };
+
+        let config = exec_process_config(
+            &["npm".to_string()],
+            None,
+            false,
+            &defaults,
+            None,
+            &["TOKEN=t".to_string()],
+        );
+
+        assert_eq!(
+            config.environment,
+            vec![
+                "PATH=/usr/local/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string(),
+                "TOKEN=t".to_string(),
+            ]
+        );
+
+        let shadowed = exec_process_config(
+            &["npm".to_string()],
+            None,
+            false,
+            &defaults,
+            None,
+            &["NODE_VERSION=23".to_string()],
+        );
+
+        assert_eq!(
+            shadowed.environment,
+            vec![
+                "PATH=/usr/local/bin:/usr/bin".to_string(),
+                "NODE_VERSION=23".to_string(),
+            ],
+            "an injected name must be the only entry under that name"
         );
     }
 
@@ -2537,7 +2618,7 @@ mod tests {
             working_directory: apple_config.init_process.working_directory.clone(),
             environment: apple_config.init_process.environment.clone(),
         };
-        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults, None);
+        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults, None, &[]);
 
         assert!(
             exec.environment
@@ -2560,6 +2641,7 @@ mod tests {
             false,
             &defaults_in("/workspaces/project"),
             None,
+            &[],
         );
         assert_eq!(
             config.working_directory, "/workspaces/project",
@@ -2572,8 +2654,14 @@ mod tests {
     #[test]
     fn unusable_working_directories_fall_back_to_root() {
         for spec in ["", "relative/path"] {
-            let config =
-                exec_process_config(&["sh".to_string()], None, false, &defaults_in(spec), None);
+            let config = exec_process_config(
+                &["sh".to_string()],
+                None,
+                false,
+                &defaults_in(spec),
+                None,
+                &[],
+            );
             assert_eq!(
                 config.working_directory, "/",
                 "{spec:?} must fall back to /"
@@ -3187,7 +3275,7 @@ mod tests {
             let described = cmd.join(" ");
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                runtime.exec(id, &cmd, None, None),
+                runtime.exec(id, &cmd, None, None, &[]),
             )
             .await
             .unwrap_or_else(|_| panic!("exec hung: {described}"))
@@ -3250,6 +3338,7 @@ mod tests {
             true,
             &defaults,
             None,
+            &[],
         );
         let (terminal_out, terminal_in) = terminal_pipe();
         let process_id = next_process_id("exec-interactive-smoke");
@@ -3336,13 +3425,14 @@ mod tests {
         };
 
         let interactive =
-            exec_process_config(&["/bin/sh".to_string()], None, true, &defaults, None);
+            exec_process_config(&["/bin/sh".to_string()], None, true, &defaults, None, &[]);
         assert!(
             interactive.terminal,
             "dev shell runs against the caller's terminal"
         );
 
-        let captured = exec_process_config(&["/bin/sh".to_string()], None, false, &defaults, None);
+        let captured =
+            exec_process_config(&["/bin/sh".to_string()], None, false, &defaults, None, &[]);
         assert!(
             !captured.terminal,
             "a captured exec reads its own stdout and stderr and must not ask for a pty"

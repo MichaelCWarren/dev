@@ -13,6 +13,7 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::devcontainer::jsonc::parse_jsonc;
+use crate::devcontainer::secrets::SecretValue;
 use crate::util::paths::DevHome;
 
 pub(crate) const DEFAULT_RUNTIME_PROPERTY: &str = "defaultRuntime";
@@ -67,7 +68,7 @@ pub enum ContainerState {
 }
 
 /// Configuration for creating a new container.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerConfig {
     pub image: String,
     pub name: String,
@@ -99,6 +100,44 @@ pub struct ContainerConfig {
     pub security_opt: Vec<String>,
     /// User namespace mode (--userns).
     pub userns_mode: Option<String>,
+}
+
+/// Wraps the env map so `ContainerConfig`'s `Debug` prints keys without values.
+/// Values may be resolved secrets; see the secrets design doc's security rules.
+struct RedactedValues<'a>(&'a HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedValues<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "***")))
+            .finish()
+    }
+}
+
+/// Hand-written so env values never reach a log or a panic message. Adding a
+/// field to `ContainerConfig` means adding it here too — the compiler will not
+/// tell you.
+impl std::fmt::Debug for ContainerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerConfig")
+            .field("image", &self.image)
+            .field("name", &self.name)
+            .field("labels", &self.labels)
+            .field("env", &RedactedValues(&self.env))
+            .field("mounts", &self.mounts)
+            .field("volumes", &self.volumes)
+            .field("ports", &self.ports)
+            .field("workspace_mount", &self.workspace_mount)
+            .field("workspace_folder", &self.workspace_folder)
+            .field("extra_args", &self.extra_args)
+            .field("entrypoint", &self.entrypoint)
+            .field("init", &self.init)
+            .field("privileged", &self.privileged)
+            .field("cap_add", &self.cap_add)
+            .field("security_opt", &self.security_opt)
+            .field("userns_mode", &self.userns_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +209,15 @@ pub struct AttachedExec {
 /// A boxed future that is Send.
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
+/// Render exec env pairs as the `KEY=VALUE` strings every runtime's wire
+/// format wants. The result holds raw secret material: it goes straight to
+/// the daemon and is never logged or formatted.
+pub(crate) fn env_assignments(env: &[(String, SecretValue)]) -> Vec<String> {
+    env.iter()
+        .map(|(key, value)| format!("{key}={}", value.expose()))
+        .collect()
+}
+
 /// Current terminal size as (columns, rows), or None when stdout is not a tty.
 pub(crate) fn terminal_size() -> Option<(u16, u16)> {
     use std::os::fd::AsRawFd;
@@ -214,12 +262,16 @@ pub trait ContainerRuntime: Send + Sync {
     /// `workdir` is for callers that have a command-scoped directory such as
     /// the resolved devcontainer `workspaceFolder`. Leaving it unset preserves
     /// runtime inheritance for commands with their own target semantics.
+    ///
+    /// `env` applies to this exec alone. It does not change the container's own
+    /// environment, so nothing started outside this command sees it.
     fn exec(
         &self,
         id: &str,
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, ExecResult>;
 
     /// Whether an [`Self::exec`] failure means the image has no such
@@ -240,13 +292,15 @@ pub trait ContainerRuntime: Send + Sync {
     }
 
     /// Run a command attached to the caller's terminal, returning its exit code
-    /// once it finishes. `workdir` has the same meaning as on [`Self::exec`].
+    /// once it finishes. `workdir` and `env` have the same meaning as on
+    /// [`Self::exec`].
     fn exec_interactive(
         &self,
         id: &str,
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32>;
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
@@ -704,5 +758,61 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("Unknown runtime"), "{message}");
+    }
+
+    fn container_config_with_env(env: &[(&str, &str)]) -> ContainerConfig {
+        ContainerConfig {
+            image: "ubuntu:24.04".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: None,
+            workspace_folder: None,
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+            userns_mode: None,
+        }
+    }
+
+    #[test]
+    fn debug_hides_env_values() {
+        let config = container_config_with_env(&[("SECRET", "hunter2")]);
+
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("SECRET"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_keeps_other_fields() {
+        let config = container_config_with_env(&[]);
+
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("ubuntu:24.04"), "{rendered}");
+        assert!(rendered.contains("vsc-test"), "{rendered}");
+    }
+
+    #[test]
+    fn alternate_debug_hides_env_values() {
+        let config = container_config_with_env(&[("SECRET", "hunter2")]);
+
+        let rendered = format!("{config:#?}");
+
+        assert!(rendered.contains("SECRET"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
     }
 }

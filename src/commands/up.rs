@@ -10,12 +10,16 @@ use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, capabilities_from_metadata, feature_image_tag,
     generate_feature_dockerfile_with_opts, order_features,
 };
+use crate::devcontainer::secrets::discovery::secrets_file_path;
+use crate::devcontainer::secrets::validate::validate_secrets_at;
+use crate::devcontainer::secrets::{ProviderRegistry, SecretValue, ValidatedSecrets};
 use crate::devcontainer::uid;
 use crate::devcontainer::{
     DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features,
     run_create_hooks, run_start_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
+use crate::error::DevError;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, ExecResult, PortMapping,
     VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
@@ -35,7 +39,9 @@ pub async fn run(
     _buildkit: bool,
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
+    secrets_file: Option<&Path>,
     no_base: bool,
+    secrets_override: Option<&Path>,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     run_with_runtime(
@@ -47,7 +53,9 @@ pub async fn run(
         frozen_lockfile,
         update_remote_user_uid_default,
         port_overrides,
+        secrets_file,
         no_base,
+        secrets_override,
     )
     .await
 }
@@ -141,7 +149,46 @@ pub(crate) async fn run_with_runtime(
     frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
+    secrets_file: Option<&Path>,
     no_base: bool,
+    secrets_override: Option<&Path>,
+) -> anyhow::Result<()> {
+    let providers = ProviderRegistry::with_builtins(workspace);
+    run_with_runtime_with_providers(
+        workspace,
+        runtime,
+        rebuild,
+        no_cache,
+        verbose,
+        frozen_lockfile,
+        update_remote_user_uid_default,
+        port_overrides,
+        secrets_file,
+        no_base,
+        secrets_override,
+        &providers,
+    )
+    .await
+}
+
+/// [`run_with_runtime`] with the secret providers supplied, so a test can put a
+/// fake in front of both validation and resolution. One registry serves both:
+/// two would let a fake satisfy validation and then resolve against the real
+/// built-ins.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_runtime_with_providers(
+    workspace: &Path,
+    runtime: &dyn ContainerRuntime,
+    rebuild: bool,
+    no_cache: bool,
+    verbose: bool,
+    frozen_lockfile: bool,
+    update_remote_user_uid_default: &str,
+    port_overrides: &[String],
+    secrets_file: Option<&Path>,
+    no_base: bool,
+    secrets_override: Option<&Path>,
+    providers: &ProviderRegistry,
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
         match find_config_source(workspace)? {
@@ -178,6 +225,15 @@ pub(crate) async fn run_with_runtime(
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
         reject_project_run_args_for_compose(&config, project_declared_run_args)?;
+        reject_secrets_file_for_compose(secrets_file)?;
+        let secrets = validate_workspace_secrets(
+            &config,
+            &config_path,
+            workspace,
+            providers,
+            secrets_override,
+        )?;
+        reject_secrets_for_compose(&config, &secrets, secrets_override)?;
         return run_compose(
             workspace,
             &config,
@@ -192,9 +248,11 @@ pub(crate) async fn run_with_runtime(
         .await;
     }
 
-    // Validate and translate runArgs before any host-visible side effects:
-    // initializeCommand, existing-container reuse, lockfile writes, image
-    // builds, and container creation must all see the same decision.
+    // Validate and translate runArgs, then secret references, before any
+    // host-visible side effects: initializeCommand, existing-container reuse,
+    // lockfile writes, image builds, and container creation must all see the
+    // same decision. The recipe directory materialized above is the one write
+    // that already happened.
     //
     // This intentionally uses config/default-user substitution here, before
     // image inspection. User-dependent HOME expansion can therefore differ
@@ -208,6 +266,25 @@ pub(crate) async fn run_with_runtime(
         .collect();
     let resolved_run_args = crate::devcontainer::run_args::resolve_run_args(&run_args, workspace)?;
     reject_run_args_unsupported_by_runtime(runtime.runtime_name(), &resolved_run_args)?;
+
+    // Read once per invocation, here rather than on the create path, so a bad
+    // path or a bad document fails on the container-reuse path too.
+    let secrets_file_env = match secrets_file {
+        Some(path) => load_secrets_file(path)?,
+        None => BTreeMap::new(),
+    };
+
+    // Parse every secret reference, reject unknown providers, and expand
+    // devcontainer variables in the reference bodies and option values with the
+    // same workspace and user the runArgs substitution above uses. No provider
+    // is asked for a value yet: resolution is on the create path only.
+    let secrets = validate_workspace_secrets(
+        &config,
+        &config_path,
+        workspace,
+        providers,
+        secrets_override,
+    )?;
 
     // Run initializeCommand on the host before anything else (Gap 9).
     if let Some(ref init_cmd) = config.initialize_command {
@@ -481,6 +558,11 @@ pub(crate) async fn run_with_runtime(
         labels.insert(k.clone(), v.clone());
     }
 
+    // Resolve only here, and only on the create path. Env reaches a container at
+    // create, so a `dev up` that reuses a running container gains nothing from
+    // resolving and costs a provider prompt every time.
+    let resolved_secrets = resolve_create_time_secrets(&secrets, providers).await?;
+
     // Substitute devcontainer variables in env values
     let mut env = HashMap::new();
     env.insert("REMOTE_CONTAINERS".to_string(), "true".to_string());
@@ -494,6 +576,7 @@ pub(crate) async fn run_with_runtime(
             env.insert(k.clone(), substitute_variables(v, workspace));
         }
     }
+    apply_secrets_file_env(&mut env, &secrets_file_env);
 
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports = caddy_ports_from_config(&config);
@@ -545,6 +628,10 @@ pub(crate) async fn run_with_runtime(
     for (k, v) in &resolved_run_args.env {
         env.insert(k.clone(), v.clone());
     }
+
+    // Secrets last: highest precedence over containerEnv, remoteEnv, and both
+    // `runArgs` env tiers. Nothing may be inserted into `env` below this line.
+    apply_secrets_to_env(&mut env, &resolved_secrets);
 
     let workspace_folder = config.workspace_folder_path(workspace, remote_user)?;
 
@@ -692,6 +779,181 @@ fn reject_project_run_args_for_compose(
     if config.is_compose() && project_declared_run_args && has_effective_run_args {
         anyhow::bail!(
             "`runArgs` is not supported for Docker Compose devcontainers in `dev`; Compose has no global container-create argument channel. Put equivalent options on the configured Compose service definition instead."
+        );
+    }
+    Ok(())
+}
+
+/// Parse, provider-check, and variable-substitute this invocation's references
+/// file — the explicit `--secrets` path when given, otherwise the `secrets.json`
+/// beside `config_path`. Exactly one of the two is read, never both. No provider
+/// is asked for a value, so this is safe to call before any side effect.
+fn validate_workspace_secrets(
+    config: &DevcontainerConfig,
+    config_path: &Path,
+    workspace: &Path,
+    providers: &ProviderRegistry,
+    secrets_override: Option<&Path>,
+) -> anyhow::Result<ValidatedSecrets> {
+    let path = secrets_file_path(secrets_override, config_path)?;
+    Ok(validate_secrets_at(
+        path,
+        workspace,
+        config.remote_user.as_deref(),
+        providers,
+    )?)
+}
+
+/// Resolve the create-time secrets for this `dev up`.
+///
+/// Create-path only. Env reaches a container at create, so resolving during a
+/// `dev up` that reuses a running container buys nothing and costs a biometric
+/// prompt every time. `createTime: false` entries are exec-time only and are
+/// filtered out by `create_time_entries`.
+///
+/// The empty case returns before the registry is touched, so "no secrets means
+/// no provider call" holds by construction.
+async fn resolve_create_time_secrets(
+    secrets: &ValidatedSecrets,
+    providers: &ProviderRegistry,
+) -> anyhow::Result<Vec<(String, SecretValue)>> {
+    let refs: Vec<_> = secrets.create_time_entries().cloned().collect();
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(providers.resolve_all(&refs).await?)
+}
+
+/// Apply resolved secrets on top of the create-time env map.
+///
+/// Last, so a secret outranks `containerEnv`, `remoteEnv`, and both `runArgs`
+/// env tiers. Anything inserted into `env` after this call would silently
+/// shadow a live secret with a stale one.
+fn apply_secrets_to_env(env: &mut HashMap<String, String>, secrets: &[(String, SecretValue)]) {
+    for (key, value) in secrets {
+        env.insert(key.clone(), value.expose().to_string());
+    }
+}
+
+/// Load the flat `{ "KEY": "literal value" }` document `dev up --secrets-file`
+/// takes, matching `devcontainers/cli`.
+///
+/// Deliberately shares nothing with the `secrets.json` loader: that document
+/// carries references and this one carries values. Neither ever sees the
+/// other's shape, so nothing has to sniff a document to decide what it is. A
+/// value that looks like a reference is still a literal — no provider is
+/// consulted and no reference parser is called on anything from this file.
+///
+/// Parses to `serde_json::Value` and type-checks by hand: deserializing
+/// straight into a `String` map would render a mismatch through serde's
+/// `Unexpected`, which prints the offending scalar into the error text.
+fn load_secrets_file(path: &Path) -> anyhow::Result<BTreeMap<String, SecretValue>> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        DevError::InvalidConfig(format!(
+            "failed to read `--secrets-file` `{}`: {e}",
+            path.display()
+        ))
+    })?;
+    let body = std::str::from_utf8(&bytes).map_err(|_| {
+        DevError::InvalidConfig(format!(
+            "`--secrets-file` `{}` is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    secrets_file_object(path, body)?
+        .iter()
+        .map(|(key, value)| secrets_file_entry(path, key, value))
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(Into::into)
+}
+
+/// The top level must be an object. An array, a scalar, or a bare string is
+/// rejected without its contents reaching the message.
+fn secrets_file_object(
+    path: &Path,
+    body: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, DevError> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        DevError::InvalidConfig(format!(
+            "`--secrets-file` `{}` is not valid JSON: {e}",
+            path.display()
+        ))
+    })?;
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err(DevError::InvalidConfig(format!(
+            "`--secrets-file` `{}` must be a JSON object mapping environment variable names to string values",
+            path.display()
+        ))),
+    }
+}
+
+/// One entry: a usable environment variable name and a string value. This is
+/// what rejects a references document — `version` is a number and `secrets` is
+/// an object, so both fail on their value, not on their name.
+fn secrets_file_entry(
+    path: &Path,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(String, SecretValue), DevError> {
+    if key.is_empty() || key.contains('=') || key.chars().any(|c| c.is_ascii_whitespace()) {
+        return Err(DevError::InvalidConfig(format!(
+            "`--secrets-file` `{}`: `{key}` is not a valid environment variable name",
+            path.display()
+        )));
+    }
+    let text = value.as_str().ok_or_else(|| {
+        DevError::InvalidConfig(format!(
+            "`--secrets-file` `{}`: the value for `{key}` is not a string. This flag takes literal values; a `secrets.json` references document goes to `--secrets`",
+            path.display()
+        ))
+    })?;
+    Ok((key.to_string(), SecretValue::new(text)))
+}
+
+/// Apply `--secrets-file` values in the `remoteEnv` tier, so a `runArgs` env
+/// entry and a resolved `secrets.json` secret both still outrank them.
+fn apply_secrets_file_env(
+    env: &mut HashMap<String, String>,
+    values: &BTreeMap<String, SecretValue>,
+) {
+    for (key, value) in values {
+        env.insert(key.clone(), value.expose().to_string());
+    }
+}
+
+/// Compose writes its environment into a generated override file on disk, which
+/// is the one thing `dev` promises never to do with a secret value. Say so
+/// rather than accepting the flag and writing the values out.
+fn reject_secrets_file_for_compose(secrets_file: Option<&Path>) -> anyhow::Result<()> {
+    if let Some(path) = secrets_file {
+        anyhow::bail!(
+            "`--secrets-file` is not supported for Docker Compose devcontainers in `dev`; Compose environment is written to a generated override file on disk, and `dev` never writes a secret value to disk. Remove `--secrets-file {}` and put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Compose creates its containers through `docker compose up`, so nothing on
+/// that path would ever read a `secrets.json`. Say so instead of leaving a
+/// container that comes up green and misbehaves later with the secrets missing.
+///
+/// Non-compose configs pass, so this is safe to call without a caller-side
+/// `is_compose()` guard. An empty `secrets` map declares nothing and passes too,
+/// matching the empty `runArgs` array rule above.
+fn reject_secrets_for_compose(
+    config: &DevcontainerConfig,
+    secrets: &ValidatedSecrets,
+    secrets_override: Option<&Path>,
+) -> anyhow::Result<()> {
+    // An explicit `--secrets` is refused even when it declares nothing: the
+    // user named a references file that this path would read with nothing.
+    let declared = secrets_override.or_else(|| secrets.source().filter(|_| !secrets.is_empty()));
+    if let (true, Some(path)) = (config.is_compose(), declared) {
+        anyhow::bail!(
+            "`secrets.json` is not supported for Docker Compose devcontainers in `dev`; secrets are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. Remove {} or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
+            path.display()
         );
     }
     Ok(())
@@ -899,7 +1161,7 @@ async fn verify_container_execs_until(
         let window = polls.remaining();
         let attempt = tokio::time::timeout(
             window,
-            runtime.exec(container_id, &probe, remote_user, workdir),
+            runtime.exec(container_id, &probe, remote_user, workdir, &[]),
         )
         .await;
 
@@ -1207,7 +1469,7 @@ async fn install_dotfiles(
         target.replace('\'', "'\\''"),
     );
     let args = vec!["sh".to_string(), "-c".to_string(), clone_cmd];
-    let result = runtime.exec(container_id, &args, user, None).await?;
+    let result = runtime.exec(container_id, &args, user, None, &[]).await?;
     if result.exit_code != 0 {
         eprintln!(
             "Warning: failed to clone dotfiles (exit {}):\n{}",
@@ -1220,7 +1482,7 @@ async fn install_dotfiles(
     if let Some(ref install_cmd) = dotfiles.install_command {
         eprintln!("Running dotfiles install command: {install_cmd}");
         let args = vec!["sh".to_string(), "-c".to_string(), install_cmd.clone()];
-        let result = runtime.exec(container_id, &args, user, None).await?;
+        let result = runtime.exec(container_id, &args, user, None, &[]).await?;
         if result.exit_code != 0 {
             eprintln!(
                 "Warning: dotfiles install command failed (exit {}):\n{}",
@@ -1837,19 +2099,23 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, apply_run_args_capabilities, caddy_ports_from_config,
-        ensure_image_present, merge_caddy_ports, parse_mounts, parse_single_mount,
-        project_declares_run_args, reject_project_run_args_for_compose, substitute_mounts,
+        apply_cli_overrides, apply_run_args_capabilities, apply_secrets_to_env,
+        caddy_ports_from_config, ensure_image_present, merge_caddy_ports, parse_mounts,
+        parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
+        reject_secrets_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
     use crate::devcontainer::features::MergedCapabilities;
+    use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
+    use crate::devcontainer::secrets::validate::validate_secrets_for_config;
+    use crate::devcontainer::secrets::{SecretValue, ValidatedSecrets};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1867,6 +2133,15 @@ mod tests {
         let devcontainer_dir = dir.path().join(".devcontainer");
         fs::create_dir_all(&devcontainer_dir).unwrap();
         let path = devcontainer_dir.join("devcontainer.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The sidecar beside a workspace-scope `devcontainer.json`.
+    fn write_secrets_json(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let devcontainer_dir = dir.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        let path = devcontainer_dir.join("secrets.json");
         fs::write(&path, content).unwrap();
         path
     }
@@ -2056,6 +2331,74 @@ mod tests {
         assert!(msg.contains("Compose service"), "{msg}");
     }
 
+    /// Parse a `secrets.json` into the value the compose guard inspects, the
+    /// same way `run_with_runtime_with_providers` does.
+    fn validated_secrets(workspace: &TempDir, content: &str) -> ValidatedSecrets {
+        let config_path = write_project_config(workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(workspace, content);
+        let fake = FakeProvider::answers_everything();
+        validate_secrets_for_config(
+            &config_path,
+            workspace.path(),
+            None,
+            &registry_with(workspace, &fake),
+        )
+        .expect("the fixture must parse and name a known provider")
+    }
+
+    #[test]
+    fn compose_project_with_secrets_is_rejected_with_compose_guidance() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"dockerComposeFile":"compose.yml","service":"app"}"#).unwrap();
+        let workspace = TempDir::new().unwrap();
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://vault/distinctive-reference"}}"#,
+        );
+
+        let err = reject_secrets_for_compose(&config, &secrets, None).unwrap_err();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("secrets.json"), "{msg}");
+        assert!(
+            msg.contains(&secrets.source().unwrap().display().to_string()),
+            "error should name the discovered file: {msg}"
+        );
+        assert!(msg.contains("Compose"), "{msg}");
+        assert!(
+            !msg.contains("distinctive-reference"),
+            "no reference body may reach the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn compose_project_without_secrets_is_not_rejected() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"dockerComposeFile":"compose.yml","service":"app"}"#).unwrap();
+
+        reject_secrets_for_compose(&config, &ValidatedSecrets::default(), None)
+            .expect("no secrets.json is nothing to reject");
+
+        let workspace = TempDir::new().unwrap();
+        let empty = validated_secrets(&workspace, r#"{"version":1,"secrets":{}}"#);
+        reject_secrets_for_compose(&config, &empty, None)
+            .expect("an empty secrets map declares nothing");
+    }
+
+    #[test]
+    fn secrets_are_not_rejected_for_non_compose_configs() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let workspace = TempDir::new().unwrap();
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://item"}}"#,
+        );
+
+        reject_secrets_for_compose(&config, &secrets, None)
+            .expect("the image path resolves secrets rather than rejecting them");
+    }
+
     #[test]
     fn value_declares_project_run_args_only_for_non_empty_arrays() {
         assert!(project_declares_run_args(
@@ -2134,6 +2477,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'_, ExecResult> {
             unused()
         }
@@ -2144,6 +2488,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'_, i32> {
             unused()
         }
@@ -2666,6 +3011,7 @@ mod tests {
             cmd: &[String],
             user: Option<&str>,
             workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'_, ExecResult> {
             let cmd = cmd.to_vec();
             let user = user.map(str::to_string);
@@ -2739,6 +3085,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'_, i32> {
             unused()
         }
@@ -2844,6 +3191,25 @@ mod tests {
 
     /// Drive `run_with_runtime` over a minimal image-based workspace.
     async fn run_up_with_fake(rt: &UpFakeRuntime, workspace: &TempDir) -> anyhow::Result<()> {
+        run_up_with_fake_secrets_file(rt, workspace, None).await
+    }
+
+    /// [`run_up_with_fake`] with a `--secrets-file` path.
+    async fn run_up_with_fake_secrets_file(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        secrets_file: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        run_up_with_fake_flags(rt, workspace, secrets_file, None).await
+    }
+
+    /// [`run_up_with_fake`] with both secret path flags.
+    async fn run_up_with_fake_flags(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        secrets_file: Option<&Path>,
+        secrets_override: Option<&Path>,
+    ) -> anyhow::Result<()> {
         super::run_with_runtime(
             workspace.path(),
             rt,
@@ -2853,7 +3219,72 @@ mod tests {
             /* frozen_lockfile */ false,
             /* update_remote_user_uid_default */ "never",
             /* port_overrides */ &[],
+            /* secrets_file */ secrets_file,
             /* no_base */ true,
+            /* secrets_override */ secrets_override,
+        )
+        .await
+    }
+
+    /// A registry holding nothing but `fake`, so no test can reach a real
+    /// provider or a plugin binary on the host `PATH`.
+    fn registry_with(workspace: &TempDir, fake: &FakeProvider) -> ProviderRegistry {
+        let mut providers = ProviderRegistry::empty(workspace.path(), PluginPath::default());
+        providers.register(Box::new(fake.clone()));
+        providers
+    }
+
+    /// [`run_up_with_fake`] with the secret providers supplied.
+    async fn run_up_with_providers(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+    ) -> anyhow::Result<()> {
+        run_up_with_providers_and_flags(rt, workspace, providers, None, None).await
+    }
+
+    /// [`run_up_with_providers`] with a `--secrets-file` path, for the tiers
+    /// that only differ once both a resolved secret and a literal are in play.
+    async fn run_up_with_providers_and_secrets_file(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+        secrets_file: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        run_up_with_providers_and_flags(rt, workspace, providers, secrets_file, None).await
+    }
+
+    /// [`run_up_with_providers`] with a `--secrets` path.
+    async fn run_up_with_providers_and_secrets(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+        secrets_override: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        run_up_with_providers_and_flags(rt, workspace, providers, None, secrets_override).await
+    }
+
+    /// [`run_up_with_providers`] with both secret path flags.
+    async fn run_up_with_providers_and_flags(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+        secrets_file: Option<&Path>,
+        secrets_override: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        super::run_with_runtime_with_providers(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* secrets_file */ secrets_file,
+            /* no_base */ true,
+            /* secrets_override */ secrets_override,
+            providers,
         )
         .await
     }
@@ -4042,6 +4473,898 @@ mod tests {
         );
     }
 
+    const SECRETS_UNKNOWN_PROVIDER: &str =
+        r#"{"version":1,"secrets":{"TOKEN":"nosuch://vault/item"}}"#;
+
+    /// A provider name nothing answers to must fail before initializeCommand
+    /// touches the host.
+    #[tokio::test]
+    async fn up_bad_secrets_json_fails_before_initialize_command() {
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("initialized");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized"}"#,
+        );
+        write_secrets_json(&workspace, SECRETS_UNKNOWN_PROVIDER);
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("an unknown secret provider must fail before initializeCommand");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nosuch"),
+            "error should name the provider: {msg}"
+        );
+        assert!(msg.contains("TOKEN"), "error should name the key: {msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before secrets validation"
+        );
+        assert!(!rt.create_was_attempted(), "{msg}");
+    }
+
+    /// A shorthand with no `://` is a parse failure, and it must land before the
+    /// existing-container lookup rather than after it.
+    #[tokio::test]
+    async fn up_malformed_secret_reference_fails_before_container_lookup() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"no-scheme-here"}}"#,
+        );
+        // A runtime whose listing always fails: reaching the lookup would report
+        // that instead, so the key in the message is the proof of ordering.
+        let rt = UpFakeRuntime::listing_never_works();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("a malformed secret reference must fail the command");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TOKEN"),
+            "secrets validation must precede the existing-container lookup: {msg}"
+        );
+        assert!(!rt.create_was_attempted(), "{msg}");
+    }
+
+    /// A document-level problem fails the same way a reference-level one does.
+    #[tokio::test]
+    async fn up_invalid_secrets_document_fails_before_container_creation() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":9,"secrets":{"TOKEN":"env://TOKEN"}}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("an unsupported secrets version must fail the command");
+        assert!(format!("{err}").contains("version"), "{err}");
+        assert!(!rt.create_was_attempted());
+    }
+
+    /// A reference body that variable substitution empties is an error, and it
+    /// is one before any side effect.
+    #[tokio::test]
+    async fn up_empty_secret_reference_body_fails_before_container_creation() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"env://${localEnv:DEV_UP_SECRETS_UNSET_BODY}"}}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("an empty reference body must fail the command");
+        assert!(format!("{err}").contains("TOKEN"), "{err}");
+        assert!(!rt.create_was_attempted());
+    }
+
+    /// The existing-container fast path must not bypass secrets validation.
+    #[tokio::test(start_paused = true)]
+    async fn up_bad_secrets_json_fails_for_existing_running_container() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, SECRETS_UNKNOWN_PROVIDER);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("container reuse must still validate secrets");
+        assert!(format!("{err}").contains("nosuch"), "{err}");
+        assert!(!rt.create_was_attempted());
+    }
+
+    /// The regression guard for every workspace that declares no secrets.
+    #[tokio::test]
+    async fn up_without_secrets_json_is_unaffected() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a workspace with no secrets.json must be unaffected");
+        assert_eq!(rt.created_config().image, "ubuntu:24.04");
+    }
+
+    /// A valid `secrets.json` validates, resolves against a real built-in
+    /// provider, and the up path proceeds.
+    #[tokio::test]
+    async fn up_with_a_valid_secrets_json_proceeds() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        fs::write(workspace.path().join("token"), "from-a-file").unwrap();
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"file://${localWorkspaceFolder}/token"}}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a valid secrets.json must not fail the command");
+        assert!(rt.create_was_attempted());
+    }
+
+    const ONE_FAKE_SECRET: &str = r#"{"version":1,"secrets":{"TOKEN":"fake://item"}}"#;
+
+    /// The whole point of the feature: a resolved value reaches the container
+    /// the runtime is asked to create.
+    #[tokio::test]
+    async fn up_applies_resolved_secret_to_created_env() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let fake = FakeProvider::answering(&[("TOKEN", "resolved-value")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a resolvable secret must not fail the command");
+        assert_eq!(
+            rt.created_config().env.get("TOKEN"),
+            Some(&"resolved-value".to_string())
+        );
+    }
+
+    /// A `runArgs` `--env` flag is the last env tier before secrets, and a stale
+    /// value there must not shadow a live one.
+    #[tokio::test]
+    async fn up_secret_outranks_run_args_env_flag() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","TOKEN=stale"]}"#,
+        );
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let fake = FakeProvider::answering(&[("TOKEN", "resolved-value")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a resolvable secret must not fail the command");
+        assert_eq!(
+            rt.created_config().env.get("TOKEN"),
+            Some(&"resolved-value".to_string())
+        );
+    }
+
+    /// The other tier that would silently shadow a live secret.
+    #[tokio::test]
+    async fn up_secret_outranks_remote_env() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","remoteEnv":{"TOKEN":"stale"}}"#,
+        );
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let fake = FakeProvider::answering(&[("TOKEN", "resolved-value")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a resolvable secret must not fail the command");
+        assert_eq!(
+            rt.created_config().env.get("TOKEN"),
+            Some(&"resolved-value".to_string())
+        );
+    }
+
+    /// `createTime: false` is exec-time only: no provider call, no env entry,
+    /// and not an error.
+    #[tokio::test]
+    async fn up_skips_create_time_false_secrets() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","createTime":false}}}"#,
+        );
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("an exec-time-only secret must not fail the command");
+        assert_eq!(fake.calls(), 0, "createTime: false must not be resolved");
+        assert!(!rt.created_config().env.contains_key("TOKEN"));
+    }
+
+    /// The regression guard for every workspace that declares no secrets: not
+    /// one provider is asked anything.
+    #[tokio::test]
+    async fn up_makes_no_provider_call_without_secrets_file() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a workspace with no secrets.json must be unaffected");
+        assert_eq!(fake.calls(), 0);
+        assert!(rt.create_was_attempted());
+    }
+
+    /// Fan-out belongs to the registry. A per-secret loop in `up.rs` would show
+    /// up here as two calls and two provider prompts.
+    #[tokio::test]
+    async fn up_batches_two_secrets_from_one_provider_into_one_call() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://one","OTHER":"fake://two"}}"#,
+        );
+        let fake = FakeProvider::answering(&[("TOKEN", "first"), ("OTHER", "second")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("two secrets from one provider must resolve");
+        assert_eq!(fake.calls(), 1, "one provider means one resolve call");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("TOKEN"), Some(&"first".to_string()));
+        assert_eq!(env.get("OTHER"), Some(&"second".to_string()));
+    }
+
+    /// An `optional` secret whose provider fails is omitted, and the container
+    /// is still created. Pinned against the fix where `optional` is parsed but
+    /// never consulted, which leaves a laptop with an expired vault session
+    /// unable to start any container.
+    ///
+    /// The resolvable sibling is what stops this passing vacuously: without it
+    /// a batch that never ran would look the same as one that ran and omitted.
+    #[tokio::test]
+    async fn up_omits_optional_secret_whose_provider_fails() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"PRESENT":"fake://present","TOKEN":{"provider":"fake","ref":"item","optional":true}}}"#,
+        );
+        let fake =
+            FakeProvider::answering(&[("PRESENT", "present-value")]).also_failing_for("TOKEN");
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("an optional secret that cannot resolve must not fail the command");
+        assert!(rt.create_was_attempted());
+        let env = rt.created_config().env;
+        assert_eq!(
+            env.get("PRESENT"),
+            Some(&"present-value".to_string()),
+            "the resolvable half of the batch must still land"
+        );
+        assert!(
+            !env.contains_key("TOKEN"),
+            "an unresolvable optional secret must be omitted, not set empty"
+        );
+    }
+
+    /// A required secret that cannot resolve fails the command, naming the key
+    /// and nothing the provider answered with.
+    #[tokio::test]
+    async fn up_fails_when_a_required_secret_cannot_resolve() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://item","KEEP":"fake://other"}}"#,
+        );
+        // KEEP resolves, TOKEN has no fixture: the batch half-succeeds, so the
+        // error is the place a sibling value could leak.
+        let fake = FakeProvider::answering(&[("KEEP", "s3cr3t-fixture")]);
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect_err("a required secret that cannot resolve must fail the command");
+        let msg = format!("{err}");
+        assert!(msg.contains("TOKEN"), "error should name the key: {msg}");
+        assert!(!msg.contains("s3cr3t-fixture"), "{msg}");
+        assert!(!rt.create_was_attempted());
+    }
+
+    /// Secrets are applied last, so they overwrite whatever the earlier env
+    /// tiers left under the same key.
+    #[test]
+    fn apply_secrets_to_env_overwrites_existing_key() {
+        let mut env = HashMap::new();
+        env.insert("TOKEN".to_string(), "from-env-file".to_string());
+        apply_secrets_to_env(
+            &mut env,
+            &[("TOKEN".to_string(), SecretValue::new("resolved-value"))],
+        );
+        assert_eq!(env.get("TOKEN"), Some(&"resolved-value".to_string()));
+    }
+
+    /// Validation already expanded every reference. A second pass here would
+    /// eat a literal `$` out of a vault path.
+    #[tokio::test]
+    async fn up_does_not_substitute_secret_references() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://vault/${NOT_A_TOKEN}/item"}}"#,
+        );
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("an unrecognised variable must be left alone, not fail the command");
+        let batches = fake.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].reference(), "vault/${NOT_A_TOKEN}/item");
+    }
+
+    // ---- up-path secret invariants ----
+    //
+    // Four guarantees that a tidy-up of `run_with_runtime` would otherwise
+    // break silently: resolution stays on the create path, no `Debug` prints a
+    // value, an optional failure is survivable, and a resolved secret outranks
+    // every other env tier.
+
+    /// Hoisting the resolve call above the existing-container lookup costs a
+    /// provider prompt on every warm `dev up`, which is what makes people turn
+    /// secrets off. Validation still fires on this path; resolution must not.
+    #[tokio::test(start_paused = true)]
+    async fn up_does_not_resolve_secrets_when_reusing_a_running_container() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let fake = FakeProvider::answering(&[("TOKEN", "resolved-value")]);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a reusable running container must not need secrets");
+        assert_eq!(fake.calls(), 0, "reusing a container must not resolve");
+        assert!(
+            !rt.create_was_attempted(),
+            "a zero call count proves nothing if the run never reached either branch"
+        );
+        assert_eq!(
+            rt.execs().len(),
+            1,
+            "the reuse arm must run through the readiness probe"
+        );
+    }
+
+    /// Restoring `#[derive(Debug)]` on `ContainerConfig`, or adding a
+    /// convenience `Debug` to `SecretValue`, turns one future `{:?}` line into
+    /// a full secret dump. Nothing prints either today, so nothing else fails.
+    #[tokio::test]
+    async fn up_created_config_debug_does_not_leak_a_resolved_secret() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"LEAK_CHECK":"fake://leak"}}"#,
+        );
+        let fake = FakeProvider::answering(&[("LEAK_CHECK", "hunter2-sentinel")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a resolvable secret must not fail the command");
+
+        let created = rt.created_config();
+        assert_eq!(
+            created.env.get("LEAK_CHECK").map(String::as_str),
+            Some("hunter2-sentinel"),
+            "redaction that works by losing the value is not redaction"
+        );
+        let rendered = format!("{created:?}");
+        assert!(
+            !rendered.contains("hunter2-sentinel"),
+            "ContainerConfig Debug must not print env values"
+        );
+        assert!(
+            rendered.contains("LEAK_CHECK"),
+            "env keys must stay visible for debugging"
+        );
+        assert!(
+            rendered.contains("***"),
+            "redacted values must be marked, not dropped"
+        );
+        let value = format!("{:?}", SecretValue::new("hunter2-sentinel"));
+        assert!(
+            !value.contains("hunter2-sentinel"),
+            "SecretValue Debug must not print the value"
+        );
+    }
+
+    /// Applying resolved secrets before the `runArgs` env loop instead of after
+    /// it lets a checked-in `.env` win over the vault: the container comes up
+    /// fine and the app talks to the wrong backend.
+    #[tokio::test]
+    async fn up_secret_overrides_a_conflicting_env_file_key() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "SHARED=from_env_file\nOTHER=from_env_file\n");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"SHARED":"fake://shared"}}"#,
+        );
+        let fake = FakeProvider::answering(&[("SHARED", "from_secret")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("a resolvable secret must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from_secret"));
+        assert_eq!(
+            env.get("OTHER").map(String::as_str),
+            Some("from_env_file"),
+            "an env-file that stopped loading would look like a secret winning"
+        );
+    }
+
+    // ---- `--secrets-file`: literal values, in the `remoteEnv` tier ----
+    //
+    // A separate document from `secrets.json` with a separate loader. Nothing
+    // here parses a reference or asks a provider anything, and no error carries
+    // a value out of the document.
+
+    /// A `--secrets-file` document somewhere outside the workspace.
+    fn write_literals_file(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("literals.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn load_literals(
+        dir: &TempDir,
+        content: &str,
+    ) -> anyhow::Result<BTreeMap<String, SecretValue>> {
+        super::load_secrets_file(&write_literals_file(dir, content))
+    }
+
+    #[test]
+    fn secrets_file_loads_every_entry_as_a_literal() {
+        let dir = TempDir::new().unwrap();
+        let loaded = load_literals(&dir, r#"{"ONE":"first","TWO":"op://Private/x/y"}"#)
+            .expect("a flat string map must load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["ONE"].expose(), "first");
+        assert_eq!(
+            loaded["TWO"].expose(),
+            "op://Private/x/y",
+            "a value that looks like a reference is still a literal"
+        );
+    }
+
+    #[test]
+    fn secrets_file_empty_object_is_valid_and_empty() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            load_literals(&dir, "{}")
+                .expect("{} is a valid document")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn secrets_file_debug_prints_no_value() {
+        let dir = TempDir::new().unwrap();
+        let loaded = load_literals(&dir, r#"{"ONE":"first-value"}"#).unwrap();
+        let rendered = format!("{loaded:?}");
+        assert!(rendered.contains("ONE"));
+        assert!(!rendered.contains("first-value"), "{rendered}");
+    }
+
+    /// Table of documents this loader must reject, each with the text that must
+    /// be in the message and the text that must not.
+    #[test]
+    fn secrets_file_rejects_bad_documents_without_echoing_values() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                r#"{"version":1,"secrets":{"K":"op://a/b/c"}}"#,
+                "secrets",
+                "op://a/b/c",
+            ),
+            (
+                r#"["sentinel-alpha","sentinel-beta"]"#,
+                "must be a JSON object",
+                "sentinel-alpha",
+            ),
+            (
+                r#""just-a-string""#,
+                "must be a JSON object",
+                "just-a-string",
+            ),
+            (r#"{"PIN":1234}"#, "PIN", "1234"),
+            (r#"{"BAD KEY":"v"}"#, "BAD KEY", "v\""),
+            (
+                r#"{"":"v"}"#,
+                "not a valid environment variable name",
+                "v\"",
+            ),
+            (r#"{"A=B":"v"}"#, "A=B", "v\""),
+            (r#"{"K":"#, "not valid JSON", "K\":"),
+        ];
+        for (body, expected, forbidden) in cases {
+            let dir = TempDir::new().unwrap();
+            let err = load_literals(&dir, body).expect_err(&format!("`{body}` must be rejected"));
+            let msg = format!("{err}");
+            assert!(msg.contains(expected), "`{body}` gave: {msg}");
+            assert!(!msg.contains(forbidden), "`{body}` leaked content: {msg}");
+        }
+    }
+
+    #[test]
+    fn secrets_file_non_utf8_names_the_path_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("literals.json");
+        fs::write(&path, [0x7b, 0x22, 0xff, 0xfe, 0x22, 0x7d]).unwrap();
+        let err = super::load_secrets_file(&path).expect_err("non-UTF-8 must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("literals.json"), "{msg}");
+        assert!(msg.contains("not valid UTF-8"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn up_secrets_file_values_reach_the_created_container() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(&literals, r#"{"TOKEN":"literal-value"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect("a valid --secrets-file must not fail the command");
+        assert_eq!(
+            rt.created_config().env.get("TOKEN"),
+            Some(&"literal-value".to_string())
+        );
+    }
+
+    /// The flag sits in the `remoteEnv` tier, so it beats a config-declared
+    /// `remoteEnv` entry for the same key.
+    #[tokio::test]
+    async fn up_secrets_file_overrides_remote_env_for_the_same_key() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","remoteEnv":{"TOKEN":"from_remote_env","KEEP":"from_remote_env"}}"#,
+        );
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(&literals, r#"{"TOKEN":"from_secrets_file"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect("a valid --secrets-file must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("TOKEN"), Some(&"from_secrets_file".to_string()));
+        assert_eq!(
+            env.get("KEEP"),
+            Some(&"from_remote_env".to_string()),
+            "a remoteEnv that stopped loading would look like the flag winning"
+        );
+    }
+
+    /// ...and loses to `runArgs` env, which is the tier above it.
+    #[tokio::test]
+    async fn up_run_args_env_overrides_secrets_file_for_the_same_key() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","TOKEN=from_run_args"]}"#,
+        );
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(
+            &literals,
+            r#"{"TOKEN":"from_secrets_file","KEEP":"from_secrets_file"}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect("a valid --secrets-file must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("TOKEN"), Some(&"from_run_args".to_string()));
+        assert_eq!(env.get("KEEP"), Some(&"from_secrets_file".to_string()));
+    }
+
+    /// ...and loses to a resolved `secrets.json` secret, which is applied last.
+    #[tokio::test]
+    async fn up_resolved_secret_overrides_secrets_file_for_the_same_key() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(
+            &literals,
+            r#"{"TOKEN":"from_secrets_file","KEEP":"from_secrets_file"}"#,
+        );
+        let fake = FakeProvider::answering(&[("TOKEN", "resolved-value")]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers_and_secrets_file(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &fake),
+            Some(&path),
+        )
+        .await
+        .expect("a resolvable secret must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("TOKEN"), Some(&"resolved-value".to_string()));
+        assert_eq!(env.get("KEEP"), Some(&"from_secrets_file".to_string()));
+    }
+
+    /// A references document handed to the values flag is rejected by its
+    /// shape, before initializeCommand touches the host.
+    #[tokio::test]
+    async fn up_rejects_a_reference_shaped_secrets_file_before_any_side_effect() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized"}"#,
+        );
+        let marker = workspace.path().join("initialized");
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(
+            &literals,
+            r#"{"version":1,"secrets":{"TOKEN":"op://Private/x/y"}}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect_err("a references document must not load as literal values");
+        let msg = format!("{err}");
+        assert!(msg.contains("--secrets"), "{msg}");
+        assert!(!msg.contains("op://Private/x/y"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before the --secrets-file check"
+        );
+        assert!(!rt.create_was_attempted(), "{msg}");
+    }
+
+    /// Unlike the sidecar, an explicitly named file must be there.
+    #[tokio::test]
+    async fn up_rejects_a_missing_secrets_file_path() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let literals = TempDir::new().unwrap();
+        let path = literals.path().join("nothing-here.json");
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect_err("a missing --secrets-file path must fail the command");
+        let msg = format!("{err}");
+        assert!(msg.contains("nothing-here.json"), "{msg}");
+        assert!(!rt.create_was_attempted(), "{msg}");
+    }
+
+    /// The reuse path injects nothing, but it still validates: a bad document
+    /// is a bad document whichever branch the run would have taken.
+    #[tokio::test(start_paused = true)]
+    async fn up_rejects_a_bad_secrets_file_on_the_reuse_path_too() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(&literals, r#"{"PIN":1234}"#);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        let err = run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect_err("container reuse must still validate --secrets-file");
+        let msg = format!("{err}");
+        assert!(msg.contains("PIN"), "{msg}");
+        assert!(!msg.contains("1234"), "{msg}");
+        assert!(rt.execs().is_empty(), "the reuse arm must not have run");
+    }
+
+    /// Compose environment is written to a generated override file on disk, so
+    /// the flag is refused before any compose command runs.
+    #[tokio::test]
+    async fn up_rejects_a_secrets_file_on_a_compose_project() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("compose.yml"),
+            "services:\n  app:\n    image: ubuntu:24.04\n",
+        )
+        .unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","initializeCommand":"touch initialized"}"#,
+        );
+        let marker = workspace.path().join("initialized");
+        let literals = TempDir::new().unwrap();
+        let path = write_literals_file(&literals, r#"{"TOKEN":"literal-value"}"#);
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake_secrets_file(&rt, &workspace, Some(&path))
+            .await
+            .expect_err("--secrets-file must fail before any compose command");
+        let msg = format!("{err}");
+        assert!(msg.contains("--secrets-file"), "{msg}");
+        assert!(msg.contains("Compose"), "{msg}");
+        assert!(!msg.contains("literal-value"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before the compose rejection"
+        );
+    }
+
+    // ---- `--secrets`: a references file from somewhere else ----
+    //
+    // Replacement, never a merge: exactly one references file is read per
+    // `dev up`, so there is no precedence order between two reference sources.
+
+    /// A references document outside the workspace, for `--secrets`.
+    fn write_out_of_tree_secrets(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("elsewhere.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The invariant most likely to rot: a sidecar that exists is not read, not
+    /// parsed, and contributes no key. Both keys go through the same fake, so a
+    /// missing `SIDECAR_ONLY` cannot be an unresolvable-provider accident.
+    #[tokio::test]
+    async fn up_secrets_flag_overrides_sidecar() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"SIDECAR_ONLY":"fake://sidecar"}}"#,
+        );
+        let elsewhere = TempDir::new().unwrap();
+        let path = write_out_of_tree_secrets(
+            &elsewhere,
+            r#"{"version":1,"secrets":{"OVERRIDE_ONLY":"fake://override"}}"#,
+        );
+        let fake = FakeProvider::answering(&[
+            ("OVERRIDE_ONLY", "from-override"),
+            ("SIDECAR_ONLY", "from-sidecar"),
+        ]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers_and_secrets(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &fake),
+            Some(&path),
+        )
+        .await
+        .expect("an explicit --secrets file must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("OVERRIDE_ONLY"), Some(&"from-override".to_string()));
+        assert!(
+            !env.contains_key("SIDECAR_ONLY"),
+            "--secrets replaces the sidecar, it does not merge with it"
+        );
+        assert_eq!(
+            fake.batch_keys(),
+            vec![vec!["OVERRIDE_ONLY".to_string()]],
+            "the sidecar must not even be parsed"
+        );
+    }
+
+    /// A missing sidecar is not an error. A path the user typed is.
+    #[tokio::test]
+    async fn up_missing_explicit_secrets_path_errors_before_side_effects() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized"}"#,
+        );
+        let marker = workspace.path().join("initialized");
+        let elsewhere = TempDir::new().unwrap();
+        let path = elsewhere.path().join("never-created.json");
+        // A runtime whose listing always fails: reaching the lookup would report
+        // that instead, so the path in the message is the proof of ordering.
+        let rt = UpFakeRuntime::listing_never_works();
+        let err = run_up_with_fake_flags(&rt, &workspace, None, Some(&path))
+            .await
+            .expect_err("a --secrets path that is not a file must fail the command");
+        let msg = format!("{err}");
+        assert!(msg.contains("never-created.json"), "{msg}");
+        assert!(msg.contains("--secrets"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before the --secrets check"
+        );
+        assert!(!rt.create_was_attempted(), "{msg}");
+    }
+
+    /// Both flags at once. Each loads through its own loader, and the resolved
+    /// `--secrets` entry still wins because resolved secrets are applied last.
+    #[tokio::test]
+    async fn up_secrets_and_secrets_file_stay_independent() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let elsewhere = TempDir::new().unwrap();
+        let references = write_out_of_tree_secrets(
+            &elsewhere,
+            r#"{"version":1,"secrets":{"SHARED":"fake://shared","REFERENCE_ONLY":"fake://ref"}}"#,
+        );
+        let literals = TempDir::new().unwrap();
+        let values = write_literals_file(
+            &literals,
+            r#"{"SHARED":"from_secrets_file","LITERAL_ONLY":"literal-value"}"#,
+        );
+        let fake = FakeProvider::answering(&[
+            ("SHARED", "from_reference"),
+            ("REFERENCE_ONLY", "reference-value"),
+        ]);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers_and_flags(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &fake),
+            Some(&values),
+            Some(&references),
+        )
+        .await
+        .expect("both secret flags together must not fail the command");
+        let env = rt.created_config().env;
+        assert_eq!(env.get("SHARED"), Some(&"from_reference".to_string()));
+        assert_eq!(
+            env.get("REFERENCE_ONLY"),
+            Some(&"reference-value".to_string())
+        );
+        assert_eq!(env.get("LITERAL_ONLY"), Some(&"literal-value".to_string()));
+    }
+
+    /// The compose branch returns before anything would read a references file,
+    /// so an accepted `--secrets` would be a path read by nothing.
+    #[tokio::test]
+    async fn up_rejects_explicit_secrets_for_compose() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("compose.yml"),
+            "services:\n  app:\n    image: ubuntu:24.04\n",
+        )
+        .unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","initializeCommand":"touch initialized"}"#,
+        );
+        let marker = workspace.path().join("initialized");
+        let elsewhere = TempDir::new().unwrap();
+        // Empty on purpose: naming a file this path reads with nothing is still
+        // the silent misbehaviour the rejection exists to prevent.
+        let path = write_out_of_tree_secrets(&elsewhere, r#"{"version":1,"secrets":{}}"#);
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_providers_and_secrets(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &fake),
+            Some(&path),
+        )
+        .await
+        .expect_err("--secrets must fail before any compose command");
+        let msg = format!("{err}");
+        assert!(msg.contains("elsewhere.json"), "{msg}");
+        assert!(msg.contains("Compose"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before the compose rejection"
+        );
+        assert_eq!(fake.calls(), 0, "the compose path resolves nothing");
+    }
+
     /// Compose projects have a separate runtime path; non-empty runArgs must
     /// fail explicitly instead of being silently ignored or passed to docker
     /// compose indirectly.
@@ -4069,6 +5392,44 @@ mod tests {
             msg.contains("Compose") || msg.contains("compose"),
             "error should direct users to compose service configuration: {msg}"
         );
+    }
+
+    /// The Compose path builds its own env map and never reads `secrets.json`,
+    /// so a declared secret must fail before `run_compose` does anything. The
+    /// missing `initialized` marker is the proof: `initializeCommand` is the
+    /// first thing `run_compose` runs.
+    #[tokio::test]
+    async fn compose_project_with_secrets_fails_before_any_compose_side_effect() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("compose.yml"),
+            "services:\n  app:\n    image: ubuntu:24.04\n",
+        )
+        .unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","initializeCommand":"touch initialized"}"#,
+        );
+        write_secrets_json(&workspace, ONE_FAKE_SECRET);
+        let marker = workspace.path().join("initialized");
+
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect_err("a compose secrets.json must fail before any compose command");
+        let msg = format!("{err}");
+
+        assert!(msg.contains("secrets.json"), "{msg}");
+        assert!(msg.contains("Compose"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before the compose rejection"
+        );
+        assert!(!rt.create_was_attempted(), "{msg}");
+        assert_eq!(fake.calls(), 0, "the compose path resolves nothing");
     }
 
     /// Compose `up -d` can return and `compose ps -q <service>` can identify

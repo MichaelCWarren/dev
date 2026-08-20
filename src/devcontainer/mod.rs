@@ -8,6 +8,7 @@ pub mod lockfile;
 pub mod merge;
 pub mod recipe;
 pub mod run_args;
+pub mod secrets;
 pub mod templates;
 pub mod uid;
 pub mod variables;

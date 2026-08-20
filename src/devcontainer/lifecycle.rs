@@ -296,14 +296,18 @@ async fn run_hook<R: ContainerRuntime + ?Sized>(
         LifecycleCommand::Single(command) => {
             eprintln!("[lifecycle] Running {name}: {command}");
             let args = hook_args(command, host);
-            let result = runtime.exec(container_id, &args, user, workdir).await?;
+            let result = runtime
+                .exec(container_id, &args, user, workdir, &[])
+                .await?;
             check_result(name, command, &result)?;
         }
         LifecycleCommand::Multiple(commands) => {
             for command in commands {
                 eprintln!("[lifecycle] Running {name}: {command}");
                 let args = hook_args(command, host);
-                let result = runtime.exec(container_id, &args, user, workdir).await?;
+                let result = runtime
+                    .exec(container_id, &args, user, workdir, &[])
+                    .await?;
                 check_result(name, command, &result)?;
             }
         }
@@ -354,7 +358,13 @@ async fn run_parallel<R: ContainerRuntime + ?Sized>(
                 eprintln!("[lifecycle] Running {name} ({label}): {command}");
                 let args = hook_args(&command, host);
                 let result = runtime
-                    .exec(&container_id, &args, user.as_deref(), workdir.as_deref())
+                    .exec(
+                        &container_id,
+                        &args,
+                        user.as_deref(),
+                        workdir.as_deref(),
+                        &[],
+                    )
                     .await?;
                 check_result(&name, &command, &result)?;
                 Ok::<(), DevError>(())

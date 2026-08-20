@@ -180,6 +180,7 @@ mod tests {
     //!   2. A stop failure on container 0 does not skip removal for container 1.
     //!   3. Removal success after stop failure does not fail the command.
     use super::run_with_runtime;
+    use crate::devcontainer::secrets::SecretValue;
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
@@ -325,6 +326,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'static, ExecResult> {
             as_fut(Ok(ExecResult {
                 exit_code: 0,
@@ -339,6 +341,7 @@ mod tests {
             _cmd: &[String],
             _user: Option<&str>,
             _workdir: Option<&str>,
+            _env: &[(String, SecretValue)],
         ) -> BoxFut<'static, i32> {
             as_fut(Ok(0))
         }

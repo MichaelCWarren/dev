@@ -401,6 +401,7 @@ async fn find_netcat(runtime: &dyn ContainerRuntime, container_id: &str) -> anyh
                 &["which".to_string(), name.to_string()],
                 None,
                 None,
+                &[],
             )
             .await?;
         if result.exit_code == 0 {

@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
+use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, terminal_size,
+    ExecResult, ImageMetadata, env_assignments, terminal_size,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -186,6 +187,15 @@ fn recorded_exit_code(running: Option<bool>, exit_code: Option<i64>) -> Option<i
         return None;
     }
     exit_code.map(|code| code as i32)
+}
+
+/// Which of an exec's streams are attached, and whether it runs on a tty.
+#[derive(Clone, Copy)]
+struct ExecStreams {
+    attach_stdin: bool,
+    attach_stdout: bool,
+    attach_stderr: bool,
+    tty: bool,
 }
 
 impl BollardRuntime {
@@ -490,19 +500,18 @@ impl BollardRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
-        attach_stdin: bool,
-        attach_stdout: bool,
-        attach_stderr: bool,
-        tty: bool,
+        env: &[String],
+        streams: ExecStreams,
     ) -> CreateExecOptions<String> {
         CreateExecOptions {
             cmd: Some(cmd.to_vec()),
-            attach_stdin: Some(attach_stdin),
-            attach_stdout: Some(attach_stdout),
-            attach_stderr: Some(attach_stderr),
-            tty: Some(tty),
+            attach_stdin: Some(streams.attach_stdin),
+            attach_stdout: Some(streams.attach_stdout),
+            attach_stderr: Some(streams.attach_stderr),
+            tty: Some(streams.tty),
             user: user.map(|u| u.to_string()),
             working_dir: workdir.map(|d| d.to_string()),
+            env: (!env.is_empty()).then(|| env.to_vec()),
             ..Default::default()
         }
     }
@@ -513,6 +522,7 @@ impl BollardRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[String],
     ) -> Result<ExecResult, DevError> {
         use futures_util::StreamExt;
 
@@ -521,9 +531,16 @@ impl BollardRuntime {
             .create_exec(
                 id,
                 Self::create_exec_options(
-                    cmd, user, workdir, /* attach_stdin */ false,
-                    /* attach_stdout */ true, /* attach_stderr */ true,
-                    /* tty */ false,
+                    cmd,
+                    user,
+                    workdir,
+                    env,
+                    ExecStreams {
+                        attach_stdin: false,
+                        attach_stdout: true,
+                        attach_stderr: true,
+                        tty: false,
+                    },
                 ),
             )
             .await?;
@@ -563,6 +580,7 @@ impl BollardRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[String],
     ) -> Result<i32, DevError> {
         use futures_util::StreamExt;
 
@@ -571,9 +589,16 @@ impl BollardRuntime {
             .create_exec(
                 id,
                 Self::create_exec_options(
-                    cmd, user, workdir, /* attach_stdin */ true,
-                    /* attach_stdout */ true, /* attach_stderr */ true,
-                    /* tty */ true,
+                    cmd,
+                    user,
+                    workdir,
+                    env,
+                    ExecStreams {
+                        attach_stdin: true,
+                        attach_stdout: true,
+                        attach_stderr: true,
+                        tty: true,
+                    },
                 ),
             )
             .await?;
@@ -1006,13 +1031,15 @@ impl ContainerRuntime for BollardRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, ExecResult> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
+        let env = env_assignments(env);
         Box::pin(async move {
-            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref(), &env)
                 .await
         })
     }
@@ -1027,13 +1054,15 @@ impl ContainerRuntime for BollardRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
+        let env = env_assignments(env);
         Box::pin(async move {
-            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref(), &env)
                 .await
         })
     }
@@ -1143,8 +1172,9 @@ impl ContainerRuntime for DockerRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, ExecResult> {
-        self.0.exec(id, cmd, user, workdir)
+        self.0.exec(id, cmd, user, workdir, env)
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
@@ -1157,8 +1187,9 @@ impl ContainerRuntime for DockerRuntime {
         cmd: &[String],
         user: Option<&str>,
         workdir: Option<&str>,
+        env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32> {
-        self.0.exec_interactive(id, cmd, user, workdir)
+        self.0.exec_interactive(id, cmd, user, workdir, env)
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -1315,10 +1346,13 @@ mod tests {
             &["cargo".to_string(), "test".to_string()],
             Some("vscode"),
             Some("/srv/app/packages/api"),
-            false,
-            true,
-            true,
-            false,
+            &[],
+            ExecStreams {
+                attach_stdin: false,
+                attach_stdout: true,
+                attach_stderr: true,
+                tty: false,
+            },
         );
 
         assert_eq!(opts.working_dir.as_deref(), Some("/srv/app/packages/api"));
@@ -1428,6 +1462,33 @@ mod tests {
             recorded_exit_code(Some(false), None),
             None,
             "a stopped exec whose code is not recorded yet is not a success"
+        );
+    }
+
+    #[test]
+    fn exec_options_carry_the_env_assignments_in_order() {
+        let streams = ExecStreams {
+            attach_stdin: false,
+            attach_stdout: true,
+            attach_stderr: true,
+            tty: false,
+        };
+        let env = ["A=1".to_string(), "B=2".to_string()];
+
+        let options =
+            BollardRuntime::create_exec_options(&["bash".to_string()], None, None, &env, streams);
+
+        assert_eq!(
+            options.env,
+            Some(vec!["A=1".to_string(), "B=2".to_string()])
+        );
+
+        let options =
+            BollardRuntime::create_exec_options(&["bash".to_string()], None, None, &[], streams);
+
+        assert_eq!(
+            options.env, None,
+            "an exec with no extra env sends the same body as before"
         );
     }
 }
