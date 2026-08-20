@@ -226,24 +226,38 @@ impl PluginProvider {
             .spawn()
             .map_err(|err| self.spawn_error(err))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            // A plugin may answer without draining stdin, which closes the pipe
-            // under us. Its response is what matters, so a broken pipe here is
-            // not a failure. Dropping the handle before awaiting the output is
-            // what keeps such a plugin from deadlocking against dev.
-            match stdin.write_all(&body).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(err) => {
-                    return Err(self.failed(format!(
-                        "could not send the request to plugin `{}`: {err}",
-                        self.binary_name()
-                    )));
-                }
-            }
-        }
+        // Writing to completion before awaiting the child deadlocks as soon as
+        // both pipes fill: dev blocks on a full stdin pipe while the plugin
+        // blocks on a full stdout pipe, and dev owns no clock here, so nothing
+        // ever breaks the tie. `spawn_op` writes concurrently for the same
+        // reason. The handle must also be closed or a plugin that reads to EOF
+        // waits forever.
+        let stdin = child.stdin.take();
+        let (written, output) = tokio::join!(
+            async move {
+                let Some(mut pipe) = stdin else {
+                    return Ok(());
+                };
+                pipe.write_all(&body).await?;
+                pipe.shutdown().await
+            },
+            self.wait_with_notice(child),
+        );
 
-        let output = self.wait_with_notice(child).await?;
+        let output = output?;
+        // A plugin may answer without draining stdin, which closes the pipe
+        // under us, so a broken pipe is not a failure. Any other write error is,
+        // but only when the plugin itself succeeded: a plugin that died has a
+        // status and a stderr of its own, and reporting the pipe would hide it.
+        if let Err(err) = written
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+            && output.status.success()
+        {
+            return Err(self.failed(format!(
+                "could not send the request to plugin `{}`: {err}",
+                self.binary_name()
+            )));
+        }
         if !output.status.success() {
             return Err(self.failed(self.exit_reason(output.status)));
         }
@@ -666,6 +680,38 @@ mod tests {
             serde_json::from_str::<PluginRequest>(&sent).unwrap(),
             provider.build_request(&refs)
         );
+    }
+
+    /// Both pipes full at once. The plugin writes a response far larger than a
+    /// pipe buffer before it reads a byte of a request that is itself larger
+    /// than one, so a dev that wrote stdin to completion first would block
+    /// against a plugin blocked on stdout, with no clock on either side to break
+    /// it. The timeout is what turns that regression into a failure rather than
+    /// a suite that never finishes.
+    #[tokio::test]
+    async fn a_large_request_and_a_large_response_do_not_deadlock() {
+        const PAD: usize = 256 * 1024;
+        let dir = TempDir::new().unwrap();
+        let provider = plugin(
+            &dir,
+            &format!(
+                r#"printf '{{"version":1,"secrets":[{{"key":"A","value":"'
+head -c {PAD} /dev/zero | tr '\0' 'x'
+printf '"}}]}}'
+cat >/dev/null"#
+            ),
+        );
+        let refs: Vec<SecretRef> = (0..300)
+            .map(|i| secret_ref("A", &format!("kv/{i}/{}", "p".repeat(1000))))
+            .collect();
+
+        let batch = tokio::time::timeout(Duration::from_secs(30), provider.resolve(&refs))
+            .await
+            .expect("resolving must not deadlock on a full stdin and a full stdout")
+            .unwrap();
+
+        assert_eq!(batch.values().len(), refs.len());
+        assert_eq!(batch.values()[0].1.expose().len(), PAD);
     }
 
     #[tokio::test]

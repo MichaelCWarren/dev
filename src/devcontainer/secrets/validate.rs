@@ -32,10 +32,6 @@ pub struct ValidatedSecrets {
 }
 
 impl ValidatedSecrets {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// The file these entries came from, or `None` when there was no sidecar.
     pub fn source(&self) -> Option<&Path> {
         self.source.as_deref()
@@ -203,7 +199,7 @@ mod tests {
         let registry = registry(dir.path());
         let validated =
             validate_secrets_for_config(&config_path, dir.path(), None, &registry).unwrap();
-        assert!(validated.is_empty());
+        assert!(validated.entries().is_empty());
         assert!(validated.source().is_none());
     }
 

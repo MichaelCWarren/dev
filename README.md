@@ -398,7 +398,9 @@ sidecar on every invocation, so a rotated secret reaches the next command with
 no rebuild.
 
 Create-time secret values are readable through `docker inspect` — that is
-inherent to environment variables, and `createTime: false` is the way out.
+inherent to environment variables, and `createTime: false` is the way out. It is
+also what Docker Compose projects use: Compose creates containers through
+`docker compose up`, so it takes exec-time secrets and refuses create-time ones.
 
 See [docs/secrets.md](docs/secrets.md) for the full reference.
 

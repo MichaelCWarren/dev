@@ -40,6 +40,28 @@ pub use validate::{ValidatedSecrets, validate_secrets_at, validate_secrets_for_c
 /// The redaction both `Debug` and `Display` print in place of the value.
 const REDACTED: &str = "***";
 
+/// Why `name` cannot be an environment variable, or `None` when it can.
+///
+/// One rule for both ways a name reaches this feature: a `secrets.json` key and
+/// a `--secrets-file` key. It returns the reason rather than an error because
+/// the two build different errors around it — one names a reference, the other
+/// names a flag — and the check itself must not drift between them.
+///
+/// `char::is_whitespace`, not `is_ascii_whitespace`: a key holding U+00A0 is
+/// just as unusable and twice as hard to see.
+pub fn env_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("the environment variable name is empty");
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Some("the environment variable name contains whitespace");
+    }
+    if name.contains('=') {
+        return Some("the environment variable name contains `=`");
+    }
+    None
+}
+
 /// A resolved secret value.
 ///
 /// `Debug` and `Display` both print `***`, so a stray `{:?}` in a log line or an

@@ -11,6 +11,7 @@ use crate::devcontainer::features::{
     generate_feature_dockerfile_with_opts, order_features,
 };
 use crate::devcontainer::secrets::discovery::secrets_file_path;
+use crate::devcontainer::secrets::env_name_problem;
 use crate::devcontainer::secrets::validate::validate_secrets_at;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue, ValidatedSecrets};
 use crate::devcontainer::uid;
@@ -225,7 +226,11 @@ pub(crate) async fn run_with_runtime_with_providers(
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
         reject_project_run_args_for_compose(&config, project_declared_run_args)?;
+        // Both refusals precede validation: a flag this path cannot honour is
+        // worth saying so about before the user is asked to fix a file the
+        // answer does not depend on.
         reject_secrets_file_for_compose(secrets_file)?;
+        reject_secrets_override_for_compose(secrets_override)?;
         let secrets = validate_workspace_secrets(
             &config,
             &config_path,
@@ -233,7 +238,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             providers,
             secrets_override,
         )?;
-        reject_secrets_for_compose(&config, &secrets, secrets_override)?;
+        reject_secrets_for_compose(&config, &secrets)?;
         return run_compose(
             workspace,
             &config,
@@ -576,7 +581,12 @@ pub(crate) async fn run_with_runtime_with_providers(
             env.insert(k.clone(), substitute_variables(v, workspace));
         }
     }
-    apply_secrets_file_env(&mut env, &secrets_file_env);
+    // `--secrets-file` sits in the `remoteEnv` tier, so a `runArgs` env entry and
+    // a resolved `secrets.json` secret both still outrank it.
+    apply_secrets_to_env(
+        &mut env,
+        secrets_file_env.iter().map(|(k, v)| (k.as_str(), v)),
+    );
 
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports = caddy_ports_from_config(&config);
@@ -631,7 +641,10 @@ pub(crate) async fn run_with_runtime_with_providers(
 
     // Secrets last: highest precedence over containerEnv, remoteEnv, and both
     // `runArgs` env tiers. Nothing may be inserted into `env` below this line.
-    apply_secrets_to_env(&mut env, &resolved_secrets);
+    apply_secrets_to_env(
+        &mut env,
+        resolved_secrets.iter().map(|(k, v)| (k.as_str(), v)),
+    );
 
     let workspace_folder = config.workspace_folder_path(workspace, remote_user)?;
 
@@ -829,9 +842,15 @@ async fn resolve_create_time_secrets(
 /// Last, so a secret outranks `containerEnv`, `remoteEnv`, and both `runArgs`
 /// env tiers. Anything inserted into `env` after this call would silently
 /// shadow a live secret with a stale one.
-fn apply_secrets_to_env(env: &mut HashMap<String, String>, secrets: &[(String, SecretValue)]) {
+/// Write resolved values into the create-time env map. Which tier that lands in
+/// is the call site's business; see the two calls in
+/// `run_with_runtime_with_providers`.
+fn apply_secrets_to_env<'a>(
+    env: &mut HashMap<String, String>,
+    secrets: impl IntoIterator<Item = (&'a str, &'a SecretValue)>,
+) {
     for (key, value) in secrets {
-        env.insert(key.clone(), value.expose().to_string());
+        env.insert(key.to_string(), value.expose().to_string());
     }
 }
 
@@ -896,9 +915,9 @@ fn secrets_file_entry(
     key: &str,
     value: &serde_json::Value,
 ) -> Result<(String, SecretValue), DevError> {
-    if key.is_empty() || key.contains('=') || key.chars().any(|c| c.is_ascii_whitespace()) {
+    if let Some(reason) = env_name_problem(key) {
         return Err(DevError::InvalidConfig(format!(
-            "`--secrets-file` `{}`: `{key}` is not a valid environment variable name",
+            "`--secrets-file` `{}`: `{key}` is not a valid environment variable name: {reason}",
             path.display()
         )));
     }
@@ -909,17 +928,6 @@ fn secrets_file_entry(
         ))
     })?;
     Ok((key.to_string(), SecretValue::new(text)))
-}
-
-/// Apply `--secrets-file` values in the `remoteEnv` tier, so a `runArgs` env
-/// entry and a resolved `secrets.json` secret both still outrank them.
-fn apply_secrets_file_env(
-    env: &mut HashMap<String, String>,
-    values: &BTreeMap<String, SecretValue>,
-) {
-    for (key, value) in values {
-        env.insert(key.clone(), value.expose().to_string());
-    }
 }
 
 /// Compose writes its environment into a generated override file on disk, which
@@ -936,8 +944,13 @@ fn reject_secrets_file_for_compose(secrets_file: Option<&Path>) -> anyhow::Resul
 }
 
 /// Compose creates its containers through `docker compose up`, so nothing on
-/// that path would ever read a `secrets.json`. Say so instead of leaving a
-/// container that comes up green and misbehaves later with the secrets missing.
+/// that path injects create-time secrets. Say so instead of leaving a container
+/// that comes up green and misbehaves later with the secrets missing.
+///
+/// `createTime: false` entries pass. They are never injected at create on any
+/// runtime; `dev exec` and `dev shell` resolve them per invocation and pass them
+/// on the exec itself, which is a path Compose shares. The generated override
+/// file never sees them, so the "no secret value reaches disk" rule holds.
 ///
 /// Non-compose configs pass, so this is safe to call without a caller-side
 /// `is_compose()` guard. An empty `secrets` map declares nothing and passes too,
@@ -945,14 +958,32 @@ fn reject_secrets_file_for_compose(secrets_file: Option<&Path>) -> anyhow::Resul
 fn reject_secrets_for_compose(
     config: &DevcontainerConfig,
     secrets: &ValidatedSecrets,
-    secrets_override: Option<&Path>,
 ) -> anyhow::Result<()> {
-    // An explicit `--secrets` is refused even when it declares nothing: the
-    // user named a references file that this path would read with nothing.
-    let declared = secrets_override.or_else(|| secrets.source().filter(|_| !secrets.is_empty()));
-    if let (true, Some(path)) = (config.is_compose(), declared) {
+    if !config.is_compose() {
+        return Ok(());
+    }
+    let Some(path) = secrets.source() else {
+        return Ok(());
+    };
+    let create_time: Vec<&str> = secrets.create_time_entries().map(|r| r.key()).collect();
+    if create_time.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "create-time secrets are not supported for Docker Compose devcontainers in `dev`; they are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. In {}, either add `\"createTime\": false` to {} so the value is injected on `dev exec` and `dev shell` instead, or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
+        path.display(),
+        create_time.join(", ")
+    );
+}
+
+/// `--secrets` replaces the sidecar for one `dev up`, and the Compose path has
+/// no create-time injection for it to feed. Refusing it is what keeps the flag
+/// from reading as a working override: `dev exec` and `dev shell` rediscover the
+/// sidecar per invocation and would never see the named file.
+fn reject_secrets_override_for_compose(secrets_override: Option<&Path>) -> anyhow::Result<()> {
+    if let Some(path) = secrets_override {
         anyhow::bail!(
-            "`secrets.json` is not supported for Docker Compose devcontainers in `dev`; secrets are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. Remove {} or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
+            "`--secrets` is not supported for Docker Compose devcontainers in `dev`; `dev up` injects create-time secrets when it creates the container, and the Compose path creates containers through `docker compose up` instead. Remove `--secrets {}`; exec-time secrets come from the `secrets.json` beside the config, which `dev exec` and `dev shell` read on every invocation.",
             path.display()
         );
     }
@@ -2102,7 +2133,7 @@ mod tests {
         apply_cli_overrides, apply_run_args_capabilities, apply_secrets_to_env,
         caddy_ports_from_config, ensure_image_present, merge_caddy_ports, parse_mounts,
         parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
-        reject_secrets_for_compose, substitute_mounts,
+        reject_secrets_for_compose, reject_secrets_override_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
@@ -2346,43 +2377,91 @@ mod tests {
         .expect("the fixture must parse and name a known provider")
     }
 
+    fn compose_config() -> DevcontainerConfig {
+        serde_json::from_str(r#"{"dockerComposeFile":"compose.yml","service":"app"}"#).unwrap()
+    }
+
     #[test]
-    fn compose_project_with_secrets_is_rejected_with_compose_guidance() {
-        let config: DevcontainerConfig =
-            serde_json::from_str(r#"{"dockerComposeFile":"compose.yml","service":"app"}"#).unwrap();
+    fn compose_project_with_create_time_secrets_is_rejected_with_compose_guidance() {
+        let config = compose_config();
         let workspace = TempDir::new().unwrap();
         let secrets = validated_secrets(
             &workspace,
             r#"{"version":1,"secrets":{"TOKEN":"fake://vault/distinctive-reference"}}"#,
         );
 
-        let err = reject_secrets_for_compose(&config, &secrets, None).unwrap_err();
+        let err = reject_secrets_for_compose(&config, &secrets).unwrap_err();
         let msg = format!("{err}");
 
-        assert!(msg.contains("secrets.json"), "{msg}");
+        assert!(msg.contains("TOKEN"), "error should name the key: {msg}");
         assert!(
             msg.contains(&secrets.source().unwrap().display().to_string()),
             "error should name the discovered file: {msg}"
         );
         assert!(msg.contains("Compose"), "{msg}");
         assert!(
+            msg.contains("createTime"),
+            "error should point at the way out: {msg}"
+        );
+        assert!(
             !msg.contains("distinctive-reference"),
             "no reference body may reach the message: {msg}"
         );
     }
 
+    /// The narrow rule: Compose refuses what it cannot inject, and nothing more.
+    /// A `createTime: false` entry never reaches container creation on any
+    /// runtime, so the Compose override file never sees it either. `dev exec`
+    /// and `dev shell` resolve it per invocation and pass it on the exec.
+    #[test]
+    fn compose_project_with_exec_time_only_secrets_is_allowed() {
+        let config = compose_config();
+        let workspace = TempDir::new().unwrap();
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","createTime":false}}}"#,
+        );
+
+        reject_secrets_for_compose(&config, &secrets)
+            .expect("an exec-time-only secret is injected on a path Compose shares");
+    }
+
+    /// A file mixing both is refused, and the message names only the entries
+    /// that are actually the problem.
+    #[test]
+    fn compose_rejection_names_only_the_create_time_keys() {
+        let config = compose_config();
+        let workspace = TempDir::new().unwrap();
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{
+                "AT_CREATE":"fake://one",
+                "AT_EXEC":{"provider":"fake","ref":"two","createTime":false}
+            }}"#,
+        );
+
+        let msg = format!(
+            "{}",
+            reject_secrets_for_compose(&config, &secrets).unwrap_err()
+        );
+
+        assert!(msg.contains("AT_CREATE"), "{msg}");
+        assert!(
+            !msg.contains("AT_EXEC"),
+            "an exec-time key is not what is being refused: {msg}"
+        );
+    }
+
     #[test]
     fn compose_project_without_secrets_is_not_rejected() {
-        let config: DevcontainerConfig =
-            serde_json::from_str(r#"{"dockerComposeFile":"compose.yml","service":"app"}"#).unwrap();
+        let config = compose_config();
 
-        reject_secrets_for_compose(&config, &ValidatedSecrets::default(), None)
+        reject_secrets_for_compose(&config, &ValidatedSecrets::default())
             .expect("no secrets.json is nothing to reject");
 
         let workspace = TempDir::new().unwrap();
         let empty = validated_secrets(&workspace, r#"{"version":1,"secrets":{}}"#);
-        reject_secrets_for_compose(&config, &empty, None)
-            .expect("an empty secrets map declares nothing");
+        reject_secrets_for_compose(&config, &empty).expect("an empty secrets map declares nothing");
     }
 
     #[test]
@@ -2395,8 +2474,24 @@ mod tests {
             r#"{"version":1,"secrets":{"TOKEN":"fake://item"}}"#,
         );
 
-        reject_secrets_for_compose(&config, &secrets, None)
+        reject_secrets_for_compose(&config, &secrets)
             .expect("the image path resolves secrets rather than rejecting them");
+    }
+
+    /// `--secrets` feeds create-time injection only, and Compose has none.
+    #[test]
+    fn compose_project_with_a_secrets_override_is_rejected() {
+        let msg = format!(
+            "{}",
+            reject_secrets_override_for_compose(Some(Path::new("/w/other-secrets.json")))
+                .unwrap_err()
+        );
+
+        assert!(msg.contains("--secrets"), "{msg}");
+        assert!(msg.contains("other-secrets.json"), "{msg}");
+        assert!(msg.contains("Compose"), "{msg}");
+
+        reject_secrets_override_for_compose(None).expect("no override is nothing to reject");
     }
 
     #[test]
@@ -4781,16 +4876,20 @@ mod tests {
     }
 
     /// Secrets are applied last, so they overwrite whatever the earlier env
-    /// tiers left under the same key.
+    /// tiers left under the same key. Both call sites feed the same function, so
+    /// the `--secrets-file` map and the resolved list get the same treatment.
     #[test]
     fn apply_secrets_to_env_overwrites_existing_key() {
+        let resolved = [("TOKEN".to_string(), SecretValue::new("resolved-value"))];
         let mut env = HashMap::new();
         env.insert("TOKEN".to_string(), "from-env-file".to_string());
-        apply_secrets_to_env(
-            &mut env,
-            &[("TOKEN".to_string(), SecretValue::new("resolved-value"))],
-        );
+        apply_secrets_to_env(&mut env, resolved.iter().map(|(k, v)| (k.as_str(), v)));
         assert_eq!(env.get("TOKEN"), Some(&"resolved-value".to_string()));
+
+        let from_file: BTreeMap<String, SecretValue> =
+            [("TOKEN".to_string(), SecretValue::new("literal-value"))].into();
+        apply_secrets_to_env(&mut env, from_file.iter().map(|(k, v)| (k.as_str(), v)));
+        assert_eq!(env.get("TOKEN"), Some(&"literal-value".to_string()));
     }
 
     /// Validation already expanded every reference. A second pass here would
@@ -4998,6 +5097,9 @@ mod tests {
                 "v\"",
             ),
             (r#"{"A=B":"v"}"#, "A=B", "v\""),
+            // U+00A0. `secrets.json` refuses it, so this flag must too:
+            // `env_name_problem` is the one rule both go through.
+            ("{\"A\u{a0}B\":\"v\"}", "contains whitespace", "v\""),
             (r#"{"K":"#, "not valid JSON", "K\":"),
         ];
         for (body, expected, forbidden) in cases {

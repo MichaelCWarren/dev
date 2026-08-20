@@ -12,6 +12,7 @@
 //! names, the version, and the path ever reaches a message, so a reference body
 //! that turns out to be a pasted secret cannot escape through an error.
 
+use super::env_name_problem;
 use super::reference::SecretRef;
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::error::DevError;
@@ -82,23 +83,16 @@ fn build_refs(raw: Vec<(String, Value)>) -> Result<Vec<SecretRef>, DevError> {
         .collect()
 }
 
-/// The rule `run_args.rs` splits across `push_env_flag_token` and
-/// `parse_env_file_content`, widened to the whole of it: non-empty, no
-/// whitespace, no `=`.
+/// [`env_name_problem`] as a per-key error. The rule itself is shared with
+/// `--secrets-file`, which applies the same one to its literal keys.
 fn validate_env_name(key: &str) -> Result<(), DevError> {
-    let reason = if key.is_empty() {
-        "the environment variable name is empty"
-    } else if key.chars().any(char::is_whitespace) {
-        "the environment variable name contains whitespace"
-    } else if key.contains('=') {
-        "the environment variable name contains `=`"
-    } else {
-        return Ok(());
-    };
-    Err(DevError::SecretReference {
-        key: key.to_string(),
-        reason: reason.to_string(),
-    })
+    match env_name_problem(key) {
+        None => Ok(()),
+        Some(reason) => Err(DevError::SecretReference {
+            key: key.to_string(),
+            reason: reason.to_string(),
+        }),
+    }
 }
 
 /// A repeated key is the one per-key problem serde detects, so lift it back off

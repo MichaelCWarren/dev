@@ -810,16 +810,14 @@ Anyone who can talk to the container daemon can read them. `createTime: false`
 is the way out when it matters: the value is then injected only at exec time and
 never reaches the container's create-time environment.
 
-**On Podman, `dev shell` exposes resolved values in the host process table.**
-Podman's HTTP API does not reliably support interactive TTY exec, so `dev shell`
-shells out to the `podman` binary instead. Each secret arrives as a
-`-e KEY=VALUE` argument, and any process running as the same user can read it
-with `ps`. Docker — both the bollard path and the CLI wrapper — and Apple
-Containers pass environment through an API and never put it on a command line;
-so does `dev exec` on Podman, which uses the API rather than the binary. This is
-a known and accepted consequence of how Podman does interactive exec. The
-mitigation is the ordinary one: do not run untrusted processes as your own user,
-or use the Docker runtime where it matters.
+**No resolved value reaches a command line, on any runtime.** Docker and Apple
+Containers pass environment through an API. Podman's HTTP API does not reliably
+support interactive TTY exec, so `dev shell` shells out to the `podman` binary —
+but it passes `-e NAME` with the name only and puts the value in the podman
+client's own environment, which `podman` then reads back. That distinction is
+worth stating plainly: `/proc/<pid>/cmdline` is world readable, so an assignment
+in argv is legible to every user on the host, while `/proc/<pid>/environ` is
+readable only by the process owner.
 
 **`dev` never writes a resolved value to disk.** Not the lockfile, not the
 `devcontainer.metadata` image label, no cache anywhere. Values live in memory
@@ -843,14 +841,33 @@ not the secret. See the [committed-file warning](#where-secretsjson-goes).
 
 ## Docker Compose
 
-Secrets are not supported for Docker Compose devcontainers, and both flags and
-the sidecar are rejected before any Compose side effect — the same way
-project-declared `runArgs` are rejected.
+Compose supports exec-time secrets and refuses create-time ones. Every refusal
+lands before any Compose side effect, the same way project-declared `runArgs`
+are rejected.
 
-A `secrets.json` beside a Compose config:
+`"createTime": false` works on Compose exactly as it does everywhere else. Such
+an entry is never injected at container creation on any runtime — `dev exec` and
+`dev shell` resolve it per invocation and pass it on the exec itself, and the
+generated override file never sees it:
+
+```json
+{
+  "version": 1,
+  "secrets": {
+    "LINEAR_API_KEY": {
+      "provider": "op",
+      "ref": "Private/Linear CLI/credential",
+      "createTime": false
+    }
+  }
+}
+```
+
+A create-time entry beside a Compose config is refused, and the message names
+the keys that are the problem:
 
 ```
-Error: `secrets.json` is not supported for Docker Compose devcontainers in `dev`; secrets are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. Remove /Users/you/code/demo/.devcontainer/secrets.json or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).
+Error: create-time secrets are not supported for Docker Compose devcontainers in `dev`; they are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. In /Users/you/code/demo/.devcontainer/secrets.json, either add `"createTime": false` to LINEAR_API_KEY so the value is injected on `dev exec` and `dev shell` instead, or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).
 ```
 
 `--secrets-file` on a Compose project:
@@ -859,14 +876,24 @@ Error: `secrets.json` is not supported for Docker Compose devcontainers in `dev`
 Error: `--secrets-file` is not supported for Docker Compose devcontainers in `dev`; Compose environment is written to a generated override file on disk, and `dev` never writes a secret value to disk. Remove `--secrets-file /Users/you/code/demo/literals.json` and put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).
 ```
 
-The reasons differ. Compose creates containers through `docker compose up`, so
-nothing on that path would read a `secrets.json` — a container would come up
-green and misbehave later with the secrets missing. And Compose environment is
-written to a generated override file on disk, which is the one thing `dev`
-promises never to do with a secret value.
+`--secrets` on a Compose project:
 
-What to do instead: put the value on the Compose service (`environment:` or
-`env_file:`), or use `dev exec` for the exec-time half.
+```
+Error: `--secrets` is not supported for Docker Compose devcontainers in `dev`; `dev up` injects create-time secrets when it creates the container, and the Compose path creates containers through `docker compose up` instead. Remove `--secrets /Users/you/code/demo/other-secrets.json`; exec-time secrets come from the `secrets.json` beside the config, which `dev exec` and `dev shell` read on every invocation.
+```
+
+The three reasons differ. Compose creates containers through `docker compose up`,
+so nothing on that path injects a create-time value — a container would come up
+green and misbehave later with the secret missing. Compose environment is written
+to a generated override file on disk, which is the one thing `dev` promises never
+to do with a secret value, so `--secrets-file` cannot be honoured at all. And
+`--secrets` feeds create-time injection only; `dev exec` and `dev shell`
+rediscover the sidecar per invocation and would never see the named file, so
+accepting the flag would make it read as a working override when it is inert.
+
+What to do instead for a value a Compose service needs at startup: put it on the
+service (`environment:` or `env_file:`). Everything a command needs rather than
+the service itself belongs in `"createTime": false`.
 
 ## Writing a `dev-secret-*` plugin
 
@@ -1115,7 +1142,7 @@ key `dev` does not recognize, so it arrived in `options` untouched.
 | `` `cmd` succeeded but printed nothing `` | The command exited 0 with empty stdout. It probably needs credentials it did not get. |
 | ``plugin `dev-secret-foo` exited with code 3`` | The plugin crashed. A plugin reporting a failure exits 0 and sets `error`. |
 | ``plugin `dev-secret-foo` did not write a valid version 1 response on stdout`` | Something other than the JSON response reached stdout. Move diagnostics to stderr. |
-| `` `secrets.json` is not supported for Docker Compose devcontainers `` | See [Docker Compose](#docker-compose). |
+| ``create-time secrets are not supported for Docker Compose devcontainers`` | Add `"createTime": false` to the named keys, or move them to the Compose service. See [Docker Compose](#docker-compose). |
 | `` `--secrets /path`: no such file `` | Unlike a missing sidecar, an explicitly named references file must exist. |
 | `` `--secrets-file` `/path`: the value for `secrets` is not a string `` | You handed a references document to the literals flag. Use `--secrets`. |
 
@@ -1128,7 +1155,8 @@ key `dev` does not recognize, so it arrived in `options` untouched.
   round trip. That is only affordable because providers cache their own sessions.
 - **Already-running processes keep their old values.** A rotated secret needs
   `dev up --rebuild` to reach a process started at `postStart`.
-- **No Docker Compose support.** See [above](#docker-compose).
+- **No create-time secrets on Docker Compose.** Exec-time (`"createTime": false`)
+  entries work there; create-time ones do not. See [above](#docker-compose).
 - **`secrets.json` is fork-local.** It is not part of the Dev Containers
   specification, so `devcontainers/cli` and VS Code do not read it. Only
   `--secrets-file` is shared with the reference CLI.

@@ -5,7 +5,7 @@ use crate::error::DevError;
 use crate::runtime::docker::BollardRuntime;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
-    ImageMetadata, env_assignments,
+    ImageMetadata,
 };
 use std::os::unix::process::CommandExt;
 
@@ -53,6 +53,12 @@ fn podman_socket_path() -> Result<String, DevError> {
     ))
 }
 
+/// `env` carries names only, never `NAME=value`. `podman exec -e NAME` reads the
+/// value out of the podman client's own environment, so a secret reaches the
+/// container without ever appearing in argv. That matters because
+/// `/proc/<pid>/cmdline` is world readable while `/proc/<pid>/environ` is not:
+/// an assignment on the command line is legible to every user on the host, not
+/// only to the one running `dev`.
 fn podman_exec_args(
     id: &str,
     cmd: &[String],
@@ -69,9 +75,9 @@ fn podman_exec_args(
         args.push("--workdir".to_string());
         args.push(dir.to_string());
     }
-    for assignment in env {
+    for name in env {
         args.push("-e".to_string());
-        args.push(assignment.clone());
+        args.push(name.clone());
     }
     args.push(id.to_string());
     args.extend(cmd.iter().cloned());
@@ -145,11 +151,20 @@ impl ContainerRuntime for PodmanRuntime {
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         let workdir = workdir.map(|d| d.to_string());
-        let env = env_assignments(env);
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.expose().to_string()))
+            .collect();
         Box::pin(async move {
-            let args = podman_exec_args(&id, &cmd, user.as_deref(), workdir.as_deref(), &env);
+            let names: Vec<String> = env.iter().map(|(key, _)| key.clone()).collect();
+            let args = podman_exec_args(&id, &cmd, user.as_deref(), workdir.as_deref(), &names);
 
-            let err = std::process::Command::new("podman").args(&args).exec();
+            // The values go into the child's environment rather than its argv.
+            // `exec()` replaces this process image and keeps the environment, so
+            // `podman` reads them back out for the `-e NAME` flags above.
+            let mut command = std::process::Command::new("podman");
+            command.args(&args).envs(env);
+            let err = command.exec();
             // exec() only returns on error
             Err(DevError::Runtime(format!(
                 "Failed to exec into container: {err}"
@@ -339,28 +354,39 @@ mod tests {
         );
     }
 
+    /// One `-e` per name, and the name only. A `NAME=value` here would put the
+    /// value in `/proc/<pid>/cmdline`, which every user on the host can read.
     #[test]
-    fn interactive_exec_args_carry_one_flag_per_env_entry() {
+    fn interactive_exec_args_name_env_entries_without_their_values() {
         let args = podman_exec_args(
             "container-id",
             &["bash".to_string()],
             None,
             None,
-            &["A=1".to_string(), "B=2".to_string()],
+            &["A".to_string(), "B".to_string()],
         );
 
         assert_eq!(
             args,
-            vec![
-                "exec",
-                "-it",
-                "-e",
-                "A=1",
-                "-e",
-                "B=2",
-                "container-id",
-                "bash"
-            ]
+            vec!["exec", "-it", "-e", "A", "-e", "B", "container-id", "bash"]
+        );
+    }
+
+    /// The guard against someone reintroducing `env_assignments` here: an
+    /// assignment reaching this function would be a value in argv.
+    #[test]
+    fn no_env_argument_carries_an_assignment() {
+        let args = podman_exec_args(
+            "container-id",
+            &["bash".to_string()],
+            Some("vscode"),
+            Some("/workspaces/demo"),
+            &["API_TOKEN".to_string()],
+        );
+
+        assert!(
+            !args.iter().any(|arg| arg.contains('=')),
+            "no argument may carry a `NAME=value` assignment: {args:?}"
         );
     }
 }
