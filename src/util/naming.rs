@@ -117,11 +117,7 @@ pub fn container_name(workspace: &Path) -> String {
     let abs_path = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let path_str = abs_path.to_string_lossy();
-
-    let mut hasher = Sha256::new();
-    hasher.update(path_str.as_bytes());
-    let hash = hex::encode(hasher.finalize());
+    let hash = devcontainer_id(workspace);
 
     let dirname = abs_path
         .file_name()
@@ -130,6 +126,23 @@ pub fn container_name(workspace: &Path) -> String {
 
     let normalized = normalize_docker_image_name(&dirname);
     format!("vsc-{normalized}-{hash}")
+}
+
+/// Stable identifier for a workspace's devcontainer: the SHA-256 hex of the
+/// canonicalized workspace path — the same hash `container_name` embeds.
+///
+/// Backs the `${devcontainerId}` substitution variable, so a feature volume like
+/// `dind-var-lib-docker-${devcontainerId}` gets the same name on every `dev up`
+/// for a workspace. The charset (lowercase hex) is valid in volume names,
+/// hostnames, and labels. Note this id differs from the reference devcontainer
+/// CLI's, so such volumes are not shared with containers other tools create.
+pub fn devcontainer_id(workspace: &Path) -> String {
+    let abs_path = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(abs_path.to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Return label key-value pairs used to identify containers belonging to a workspace.
@@ -158,6 +171,14 @@ pub fn workspace_labels(workspace: &Path, config_file: Option<&Path>) -> Vec<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `${devcontainerId}` promises the same hash `container_name` embeds; if the
+    /// two derivations drift, per-workspace volumes stop lining up with containers.
+    #[test]
+    fn container_name_ends_with_devcontainer_id() {
+        let workspace = Path::new("/home/user/project");
+        assert!(container_name(workspace).ends_with(&devcontainer_id(workspace)));
+    }
     use std::path::Path;
 
     #[test]

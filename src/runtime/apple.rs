@@ -1122,6 +1122,19 @@ fn to_apple_config(
     let mounts: Vec<Filesystem> = config
         .mounts
         .iter()
+        .filter(|m| {
+            // Virtiofs shares host paths; a bare named-volume source (as feature
+            // mounts like docker-in-docker declare) has no host path to share.
+            let is_host_path = m.source.is_absolute();
+            if !is_host_path {
+                eprintln!(
+                    "Warning: Apple Containers cannot mount named volume '{}'; skipping mount of '{}'",
+                    m.source.display(),
+                    m.target
+                );
+            }
+            is_host_path
+        })
         .map(|m| Filesystem {
             fs_type: FSType::Virtiofs(Empty {}),
             source: m.source.display().to_string(),

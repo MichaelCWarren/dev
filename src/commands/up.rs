@@ -617,11 +617,14 @@ pub(crate) async fn run_with_runtime_with_providers(
         final_image
     };
 
-    let mount_strings = substitute_mounts(
+    // Feature mounts first, then config mounts — the same feature-first order
+    // capabilities use, so a project mount can override a feature's target.
+    let mut mount_strings = feature_mount_strings(&ordered_features, workspace, remote_user);
+    mount_strings.extend(substitute_mounts(
         config.mounts.as_deref().unwrap_or(&[]),
         workspace,
         remote_user,
-    );
+    ));
     let mounts = parse_mounts(&mount_strings);
 
     let volume_strings: Vec<String> = config
@@ -1742,11 +1745,12 @@ async fn run_compose(
         }
     }
 
-    let mounts = substitute_mounts(
+    let mut mounts = feature_mount_strings(&ordered_features, workspace, remote_user);
+    mounts.extend(substitute_mounts(
         config.mounts.as_deref().unwrap_or(&[]),
         workspace,
         remote_user,
-    );
+    ));
 
     let volume_strings: Vec<String> = config
         .volumes
@@ -1992,6 +1996,35 @@ async fn verify_compose_service_running(
 
 /// Substitute variables in each mount entry (string or object form) and emit
 /// Docker long-form strings, warning about entries that lack `source`/`target`.
+/// Long-form mount strings contributed by features, in install order.
+///
+/// Feature mounts arrive as raw devcontainer JSON (string or object form); each
+/// is deserialized into a `MountSpec` and substituted exactly like config
+/// mounts, so `${devcontainerId}` volume names resolve. Malformed entries are
+/// skipped with a warning, mirroring `substitute_mounts`.
+fn feature_mount_strings(
+    features: &[ResolvedFeature],
+    workspace: &Path,
+    remote_user: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for feature in features {
+        for raw in &feature.mounts {
+            let emitted = serde_json::from_value::<MountSpec>(raw.clone())
+                .ok()
+                .and_then(|spec| spec.substitute_and_emit(workspace, remote_user));
+            match emitted {
+                Some(mount) => out.push(mount),
+                None => eprintln!(
+                    "Warning: feature '{}' declares an invalid mount entry; skipping: {raw}",
+                    feature.id
+                ),
+            }
+        }
+    }
+    out
+}
+
 fn substitute_mounts(
     mounts: &[MountSpec],
     workspace: &Path,
@@ -4093,6 +4126,70 @@ mod tests {
             "a feature's postStartCommand fires on restart, its postCreateCommand does not, \
              got: {bodies:?}"
         );
+    }
+
+    /// Issue #13: feature-declared mounts must reach the created container,
+    /// with `${devcontainerId}` resolved to the stable per-workspace hash. On
+    /// the cache path the mounts come from the image's metadata label.
+    #[tokio::test(start_paused = true)]
+    async fn feature_mounts_reach_the_created_container() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"./dind": {}}}"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": [{
+                "source": "dind-var-lib-docker-${devcontainerId}",
+                "target": "/var/lib/docker",
+                "type": "volume"
+            }]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a feature mount must not break container creation");
+
+        let mounts = rt.created_config().mounts;
+        let expected = format!(
+            "dind-var-lib-docker-{}",
+            crate::util::naming::devcontainer_id(workspace.path())
+        );
+        assert_eq!(mounts.len(), 1, "the feature volume mount must be applied");
+        assert_eq!(mounts[0].source, std::path::PathBuf::from(&expected));
+        assert_eq!(mounts[0].target, "/var/lib/docker");
+    }
+
+    /// Feature mounts come first, so a project mount can override a feature's
+    /// target — the same feature-first order capabilities use.
+    #[tokio::test(start_paused = true)]
+    async fn feature_mounts_precede_config_mounts() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"./dind": {}},
+                "mounts": ["source=projvol,target=/proj,type=volume"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": ["source=featvol,target=/feat,type=volume"]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("feature and config mounts must coexist");
+
+        let sources: Vec<String> = rt
+            .created_config()
+            .mounts
+            .iter()
+            .map(|m| m.source.display().to_string())
+            .collect();
+        assert_eq!(sources, ["featvol", "projvol"]);
     }
 
     /// Issue #12: a container recreated from a cached features image gets a

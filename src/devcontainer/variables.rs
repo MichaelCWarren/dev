@@ -9,6 +9,7 @@ use std::path::Path;
 /// - `${localWorkspaceFolder}` — workspace path on host
 /// - `${localWorkspaceFolderBasename}` — basename of workspace path
 /// - `${containerWorkspaceFolder}` — workspace path inside the container
+/// - `${devcontainerId}` — stable per-workspace id (see [`crate::util::naming::devcontainer_id`])
 pub fn substitute_variables(s: &str, workspace: &Path) -> String {
     substitute_variables_with_user(s, workspace, None)
 }
@@ -80,6 +81,8 @@ fn expand_variable(expr: &str, workspace: &Path, remote_user: Option<&str>) -> O
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         )
+    } else if expr == "devcontainerId" {
+        Some(crate::util::naming::devcontainer_id(workspace))
     } else if expr == "containerWorkspaceFolder" {
         let folder_name = workspace
             .file_name()
@@ -95,6 +98,35 @@ fn expand_variable(expr: &str, workspace: &Path, remote_user: Option<&str>) -> O
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn devcontainer_id_expands_to_a_stable_workspace_hash() {
+        let workspace = PathBuf::from("/home/user/project");
+        let expanded = substitute_variables("dind-var-lib-docker-${devcontainerId}", &workspace);
+
+        let id = expanded
+            .strip_prefix("dind-var-lib-docker-")
+            .expect("prefix must survive substitution");
+        assert_eq!(id.len(), 64, "the id is a full sha256 hex digest");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+
+        assert_eq!(
+            expanded,
+            substitute_variables("dind-var-lib-docker-${devcontainerId}", &workspace),
+            "the id is stable across calls"
+        );
+        assert_ne!(
+            expanded,
+            substitute_variables(
+                "dind-var-lib-docker-${devcontainerId}",
+                &PathBuf::from("/home/user/other")
+            ),
+            "different workspaces get different ids"
+        );
+    }
 
     #[test]
     fn test_no_variables() {

@@ -392,6 +392,13 @@ pub fn generate_compose_override(
 
     for mount_str in mounts {
         if let Some(entry) = mount_to_compose_volume(mount_str) {
+            // Named volumes must also be declared at the top level or
+            // `compose config` rejects the override.
+            if entry.get("type").and_then(serde_json::Value::as_str) == Some("volume")
+                && let Some(src) = entry.get("source").and_then(serde_json::Value::as_str)
+            {
+                top_level_volumes.insert(src.to_string(), serde_json::Value::Null);
+            }
             vol_entries.push(entry);
         }
     }
@@ -766,6 +773,38 @@ mod tests {
             .iter()
             .any(|l| l == &"volumes:" || l.starts_with("volumes:"));
         assert!(top_level_volumes);
+    }
+
+    /// A feature's `type=volume` mount must be declared in the top-level
+    /// `volumes:` map as well as on the service, or `compose config` rejects
+    /// the override; bind mounts must not be registered there.
+    #[test]
+    fn override_registers_feature_volume_mounts_at_top_level() {
+        let mounts = vec![
+            "source=dind-var-lib-docker-abc,target=/var/lib/docker,type=volume".to_string(),
+            "source=/home/user/.ssh,target=/home/vscode/.ssh,type=bind".to_string(),
+        ];
+
+        let yaml = generate_compose_override(
+            "dev",
+            &[],
+            &HashMap::new(),
+            &mounts,
+            &[],
+            &[],
+            None,
+            &MergedCapabilities::default(),
+        );
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let top = parsed
+            .get("volumes")
+            .expect("a named volume mount must create the top-level volumes map");
+        assert!(top.get("dind-var-lib-docker-abc").is_some());
+        assert!(
+            top.get("/home/user/.ssh").is_none(),
+            "bind mounts must not be registered as named volumes"
+        );
     }
 
     #[test]
