@@ -996,23 +996,65 @@ pub struct MergedCapabilities {
     pub security_opt: Vec<String>,
 }
 
-/// Recover feature-contributed capabilities from an image's `devcontainer.metadata`
+/// Rebuild the features that produced an image from its `devcontainer.metadata`
 /// label entries, as written by `build_metadata_label`.
 ///
-/// This is the counterpart to `merge_feature_capabilities` for the cached-image path,
-/// where the features that built the image are not re-resolved and so no
-/// `ResolvedFeature` list exists. Semantics match that function: booleans are OR'd and
-/// arrays unioned. Keys are read defensively — the writer omits falsey capabilities
-/// entirely, and the trailing base-config entry carries none of them.
-pub fn capabilities_from_metadata(entries: &[serde_json::Value]) -> MergedCapabilities {
-    let mut result = MergedCapabilities::default();
-    for entry in entries {
-        result.init |= entry_flag(entry, "init");
-        result.privileged |= entry_flag(entry, "privileged");
-        union_string_array(entry.get("capAdd"), &mut result.cap_add);
-        union_string_array(entry.get("securityOpt"), &mut result.security_opt);
-    }
-    result
+/// Entries appear in install order, so the returned list preserves the original
+/// feature order. The trailing base-config entry is the only one without an
+/// `"id"` key and is skipped. Only the contribution fields the label carries
+/// (mounts, entrypoint, capabilities, lifecycle hooks) are restored; build-time
+/// fields such as `options` and `install_script_path` are defaulted and must not
+/// be read from a recovered feature.
+pub fn features_from_metadata(entries: &[serde_json::Value]) -> Vec<ResolvedFeature> {
+    entries
+        .iter()
+        .filter_map(feature_from_metadata_entry)
+        .collect()
+}
+
+fn feature_from_metadata_entry(entry: &serde_json::Value) -> Option<ResolvedFeature> {
+    let id = entry.get("id")?.as_str()?.to_string();
+    let hooks = FeatureLifecycleHooks {
+        on_create_command: entry
+            .get("onCreateCommand")
+            .and_then(parse_lifecycle_command),
+        post_create_command: entry
+            .get("postCreateCommand")
+            .and_then(parse_lifecycle_command),
+        post_start_command: entry
+            .get("postStartCommand")
+            .and_then(parse_lifecycle_command),
+        post_attach_command: entry
+            .get("postAttachCommand")
+            .and_then(parse_lifecycle_command),
+    };
+    let mut feature = ResolvedFeature {
+        oci_ref: id.clone(),
+        id,
+        version: String::new(),
+        options: serde_json::Value::Null,
+        install_script_path: PathBuf::new(),
+        install_after: Vec::new(),
+        container_env: HashMap::new(),
+        mounts: entry
+            .get("mounts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        init: entry_flag(entry, "init"),
+        privileged: entry_flag(entry, "privileged"),
+        cap_add: Vec::new(),
+        security_opt: Vec::new(),
+        entrypoint: entry
+            .get("entrypoint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        lifecycle_hooks: hooks,
+        is_dependency: false,
+    };
+    union_string_array(entry.get("capAdd"), &mut feature.cap_add);
+    union_string_array(entry.get("securityOpt"), &mut feature.security_opt);
+    Some(feature)
 }
 
 /// Read a boolean metadata key, treating absent or non-boolean values as false.
@@ -1066,6 +1108,12 @@ mod tests {
 
     fn parse_label(label: &str) -> Vec<serde_json::Value> {
         serde_json::from_str(label).expect("metadata label should be a JSON array")
+    }
+
+    /// The cached-image capability recovery: features restored from the label, then
+    /// merged exactly as the build path merges freshly resolved features.
+    fn capabilities_from_metadata(entries: &[serde_json::Value]) -> MergedCapabilities {
+        merge_feature_capabilities(&features_from_metadata(entries))
     }
 
     /// The capabilities recovered from a built image must equal those the build itself
@@ -1153,6 +1201,42 @@ mod tests {
             "a non-array capAdd must be ignored"
         );
         assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
+    }
+
+    /// Everything the label writer records for a feature must be recoverable, in
+    /// install order, with the id-less base-config entry skipped. This guards the
+    /// cached-image path, which recreates containers without re-resolving features.
+    #[test]
+    fn features_from_metadata_restores_hooks_mounts_and_entrypoint_in_install_order() {
+        let mut dind = feature("ghcr.io/devcontainers/features/docker-in-docker:2");
+        dind.mounts = vec![serde_json::json!({
+            "source": "dind-var-lib-docker-${devcontainerId}",
+            "target": "/var/lib/docker",
+            "type": "volume"
+        })];
+        dind.entrypoint = Some("/usr/local/share/docker-init.sh".to_string());
+        dind.lifecycle_hooks.on_create_command =
+            Some(LifecycleCommand::Single("touch on-create".to_string()));
+        dind.lifecycle_hooks.post_start_command =
+            Some(LifecycleCommand::Single("touch post-start".to_string()));
+        let node = feature("ghcr.io/devcontainers/features/node:1");
+        let features = vec![dind, node];
+
+        let label = build_metadata_label(&features, &empty_config(), Some("vscode"));
+        let recovered = features_from_metadata(&parse_label(&label));
+
+        assert_eq!(recovered.len(), 2, "the id-less base entry must be skipped");
+        assert_eq!(recovered[0].id, features[0].id);
+        assert_eq!(recovered[1].id, features[1].id);
+        assert_eq!(recovered[0].mounts, features[0].mounts);
+        assert_eq!(recovered[0].entrypoint, features[0].entrypoint);
+        assert_eq!(
+            format!("{:?}", recovered[0].lifecycle_hooks),
+            format!("{:?}", features[0].lifecycle_hooks),
+            "lifecycle hooks must survive the roundtrip"
+        );
+        assert!(recovered[1].lifecycle_hooks.post_start_command.is_none());
+        assert!(recovered[1].entrypoint.is_none());
     }
 
     /// Adapter over `feature` for tests that exercise Dockerfile generation.

@@ -184,6 +184,8 @@ When a config declares features, `dev up` and `dev build` layer them onto a deri
 
 The digest covers selectors, not the files they point at. Editing a `Dockerfile` referenced by `build.dockerfile` leaves the digest unchanged, so the cached image is reused; pass `--rebuild` or `--no-cache` after changing Dockerfile contents.
 
+A cached features image carries a `devcontainer.metadata` label, and `dev up` restores the feature contributions recorded there — mounts, entrypoints, capabilities, and lifecycle hooks — when it creates a container from that image without rebuilding. Lifecycle hooks are container-scoped: `dev down --remove` followed by `dev up` creates a *new* container, so `onCreateCommand`, `postCreateCommand`, and `postStartCommand` run again even though the image came from cache.
+
 Superseded images are left behind rather than overwritten in place — `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim space with your runtime's own tooling when it matters:
 
 ```sh

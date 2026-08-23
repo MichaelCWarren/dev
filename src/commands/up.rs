@@ -7,7 +7,7 @@ use crate::devcontainer::effective::{
     LockfilePolicy, effective_config_from_parts, load_effective_config,
 };
 use crate::devcontainer::features::{
-    MergedCapabilities, ResolvedFeature, capabilities_from_metadata, feature_image_tag,
+    MergedCapabilities, ResolvedFeature, feature_image_tag, features_from_metadata,
     generate_feature_dockerfile_with_opts, order_features,
 };
 use crate::devcontainer::secrets::discovery::secrets_file_path;
@@ -548,11 +548,13 @@ pub(crate) async fn run_with_runtime_with_providers(
         final_tag
     };
 
-    // Resolve feature capabilities against the image the features produced, before the
-    // UID-remap layer below shadows `final_image` with a derived tag.
-    let mut caps =
-        resolve_container_capabilities(runtime, &final_image, &ordered_features, has_features)
-            .await?;
+    // Recover feature contributions against the image the features produced, before
+    // the UID-remap layer below shadows `final_image` with a derived tag. On the
+    // cache-hit path this restores mounts, entrypoints, capabilities, and lifecycle
+    // hooks from the image's `devcontainer.metadata` label.
+    let ordered_features =
+        resolve_effective_features(runtime, &final_image, ordered_features, has_features).await?;
+    let mut caps = merge_feature_capabilities(&ordered_features);
     apply_run_args_capabilities(&mut caps, &resolved_run_args);
 
     // Build container config
@@ -1408,21 +1410,21 @@ pub(crate) async fn ensure_image_present(
 /// Resolve the container capabilities contributed by features.
 ///
 /// On the build path `ordered_features` is populated and is authoritative. On the
-/// cache-hit path the features are never resolved, so recover the capabilities from the
+/// cache-hit path the features are never resolved, so recover them from the
 /// `devcontainer.metadata` label the build wrote onto the image — otherwise a container
-/// recreated from a cached image silently loses `privileged`, `capAdd`, `securityOpt`
-/// and `init`, and a docker-in-docker daemon cannot start.
-async fn resolve_container_capabilities(
+/// recreated from a cached image silently loses feature mounts, entrypoints,
+/// capabilities, and lifecycle hooks, and a docker-in-docker daemon cannot start.
+async fn resolve_effective_features(
     runtime: &dyn ContainerRuntime,
     image: &str,
-    ordered_features: &[ResolvedFeature],
+    ordered_features: Vec<ResolvedFeature>,
     has_features: bool,
-) -> anyhow::Result<MergedCapabilities> {
+) -> anyhow::Result<Vec<ResolvedFeature>> {
     if !ordered_features.is_empty() {
-        return Ok(merge_feature_capabilities(ordered_features));
+        return Ok(ordered_features);
     }
     if !has_features {
-        return Ok(MergedCapabilities::default());
+        return Ok(Vec::new());
     }
 
     // Features were configured but not resolved, so this is the cache-hit path.
@@ -1430,13 +1432,13 @@ async fn resolve_container_capabilities(
     if meta.metadata_entries.is_empty() {
         eprintln!(
             "Warning: image '{image}' has no devcontainer metadata, so feature \
-             capabilities (privileged, cap-add, security-opt) cannot be restored. \
-             Run 'dev up --rebuild' to rebuild it."
+             contributions (mounts, entrypoints, capabilities, lifecycle hooks) \
+             cannot be restored. Run 'dev up --rebuild' to rebuild it."
         );
-        return Ok(MergedCapabilities::default());
+        return Ok(Vec::new());
     }
 
-    Ok(capabilities_from_metadata(&meta.metadata_entries))
+    Ok(features_from_metadata(&meta.metadata_entries))
 }
 
 /// Run the `initializeCommand` on the host machine (Gap 9).
@@ -2806,6 +2808,9 @@ mod tests {
         created_config: Arc<Mutex<Option<ContainerConfig>>>,
         started_id: Arc<Mutex<Option<String>>>,
         containers: Arc<Mutex<Vec<ContainerInfo>>>,
+        /// What `inspect_image_metadata` reports, so cache-path tests can seed
+        /// `devcontainer.metadata` entries to recover feature contributions from.
+        image_metadata: Arc<Mutex<ImageMetadata>>,
     }
 
     impl UpFakeRuntime {
@@ -2833,7 +2838,14 @@ mod tests {
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
                 containers: Arc::new(Mutex::new(Vec::new())),
+                image_metadata: Arc::new(Mutex::new(ImageMetadata::default())),
             }
+        }
+
+        /// Seed the `devcontainer.metadata` entries the fake image reports.
+        fn with_metadata_entries(self, entries: Vec<serde_json::Value>) -> Self {
+            self.image_metadata.lock().unwrap().metadata_entries = entries;
+            self
         }
 
         fn named_runtime(mut self, runtime_name: &'static str) -> Self {
@@ -3269,9 +3281,11 @@ mod tests {
         }
 
         fn inspect_image_metadata(&self, _image: &str) -> BoxFut<'_, ImageMetadata> {
-            // No remote user, and update_remote_user_uid_default="never" skips
-            // UID remap, so the up flow never advances past create/start here.
-            Box::pin(async move { Ok(ImageMetadata::default()) })
+            // Defaults report no remote user, and update_remote_user_uid_default
+            // ="never" skips UID remap, so the up flow never advances past
+            // create/start unless a test seeds metadata entries.
+            let meta = self.image_metadata.lock().unwrap().clone();
+            Box::pin(async move { Ok(meta) })
         }
 
         fn exec_attached(
@@ -4078,6 +4092,67 @@ mod tests {
             vec!["touch feature-post-start"],
             "a feature's postStartCommand fires on restart, its postCreateCommand does not, \
              got: {bodies:?}"
+        );
+    }
+
+    /// Issue #12: a container recreated from a cached features image gets a
+    /// fresh container, so onCreate/postCreate/postStart are owed again. The
+    /// cache branch never resolves features, so the hooks must be recovered
+    /// from the image's `devcontainer.metadata` label.
+    #[tokio::test(start_paused = true)]
+    async fn a_container_recreated_from_a_cached_image_reruns_feature_create_hooks() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"./greeter": {}}}"#,
+        );
+
+        // `image_exists` is true, so up takes the cache-hit path; the hooks
+        // exist only in the seeded metadata, never on disk.
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "greeter",
+            "onCreateCommand": "touch feature-on-create",
+            "postCreateCommand": "touch feature-post-create",
+            "postStartCommand": "touch feature-post-start"
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a cached features image should still produce a container");
+
+        let bodies = hook_bodies(&rt.execs());
+        assert_eq!(
+            bodies,
+            vec![
+                "touch feature-on-create",
+                "touch feature-post-create",
+                "touch feature-post-start"
+            ],
+            "feature hooks recovered from image metadata run on the new container, got: {bodies:?}"
+        );
+    }
+
+    /// A cached image with no metadata label cannot restore contributions; the
+    /// container must still come up, just without feature hooks.
+    #[tokio::test(start_paused = true)]
+    async fn cached_image_with_empty_metadata_warns_and_creates_without_contributions() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"./greeter": {}}}"#,
+        );
+
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("missing metadata degrades to no contributions, not a failure");
+
+        assert!(
+            hook_bodies(&rt.execs()).is_empty(),
+            "no hooks can be recovered from an empty metadata label"
+        );
+        assert!(
+            rt.created_config.lock().unwrap().is_some(),
+            "the container is still created"
         );
     }
 
