@@ -368,11 +368,19 @@ pub fn generate_compose_override(
     ports: &[super::PortMapping],
     image: Option<&str>,
     caps: &MergedCapabilities,
+    entrypoints: &[String],
 ) -> String {
     let mut service_obj = serde_json::Map::new();
 
     if let Some(img) = image {
         service_obj.insert("image".into(), json!(img));
+    }
+
+    // Feature entrypoints chain in install order. Compose ignores the image's
+    // CMD when entrypoint is overridden, so services relying on it must declare
+    // an explicit `command`.
+    if !entrypoints.is_empty() {
+        service_obj.insert("entrypoint".into(), json!(entrypoints));
     }
 
     if !labels.is_empty() {
@@ -714,7 +722,7 @@ mod tests {
         env.insert("SHELL".to_string(), "/bin/bash".to_string());
         let caps = MergedCapabilities::default();
 
-        let yaml = generate_compose_override("app", &labels, &env, &[], &[], &[], None, &caps);
+        let yaml = generate_compose_override("app", &labels, &env, &[], &[], &[], None, &caps, &[]);
         assert!(yaml.contains("app:"));
         assert!(yaml.contains("devcontainer.local_folder"));
         assert!(yaml.contains("SHELL"));
@@ -741,6 +749,7 @@ mod tests {
             }],
             Some("myimage:featured"),
             &caps,
+            &[],
         );
         assert!(yaml.contains("myimage:featured"));
         assert!(yaml.contains("init: true"));
@@ -764,6 +773,7 @@ mod tests {
             &[],
             None,
             &caps,
+            &[],
         );
         assert!(yaml.contains("/home/user/.ssh"));
         assert!(yaml.contains("extensions"));
@@ -794,6 +804,7 @@ mod tests {
             &[],
             None,
             &MergedCapabilities::default(),
+            &[],
         );
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -804,6 +815,46 @@ mod tests {
         assert!(
             top.get("/home/user/.ssh").is_none(),
             "bind mounts must not be registered as named volumes"
+        );
+    }
+
+    /// Feature entrypoints land on the service as an exec-form array, and the
+    /// key is absent entirely when no feature declares one.
+    #[test]
+    fn override_injects_feature_entrypoints() {
+        let entrypoints = vec!["/usr/local/share/docker-init.sh".to_string()];
+        let yaml = generate_compose_override(
+            "dev",
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+            None,
+            &MergedCapabilities::default(),
+            &entrypoints,
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let service = &parsed["services"]["dev"];
+        assert_eq!(
+            service["entrypoint"][0].as_str(),
+            Some("/usr/local/share/docker-init.sh")
+        );
+
+        let yaml = generate_compose_override(
+            "dev",
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+            None,
+            &MergedCapabilities::default(),
+            &[],
+        );
+        assert!(
+            !yaml.contains("entrypoint"),
+            "no entrypoint key without feature entrypoints"
         );
     }
 

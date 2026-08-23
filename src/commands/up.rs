@@ -667,7 +667,10 @@ pub(crate) async fn run_with_runtime_with_providers(
         }),
         workspace_folder: Some(workspace_folder.clone()),
         extra_args: vec![],
-        entrypoint: None,
+        entrypoint: {
+            let eps = feature_entrypoints(&ordered_features);
+            (!eps.is_empty()).then_some(eps)
+        },
         init: caps.init,
         privileged: caps.privileged,
         cap_add: caps.cap_add,
@@ -1777,6 +1780,7 @@ async fn run_compose(
         &ports,
         image_override,
         &caps,
+        &feature_entrypoints(&ordered_features),
     );
     let override_path = crate::runtime::compose::write_override_file(&override_content)?;
     let override_path_str = override_path.to_string_lossy().to_string();
@@ -2023,6 +2027,16 @@ fn feature_mount_strings(
         }
     }
     out
+}
+
+/// Feature entrypoints in install order. Each is one argv token; per the spec
+/// they are `exec "$@"` wrappers, so the runtime chains them ahead of the
+/// keep-alive command.
+fn feature_entrypoints(features: &[ResolvedFeature]) -> Vec<String> {
+    features
+        .iter()
+        .filter_map(|f| f.entrypoint.clone())
+        .collect()
 }
 
 fn substitute_mounts(
@@ -4190,6 +4204,35 @@ mod tests {
             .map(|m| m.source.display().to_string())
             .collect();
         assert_eq!(sources, ["featvol", "projvol"]);
+    }
+
+    /// Issue #15: feature entrypoints chain into the created container in
+    /// install order. On the cache path they come from the image's metadata
+    /// label, like every other contribution.
+    #[tokio::test(start_paused = true)]
+    async fn feature_entrypoints_chain_in_install_order() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"./dind": {}, "./sshd": {}}}"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![
+            serde_json::json!({"id": "dind", "entrypoint": "/usr/local/share/docker-init.sh"}),
+            serde_json::json!({"id": "sshd", "entrypoint": "/usr/local/share/ssh-init.sh"}),
+        ]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("feature entrypoints must not break container creation");
+
+        assert_eq!(
+            rt.created_config().entrypoint,
+            Some(vec![
+                "/usr/local/share/docker-init.sh".to_string(),
+                "/usr/local/share/ssh-init.sh".to_string()
+            ]),
+            "entrypoints chain in install order"
+        );
     }
 
     /// Issue #12: a container recreated from a cached features image gets a

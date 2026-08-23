@@ -1114,6 +1114,17 @@ fn truncate_container_id(name: &str) -> String {
     format!("{}-{}", &name[..17], &name[name.len() - 18..])
 }
 
+/// The init process argv: the entrypoint chain followed by the keep-alive
+/// command — the same argv Docker builds from Entrypoint + Cmd, so `exec "$@"`
+/// feature entrypoints chain into `sleep infinity` and the container stays up.
+fn init_process_argv(entrypoint: Option<&[String]>) -> (String, Vec<String>) {
+    let mut argv: Vec<String> = entrypoint.unwrap_or_default().to_vec();
+    argv.push("sleep".to_string());
+    argv.push("infinity".to_string());
+    let executable = argv.remove(0);
+    (executable, argv)
+}
+
 fn to_apple_config(
     config: &ContainerConfig,
     image: ImageDescription,
@@ -1165,16 +1176,10 @@ fn to_apple_config(
 
     let init_env = merge_env(&image_config.env, &config.env);
 
+    let (executable, arguments) = init_process_argv(config.entrypoint.as_deref());
     let init_process = ProcessConfiguration {
-        executable: config
-            .entrypoint
-            .clone()
-            .unwrap_or_else(|| "sleep".to_string()),
-        arguments: if config.entrypoint.is_none() {
-            vec!["infinity".to_string()]
-        } else {
-            Vec::new()
-        },
+        executable,
+        arguments,
         environment: init_env,
         working_directory: container_working_directory(
             config.workspace_folder.as_deref(),
@@ -1585,6 +1590,20 @@ impl ContainerRuntime for AppleRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// The init process argv mirrors Docker's Entrypoint + Cmd: the chain
+    /// first, then the keep-alive, so `exec "$@"` wrappers keep the container up.
+    #[test]
+    fn init_process_argv_appends_keepalive_after_entrypoint_chain() {
+        let chain = vec!["/init-a.sh".to_string(), "/init-b.sh".to_string()];
+        let (exe, args) = super::init_process_argv(Some(&chain));
+        assert_eq!(exe, "/init-a.sh");
+        assert_eq!(args, ["/init-b.sh", "sleep", "infinity"]);
+
+        let (exe, args) = super::init_process_argv(None);
+        assert_eq!(exe, "sleep");
+        assert_eq!(args, ["infinity"]);
+    }
+
     use super::*;
     // Non-test code refers to these via fully-qualified paths, so they are not in
     // the module-level import that `use super::*` re-exports.

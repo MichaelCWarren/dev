@@ -452,13 +452,11 @@ impl BollardRuntime {
             // says they should, matching the Apple runtime.
             working_dir: config.workspace_folder.clone(),
             host_config: Some(host_config),
-            entrypoint: config.entrypoint.as_ref().map(|ep| vec![ep.clone()]),
-            // Keep the container running with a default command if no entrypoint provided.
-            cmd: if config.entrypoint.is_none() {
-                Some(vec!["sleep".to_string(), "infinity".to_string()])
-            } else {
-                None
-            },
+            entrypoint: config.entrypoint.clone(),
+            // The keep-alive is always the command. Feature entrypoints are
+            // `exec "$@"` wrappers, so with an entrypoint chain set the final
+            // wrapper execs `sleep infinity` and the container stays up.
+            cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
             ..Default::default()
         }
     }
@@ -1272,6 +1270,50 @@ mod tests {
     fn create_body_leaves_working_dir_unset_without_a_workspace_folder() {
         let body = BollardRuntime::to_create_body(&container_config(None));
         assert_eq!(body.working_dir, None);
+    }
+
+    /// A feature entrypoint chain goes to the daemon as exec-form Entrypoint
+    /// while the keep-alive stays in Cmd: spec entrypoints are `exec "$@"`
+    /// wrappers, so the final wrapper execs `sleep infinity` and the container
+    /// stays up instead of exiting when the entrypoint returns.
+    #[test]
+    fn create_body_sets_entrypoint_chain_and_keeps_the_keepalive_cmd() {
+        let mut cfg = container_config(None);
+        cfg.entrypoint = Some(vec![
+            "/usr/local/share/docker-init.sh".to_string(),
+            "/usr/local/share/ssh-init.sh".to_string(),
+        ]);
+
+        let body = BollardRuntime::to_create_body(&cfg);
+
+        assert_eq!(
+            body.entrypoint.as_deref(),
+            Some(
+                [
+                    "/usr/local/share/docker-init.sh".to_string(),
+                    "/usr/local/share/ssh-init.sh".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            body.cmd,
+            Some(vec!["sleep".to_string(), "infinity".to_string()]),
+            "the keep-alive must survive as CMD alongside an entrypoint"
+        );
+    }
+
+    /// Without an entrypoint the keep-alive is still the command and no
+    /// Entrypoint override is sent, so the image's own entrypoint applies.
+    #[test]
+    fn create_body_without_entrypoint_keeps_only_the_keepalive_cmd() {
+        let body = BollardRuntime::to_create_body(&container_config(None));
+
+        assert_eq!(body.entrypoint, None);
+        assert_eq!(
+            body.cmd,
+            Some(vec!["sleep".to_string(), "infinity".to_string()])
+        );
     }
 
     /// The env map `dev up` assembles — `containerEnv`/`remoteEnv` plus the

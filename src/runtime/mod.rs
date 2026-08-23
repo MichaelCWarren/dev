@@ -89,7 +89,9 @@ pub struct ContainerConfig {
     /// Retained so the struct stays a plain data bag the runtime tests build.
     #[allow(dead_code)]
     pub extra_args: Vec<String>,
-    pub entrypoint: Option<String>,
+    /// Exec-form entrypoint argv. Feature entrypoints are `exec "$@"` wrappers,
+    /// so multiple entries chain: each wrapper execs the remainder as its args.
+    pub entrypoint: Option<Vec<String>>,
     /// Run an init process inside the container (--init).
     pub init: bool,
     /// Run the container in privileged mode (--privileged).
