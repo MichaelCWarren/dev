@@ -39,6 +39,9 @@
 - `merge_layer_tracked`/`Provenance` in `src/devcontainer/merge.rs` IS the production merge
   (`dev config explain` records origins through it); the untracked `merge_layer(s)` wrappers are
   `#[cfg(test)]` reference implementations. Instrument new merge strategies there or explain drifts.
+- `feature_image_tag` hashes a `TAG_FORMAT` constant (src/devcontainer/features.rs). Bump it
+  whenever the generated Dockerfile or label encoding changes shape, so images cached under the
+  old scheme stop being cache hits; prune then sweeps them as superseded.
 - Lifecycle hooks are split by moment in `src/devcontainer/lifecycle.rs`: `run_create_hooks`
   (onCreate/updateContent/postCreate/postStart) versus `run_start_hooks` (postStart only).
   Pick by whether the container already existed — never re-run create-time hooks on reuse.

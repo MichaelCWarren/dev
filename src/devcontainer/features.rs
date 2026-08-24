@@ -688,6 +688,10 @@ pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
     ordered
 }
 
+/// Image label naming the workspace image a derived feature image belongs to.
+/// `dev prune` matches it to claim dangling rebuild leftovers.
+pub const WORKSPACE_IMAGE_LABEL: &str = "dev.workspace-image";
+
 /// Generate a composite Dockerfile that installs all features on top of a base image.
 ///
 /// Per the devcontainer spec, feature install scripts expect several environment
@@ -700,6 +704,7 @@ pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
 /// Gap 12 fix: Feature install scripts are wrapped with env sourcing and error context.
 pub fn generate_feature_dockerfile_with_opts(
     base_image: &str,
+    workspace_image: &str,
     features: &[ResolvedFeature],
     remote_user: Option<&str>,
     config: &DevcontainerConfig,
@@ -803,6 +808,13 @@ pub fn generate_feature_dockerfile_with_opts(
         .replace('"', "\\\"")
         .replace('$', "\\$");
     lines.push(format!("LABEL devcontainer.metadata=\"{escaped}\""));
+
+    // Names the workspace the image was derived for, so `dev prune` can find
+    // rebuild leftovers after the daemon untags them (a dangling image keeps
+    // its labels but loses the workspace-prefixed tag).
+    lines.push(format!(
+        "LABEL {WORKSPACE_IMAGE_LABEL}=\"{workspace_image}\""
+    ));
 
     lines.join("\n")
 }
@@ -1210,6 +1222,23 @@ mod tests {
         assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
     }
 
+    /// The workspace label ties a derived image back to its workspace even
+    /// after a rebuild untags it — `dev prune` claims danglings through it.
+    #[test]
+    fn dockerfile_labels_the_workspace_image() {
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &[],
+            None,
+            &empty_config(),
+        );
+        assert!(
+            dockerfile.contains("LABEL dev.workspace-image=\"vsc-test\""),
+            "generated Dockerfile must carry the workspace label:\n{dockerfile}"
+        );
+    }
+
     /// The metadata LABEL must escape `$` with a backslash: `$$` is Compose
     /// syntax, and Docker's builder strips the dollar from `$${...}`, so a
     /// `${devcontainerId}` mount stored that way comes back corrupted on the
@@ -1223,8 +1252,13 @@ mod tests {
             "type": "volume"
         })];
 
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("ubuntu:24.04", &[dind], None, &empty_config());
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "ubuntu:24.04",
+            "vsc-test",
+            &[dind],
+            None,
+            &empty_config(),
+        );
         let label_line = dockerfile
             .lines()
             .find(|l| l.starts_with("LABEL devcontainer.metadata="))
@@ -1294,8 +1328,13 @@ mod tests {
             make_feature("feature-b", serde_json::json!({})),
         ];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &features,
+            Some("root"),
+            &config,
+        );
 
         // Feature options should be in RUN (scoped), not ENV (global).
         assert!(
@@ -1318,8 +1357,13 @@ mod tests {
             .insert("MY_VAR".to_string(), "hello".to_string());
         let features = vec![feature];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &features,
+            Some("root"),
+            &config,
+        );
         assert!(
             dockerfile.contains("ENV MY_VAR=\"hello\""),
             "containerEnv should use ENV directives.\nDockerfile:\n{dockerfile}"
@@ -1340,8 +1384,13 @@ mod tests {
             serde_json::json!({"desc": "line1\nline2"}),
         )];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &features,
+            Some("root"),
+            &config,
+        );
         // Newlines should be escaped as \n inside printf, not literal newlines
         // that would break the Dockerfile RUN instruction.
         assert!(

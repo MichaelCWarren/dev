@@ -138,6 +138,7 @@ pub async fn run(
         .await?;
         let dockerfile = generate_feature_dockerfile_with_opts(
             &folder_image,
+            &folder_image,
             &ordered,
             feature_user.as_deref(),
             &config,
@@ -257,6 +258,7 @@ pub async fn run(
                 .await?;
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image,
+            &folder_image,
             &ordered,
             feature_user.as_deref(),
             &config,
@@ -321,6 +323,7 @@ pub async fn run(
         resolve_remote_user(runtime.as_ref(), &base_image, config.remote_user.as_deref()).await?;
     let dockerfile = generate_feature_dockerfile_with_opts(
         &base_image,
+        &folder_image,
         &ordered,
         feature_user.as_deref(),
         &config,

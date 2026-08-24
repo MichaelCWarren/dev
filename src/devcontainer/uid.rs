@@ -71,6 +71,17 @@ pub fn should_remap_uid(
     }
 }
 
+/// The tag the UID-remapping layer is stored under. `dev prune`'s keep set
+/// derives current `-uid` tags through this same function, so a change here
+/// cannot silently drift prune into deleting the live image.
+pub fn uid_image_tag(base_image: &str, folder_image: &str) -> String {
+    if base_image.starts_with(folder_image) {
+        format!("{base_image}-uid")
+    } else {
+        format!("{folder_image}-uid")
+    }
+}
+
 /// Build the UID-remapping image layer.
 ///
 /// Returns the tag of the built image (e.g., `vsc-name-hash-features-uid`).
@@ -83,11 +94,7 @@ pub async fn build_uid_image(
     no_cache: bool,
     verbose: bool,
 ) -> anyhow::Result<String> {
-    let tag = if base_image.starts_with(folder_image) {
-        format!("{base_image}-uid")
-    } else {
-        format!("{folder_image}-uid")
-    };
+    let tag = uid_image_tag(base_image, folder_image);
 
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -200,5 +207,20 @@ mod tests {
     fn test_remap_skipped_on_macos() {
         let config = test_config(None);
         assert!(!should_remap_uid(&config, Some("vscode"), "on"));
+    }
+
+    /// Prune's keep set derives `-uid` tags through this same function; the
+    /// two cases are a features tag (extends the folder image) and a plain
+    /// base image (does not).
+    #[test]
+    fn uid_image_tag_extends_the_derived_tag_or_the_folder_image() {
+        assert_eq!(
+            uid_image_tag("vsc-ws-abc-features-aaaaaaaaaaaa", "vsc-ws-abc"),
+            "vsc-ws-abc-features-aaaaaaaaaaaa-uid"
+        );
+        assert_eq!(
+            uid_image_tag("ubuntu:24.04", "vsc-ws-abc"),
+            "vsc-ws-abc-uid"
+        );
     }
 }

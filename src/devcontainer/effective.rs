@@ -36,6 +36,37 @@ pub(crate) fn load_effective_config(
     })
 }
 
+/// Resolve the effective config for a workspace the same way `dev up`/`dev
+/// build` do, without writing any project state (no recipe materialization).
+/// Shared by read-only consumers (`dev prune`) so their view of "the current
+/// config" cannot drift from the commands that build images from it.
+pub(crate) fn effective_config_in(
+    dev_home: &crate::util::paths::DevHome,
+    workspace: &Path,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<DevcontainerConfig> {
+    use crate::util::ConfigSource;
+    match crate::util::workspace::find_config_source_in(dev_home, workspace)? {
+        ConfigSource::Direct(path) => {
+            let (value, ids) =
+                load_effective_config_value(&path, include_base, &dev_home.base_config())?;
+            Ok(effective_config_from_parts(value, ids)?.config)
+        }
+        ConfigSource::Recipe(recipe_path) => {
+            let recipe = super::Recipe::from_path(&recipe_path)?;
+            let composed = super::compose::compose_recipe_config_in(
+                dev_home,
+                &recipe_path,
+                &recipe,
+                runtime_name,
+                include_base,
+            )?;
+            Ok(effective_config_from_parts(composed.value, composed.base_feature_ids)?.config)
+        }
+    }
+}
+
 /// Build an [`EffectiveConfig`] from an already-composed config value.
 ///
 /// Recipe projects compose their layers up front, so the base layer is either

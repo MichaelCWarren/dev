@@ -194,7 +194,10 @@ pub struct ContainerInfo {
 /// A locally stored image: the tags that reference it.
 #[derive(Debug, Clone)]
 pub struct ImageInfo {
+    /// Daemon image ID (`sha256:...`); the only handle a dangling image has.
+    pub id: String,
     pub repo_tags: Vec<String>,
+    pub labels: HashMap<String, String>,
 }
 
 /// Result of a non-interactive exec command.

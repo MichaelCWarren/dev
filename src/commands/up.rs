@@ -528,6 +528,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 resolve_remote_user(runtime, &base_image, config.remote_user.as_deref()).await?;
             let dockerfile = generate_feature_dockerfile_with_opts(
                 &base_image,
+                &folder_image,
                 &ordered,
                 feature_user.as_deref(),
                 &config,
@@ -1687,6 +1688,7 @@ async fn run_compose(
         let feature_tag = feature_image_tag(&folder_image, config, &ordered);
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image,
+            &folder_image,
             &ordered,
             feature_user.as_deref(),
             config,

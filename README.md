@@ -231,7 +231,7 @@ dev prune --dry-run   # list what would be removed and what is kept
 dev prune             # remove superseded feature images
 ```
 
-The keep set is resolved the same way `dev up` resolves the current image — both with and without the base layer, so a `dev up --no-base` image survives — plus every image an existing container still references, including secondary compose services. Removal is never forced: an image the daemon reports in use is skipped and reported. Prune fails closed when no devcontainer config can be resolved, and is not yet supported on Apple Containers. The manual runtime commands (`docker image ls --filter 'reference=vsc-*-features-*'`, `docker image prune`) still work if you prefer them.
+The keep set is resolved the same way `dev up` resolves the current image — both with and without the base layer, so a `dev up --no-base` image survives — plus every image an existing container still references, including secondary compose services. Only tags with the derived digest shape and the `:latest` reference `dev` builds are candidates, so compose service images and user-applied tags like `:backup` are never touched. Dangling images left behind by rebuilds are removed too, identified by the workspace label `dev` bakes into the images it builds; images built by older `dev` versions carry no label, so `docker image prune` still covers those. Removal is never forced: an image the daemon reports in use is skipped and reported. Prune fails closed when no devcontainer config can be resolved, and is not yet supported on Apple Containers. The manual runtime commands (`docker image ls --filter 'reference=vsc-*-features-*'`, `docker image prune`) still work if you prefer them.
 
 ## Container runtimes
 
