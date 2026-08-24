@@ -169,7 +169,9 @@ impl ExplainReport {
                 if layer.present { "" } else { "   (absent)" }
             ));
         }
-        for (path, layer) in &self.origins {
+        let mut entries: Vec<(&String, &LayerId)> = self.origins.iter().collect();
+        entries.sort_by_key(|(path, _)| origin_sort_key(path));
+        for (path, layer) in entries {
             let Some(value) = resolve_path(&self.config, path) else {
                 continue; // replaced wholesale by a later layer, or selector-pruned
             };
@@ -210,6 +212,17 @@ impl ExplainReport {
             ],
         })
     }
+}
+
+/// Sort key that keeps array entries in numeric order (`mounts[2]` before
+/// `mounts[10]`), where plain string order would interleave them.
+fn origin_sort_key(path: &str) -> (String, usize) {
+    if let Some((key, rest)) = path.split_once('[')
+        && let Some(index) = rest.strip_suffix(']').and_then(|i| i.parse::<usize>().ok())
+    {
+        return (key.to_string(), index);
+    }
+    (path.to_string(), 0)
 }
 
 /// Look an origin path back up in the merged config. Origin paths take three
