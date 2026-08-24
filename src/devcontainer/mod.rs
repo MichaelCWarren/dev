@@ -2,6 +2,7 @@ pub mod compose;
 pub mod config;
 pub mod effective;
 pub mod features;
+pub mod hooklog;
 pub mod jsonc;
 pub mod lifecycle;
 pub mod lockfile;

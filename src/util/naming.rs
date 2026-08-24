@@ -145,6 +145,12 @@ pub fn devcontainer_id(workspace: &Path) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Short per-workspace key for files under `~/.dev/`: the first 16 hex chars of
+/// the workspace-path hash. Names forwarder pid files and the hook-log directory.
+pub(crate) fn workspace_hash(workspace: &Path) -> String {
+    devcontainer_id(workspace)[..16].to_string()
+}
+
 /// Return label key-value pairs used to identify containers belonging to a workspace.
 ///
 /// Uses the official devcontainer CLI labels:

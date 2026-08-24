@@ -10,6 +10,7 @@ use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, feature_image_tag, features_from_metadata,
     generate_feature_dockerfile_with_opts, order_features,
 };
+use crate::devcontainer::hooklog::HookLog;
 use crate::devcontainer::secrets::discovery::secrets_file_path;
 use crate::devcontainer::secrets::env_name_problem;
 use crate::devcontainer::secrets::validate::validate_secrets_at;
@@ -25,6 +26,7 @@ use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, ExecResult, PortMapping,
     VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
+use crate::util::paths::DevHome;
 use crate::util::{
     ConfigSource, container_name, find_config_source, workspace_folder_name, workspace_labels,
 };
@@ -168,6 +170,7 @@ pub(crate) async fn run_with_runtime(
         no_base,
         secrets_override,
         &providers,
+        &DevHome::current(),
     )
     .await
 }
@@ -190,6 +193,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     no_base: bool,
     secrets_override: Option<&Path>,
     providers: &ProviderRegistry,
+    dev_home: &DevHome,
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
         match find_config_source(workspace)? {
@@ -249,6 +253,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             verbose,
             update_remote_user_uid_default,
             &lockfile,
+            dev_home,
         )
         .await;
     }
@@ -370,6 +375,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 // container was created, and `postCreateCommand` is where
                 // toolchains get installed and databases get seeded.
                 let features = restart_feature_hooks(&config, &config_path).await?;
+                let hook_log = begin_hook_log(dev_home, workspace, "start");
                 run_start_hooks(
                     runtime,
                     &container.id,
@@ -377,6 +383,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                     user.as_deref(),
                     Some(&workspace_folder),
                     Some(&features),
+                    hook_log.as_ref(),
                 )
                 .await?;
                 // A plain `dev down` deletes the Caddy fragment but leaves the
@@ -705,6 +712,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     } else {
         Some(ordered_features.as_slice())
     };
+    let hook_log = begin_hook_log(dev_home, workspace, "create");
     run_create_hooks(
         runtime,
         &container_id,
@@ -712,6 +720,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         remote_user,
         Some(&workspace_folder),
         feature_hooks,
+        hook_log.as_ref(),
     )
     .await?;
 
@@ -1549,6 +1558,7 @@ async fn run_compose(
     verbose: bool,
     update_remote_user_uid_default: &str,
     lockfile: &LockfilePolicy,
+    dev_home: &DevHome,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -1865,6 +1875,7 @@ async fn run_compose(
     };
     match owed {
         ComposeHooks::Create => {
+            let hook_log = begin_hook_log(dev_home, workspace, "create");
             run_create_hooks(
                 runtime,
                 &container_id,
@@ -1872,10 +1883,12 @@ async fn run_compose(
                 remote_user,
                 None,
                 feature_hooks,
+                hook_log.as_ref(),
             )
             .await?;
         }
         ComposeHooks::Start => {
+            let hook_log = begin_hook_log(dev_home, workspace, "start");
             run_start_hooks(
                 runtime,
                 &container_id,
@@ -1883,6 +1896,7 @@ async fn run_compose(
                 remote_user,
                 None,
                 feature_hooks,
+                hook_log.as_ref(),
             )
             .await?;
         }
@@ -2000,6 +2014,18 @@ async fn verify_compose_service_running(
 
 /// Substitute variables in each mount entry (string or object form) and emit
 /// Docker long-form strings, warning about entries that lack `source`/`target`.
+/// Open this run's hook log, downgrading any failure to a warning — logging
+/// must never block a `dev up`.
+fn begin_hook_log(dev_home: &DevHome, workspace: &Path, run_kind: &str) -> Option<HookLog> {
+    match HookLog::begin(dev_home, workspace, run_kind) {
+        Ok(log) => Some(log),
+        Err(e) => {
+            eprintln!("Warning: hook output will not be logged: {e}");
+            None
+        }
+    }
+}
+
 /// Long-form mount strings contributed by features, in install order.
 ///
 /// Feature mounts arrive as raw devcontainer JSON (string or object form); each
@@ -2793,6 +2819,7 @@ mod tests {
     // image-based devcontainer.json so the create/start/readiness flow can be
     // exercised deterministically in CI (no container daemon).
 
+    use crate::util::paths::DevHome;
     use crate::util::workspace_labels;
     use std::sync::{Arc, Mutex};
 
@@ -3428,6 +3455,7 @@ mod tests {
         secrets_file: Option<&Path>,
         secrets_override: Option<&Path>,
     ) -> anyhow::Result<()> {
+        let dev_home_dir = TempDir::new().unwrap();
         super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
@@ -3441,6 +3469,7 @@ mod tests {
             /* no_base */ true,
             /* secrets_override */ secrets_override,
             providers,
+            &DevHome::at(dev_home_dir.path()),
         )
         .await
     }
@@ -5929,6 +5958,85 @@ mod tests {
         );
     }
 
+    /// Hook output persists to the workspace hook log on success and on
+    /// failure, so a failed `dev up` can be replayed with `dev logs --hooks`.
+    #[tokio::test(start_paused = true)]
+    async fn hooks_persist_output_to_the_log_on_success_and_failure() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"postCreateCommand":"echo ready"}"#).unwrap();
+
+        let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
+        let rt = UpFakeRuntime::ok();
+        crate::devcontainer::run_create_hooks(
+            &rt,
+            "fake-id",
+            &config,
+            None,
+            None,
+            None,
+            Some(&log),
+        )
+        .await
+        .expect("the hook exits zero");
+        let content = std::fs::read_to_string(&log.path).unwrap();
+        assert!(
+            content.contains("--- postCreateCommand: echo ready (exit 0) ---"),
+            "a successful hook reaches the log: {content}"
+        );
+
+        let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
+        let rt = UpFakeRuntime::execs_report(7);
+        crate::devcontainer::run_create_hooks(
+            &rt,
+            "fake-id",
+            &config,
+            None,
+            None,
+            None,
+            Some(&log),
+        )
+        .await
+        .expect_err("the hook fails");
+        let content = std::fs::read_to_string(&log.path).unwrap();
+        assert!(
+            content.contains("(exit 7)"),
+            "the failing hook still reaches the log before the error: {content}"
+        );
+    }
+
+    /// Parallel (object-form) hooks race, but every branch's record lands.
+    #[tokio::test(start_paused = true)]
+    async fn parallel_hooks_all_reach_the_log() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"postCreateCommand":{"lint":"echo lint","build":"echo build"}}"#,
+        )
+        .unwrap();
+
+        let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
+        let rt = UpFakeRuntime::ok();
+        crate::devcontainer::run_create_hooks(
+            &rt,
+            "fake-id",
+            &config,
+            None,
+            None,
+            None,
+            Some(&log),
+        )
+        .await
+        .expect("parallel hooks succeed");
+
+        let content = std::fs::read_to_string(&log.path).unwrap();
+        assert!(content.contains("echo lint"), "{content}");
+        assert!(content.contains("echo build"), "{content}");
+    }
+
     /// Lifecycle hooks are the visible race: without a readiness gate the
     /// first postStartCommand is the first exec and fails. The bounded helper
     /// must finish before hooks run, so the hook is after the successful probe.
@@ -5945,7 +6053,7 @@ mod tests {
         super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
             .await
             .expect("readiness should wait for the target service to become usable");
-        crate::devcontainer::run_create_hooks(&rt, "fake-id", &config, None, None, None)
+        crate::devcontainer::run_create_hooks(&rt, "fake-id", &config, None, None, None, None)
             .await
             .expect("lifecycle hook should run after readiness");
 

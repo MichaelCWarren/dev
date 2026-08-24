@@ -103,6 +103,19 @@ dev open --insiders   # use VS Code Insiders instead
 
 > **Recipes and "Reopen in Container":** a recipe-based project has no `devcontainer.json` on disk for VS Code to read, so the editor's "Reopen in Container" has nothing to open. Run `dev up` and `dev open` instead. `dev vscode repair` re-links *legacy* user-scoped projects that still keep a real `devcontainer.json`; it refuses recipe projects rather than leaving a link that resolves to nothing.
 
+## Viewing logs (`dev logs`)
+
+`dev up` persists every lifecycle hook's output — success and failure alike — to `~/.dev/logs/<workspace-hash>/hooks.log` (created `0600`, since hook output can carry secret material). The previous run is kept once, as `hooks.prev.log`. Hooks print nothing to the terminal on success, so this log is how a failed `dev up` gets replayed after the fact:
+
+```sh
+dev logs            # hook log, then each workspace container's logs
+dev logs --hooks    # hook log only — works with no runtime running
+dev logs --follow   # stream container logs
+dev logs --tail 100 # last 100 lines of container logs
+```
+
+On the non-compose path the container's own log stream is usually short — PID 1 is the keep-alive (or a feature entrypoint chain), and hooks run as execs, which the runtime does not capture in `docker logs`. The hook log is the record of what `dev up` actually ran. Compose projects log through `docker compose logs` / `podman compose logs`, which covers every service in the project, not just the primary one.
+
 ## Layered configuration
 
 `dev` merges config layers so you set preferences once and they apply everywhere. Layers merge in this order, lowest to highest priority:

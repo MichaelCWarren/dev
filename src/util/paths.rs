@@ -80,6 +80,11 @@ impl DevHome {
     pub fn runtime_config(&self, runtime: &str) -> PathBuf {
         self.root.join(runtime).join("devcontainer.json")
     }
+
+    /// A workspace's hook-log directory, `~/.dev/logs/<workspace-hash>/`.
+    pub fn workspace_logs_dir(&self, workspace_hash: &str) -> PathBuf {
+        self.root.join("logs").join(workspace_hash)
+    }
 }
 
 /// VS Code remote-containers configs directory.

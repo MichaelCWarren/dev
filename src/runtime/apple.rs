@@ -1114,6 +1114,31 @@ fn truncate_container_id(name: &str) -> String {
     format!("{}-{}", &name[..17], &name[name.len() - 18..])
 }
 
+/// Wrap a log file descriptor handed over by the daemon into an async reader.
+///
+/// The daemon may hand over a pipe or a plain log-file fd. Pipes go through the
+/// reactor (a blocking-pool read on a pipe the daemon holds open can never be
+/// given up on — the issue #4 hang); regular files read fine through the
+/// blocking pool.
+fn log_fd_reader(
+    fd: std::os::fd::RawFd,
+) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, DevError> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let is_fifo =
+        unsafe { libc::fstat(fd, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO;
+    if is_fifo {
+        let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
+            .map_err(|e| DevError::Runtime(format!("container logs pipe: {e}")))?;
+        Ok(Box::new(rx))
+    } else {
+        Ok(Box::new(tokio::fs::File::from_std(std::fs::File::from(
+            owned,
+        ))))
+    }
+}
+
 /// The init process argv: the entrypoint chain followed by the keep-alive
 /// command — the same argv Docker builds from Entrypoint + Cmd, so `exec "$@"`
 /// feature entrypoints chain into `sleep infinity` and the container stays up.
@@ -1584,6 +1609,26 @@ impl ContainerRuntime for AppleRuntime {
             Err(DevError::Runtime(
                 "Port forwarding is not yet supported for Apple Containers".into(),
             ))
+        })
+    }
+
+    fn container_logs(
+        &self,
+        id: &str,
+        _follow: bool,
+        _tail: Option<u32>,
+    ) -> BoxFut<'_, Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let (stdout_fd, stderr_fd) = self
+                .client
+                .logs(&id)
+                .await
+                .map_err(|e| DevError::Runtime(format!("container logs: {e}")))?;
+            let stdout = log_fd_reader(stdout_fd)?;
+            let stderr = log_fd_reader(stderr_fd)?;
+            Ok(Box::new(tokio::io::AsyncReadExt::chain(stdout, stderr))
+                as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
         })
     }
 }

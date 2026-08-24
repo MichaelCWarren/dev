@@ -13,7 +13,7 @@ use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, env_assignments, terminal_size,
+    ExecResult, ImageInfo, ImageMetadata, env_assignments, terminal_size,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -123,6 +123,37 @@ impl tokio::io::AsyncRead for LogOutputStream {
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Copy a container's log stream into the write half of a duplex pipe.
+///
+/// Runs as a spawned task; the reader half sees EOF when the stream ends or
+/// the daemon drops it. Transport errors are reported on stderr, since the
+/// caller only holds a byte stream.
+async fn forward_log_stream(
+    client: Docker,
+    id: String,
+    options: bollard::query_parameters::LogsOptions,
+    mut writer: tokio::io::DuplexStream,
+) {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut stream = client.logs(&id, Some(options));
+    while let Some(item) = stream.next().await {
+        let data = match item {
+            Ok(bollard::container::LogOutput::StdOut { message })
+            | Ok(bollard::container::LogOutput::StdErr { message }) => message,
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("Warning: log stream for container '{id}' ended with an error: {e}");
+                break;
+            }
+        };
+        if writer.write_all(&data).await.is_err() {
+            break; // reader went away
         }
     }
 }
@@ -841,6 +872,61 @@ impl BollardRuntime {
         }
     }
 
+    /// Stream a container's logs as bytes. The bollard stream is forwarded
+    /// through a duplex pipe by a spawned task, so the returned reader owns no
+    /// borrow of the client and outlives this call.
+    pub fn container_logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> BoxFut<'_, Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        let client = self.client.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            let mut opts = bollard::query_parameters::LogsOptionsBuilder::new()
+                .stdout(true)
+                .stderr(true)
+                .follow(follow);
+            if let Some(n) = tail {
+                opts = opts.tail(&n.to_string());
+            }
+            let (writer, reader) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(forward_log_stream(client, id, opts.build(), writer));
+            Ok(Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+        })
+    }
+
+    pub fn list_images(&self) -> BoxFut<'_, Vec<ImageInfo>> {
+        Box::pin(async move {
+            let images = self
+                .client
+                .list_images(None::<bollard::query_parameters::ListImagesOptions>)
+                .await?;
+            Ok(images
+                .into_iter()
+                .map(|i| ImageInfo {
+                    id: i.id,
+                    repo_tags: i.repo_tags,
+                })
+                .collect())
+        })
+    }
+
+    pub fn remove_image(&self, image: &str) -> BoxFut<'_, ()> {
+        let image = image.to_string();
+        Box::pin(async move {
+            self.client
+                .remove_image(
+                    &image,
+                    None::<bollard::query_parameters::RemoveImageOptions>,
+                    None,
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
     #[allow(dead_code)]
     async fn inspect_container_impl(&self, id: &str) -> Result<ContainerInfo, DevError> {
         let resp = self.client.inspect_container(id, None).await?;
@@ -1200,6 +1286,23 @@ impl ContainerRuntime for DockerRuntime {
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
         self.0.image_exists(image)
+    }
+
+    fn container_logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> BoxFut<'_, Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0.container_logs(id, follow, tail)
+    }
+
+    fn list_images(&self) -> BoxFut<'_, Vec<ImageInfo>> {
+        self.0.list_images()
+    }
+
+    fn remove_image(&self, image: &str) -> BoxFut<'_, ()> {
+        self.0.remove_image(image)
     }
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {

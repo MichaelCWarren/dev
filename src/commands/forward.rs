@@ -5,6 +5,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 use crate::runtime::{ContainerRuntime, ContainerState, detect_runtime};
+use crate::util::naming::workspace_hash;
 use crate::util::paths::dev_home;
 use crate::util::workspace_labels;
 
@@ -66,16 +67,6 @@ fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
 
 fn forward_dir() -> std::path::PathBuf {
     dev_home().join("forward")
-}
-
-fn workspace_hash(workspace: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let abs = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let mut hasher = Sha256::new();
-    hasher.update(abs.to_string_lossy().as_bytes());
-    hex::encode(hasher.finalize())[..16].to_string()
 }
 
 fn pid_file_path(workspace: &Path, host_port: u16) -> std::path::PathBuf {

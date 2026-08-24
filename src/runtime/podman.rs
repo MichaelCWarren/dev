@@ -4,7 +4,7 @@ use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::docker::BollardRuntime;
 use crate::runtime::{
-    AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
+    AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult, ImageInfo,
     ImageMetadata,
 };
 use std::os::unix::process::CommandExt;
@@ -182,6 +182,23 @@ impl ContainerRuntime for PodmanRuntime {
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
         self.0.image_exists(image)
+    }
+
+    fn container_logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> BoxFut<'_, Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0.container_logs(id, follow, tail)
+    }
+
+    fn list_images(&self) -> BoxFut<'_, Vec<ImageInfo>> {
+        self.0.list_images()
+    }
+
+    fn remove_image(&self, image: &str) -> BoxFut<'_, ()> {
+        self.0.remove_image(image)
     }
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {

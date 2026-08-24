@@ -179,6 +179,43 @@ pub async fn compose_stop(
     Ok(())
 }
 
+/// Stream compose service logs for the project.
+pub async fn compose_logs(
+    runtime_name: &str,
+    compose_files: &[&str],
+    project_dir: &Path,
+    project_name: &str,
+    follow: bool,
+    tail: Option<u32>,
+) -> Result<(), DevError> {
+    let (bin, sub) = compose_cmd(runtime_name);
+    let file_args = compose_file_args(compose_files, project_dir);
+
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg(sub)
+        .args(&file_args)
+        .arg("--project-name")
+        .arg(project_name)
+        .arg("logs");
+    if follow {
+        cmd.arg("--follow");
+    }
+    if let Some(n) = tail {
+        cmd.arg("--tail").arg(n.to_string());
+    }
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| DevError::Runtime(format!("Failed to run {bin} {sub} logs: {e}")))?;
+    if !status.success() {
+        return Err(DevError::Runtime(format!(
+            "{bin} {sub} logs failed (exit {})",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(())
+}
+
 /// Stop and remove compose services.
 pub async fn compose_down(
     runtime_name: &str,

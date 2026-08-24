@@ -146,6 +146,21 @@ pub enum Command {
         refresh: bool,
     },
 
+    /// Show container logs and persisted lifecycle-hook output
+    Logs {
+        /// Show only the persisted lifecycle-hook log (works without a runtime)
+        #[arg(long)]
+        hooks: bool,
+
+        /// Follow container log output
+        #[arg(short = 'f', long, conflicts_with = "hooks")]
+        follow: bool,
+
+        /// Show only the last N lines of container logs
+        #[arg(long, value_name = "N")]
+        tail: Option<u32>,
+    },
+
     /// Show container state for current directory
     Status {
         /// Output as JSON
@@ -333,6 +348,8 @@ mod tests {
             vec!["dev", "open", "--runtime", "apple"],
             vec!["dev", "--runtime", "apple", "status"],
             vec!["dev", "status", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "logs"],
+            vec!["dev", "logs", "--runtime", "apple"],
         ] {
             assert_eq!(
                 parsed_runtime(&command),

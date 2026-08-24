@@ -7,6 +7,7 @@ pub mod forward;
 pub mod global;
 pub mod init;
 pub mod list;
+pub mod logs;
 pub mod new;
 pub mod open;
 pub mod shell;

@@ -180,6 +180,14 @@ pub struct ContainerInfo {
     pub image: String,
 }
 
+/// A locally stored image: its id and the tags that reference it.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by `dev prune`
+pub struct ImageInfo {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+}
+
 /// Result of a non-interactive exec command.
 #[derive(Debug, Clone)]
 pub struct ExecResult {
@@ -321,6 +329,47 @@ pub trait ContainerRuntime: Send + Sync {
         cmd: &[String],
         user: Option<&str>,
     ) -> BoxFut<'_, AttachedExec>;
+
+    /// Read a container's log stream (stdout and stderr interleaved). `tail`
+    /// limits output to the last N lines; `follow` keeps the stream open.
+    ///
+    /// The default declines, so runtimes without a log channel stay honest.
+    fn container_logs(
+        &self,
+        _id: &str,
+        _follow: bool,
+        _tail: Option<u32>,
+    ) -> BoxFut<'_, Box<dyn AsyncRead + Send + Unpin>> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "container logs are not supported by the {name} runtime"
+            )))
+        })
+    }
+
+    /// Every locally stored image. Callers filter by tag prefix in code —
+    /// docker and podman `reference` filter syntaxes differ, prefix matching
+    /// here is portable.
+    fn list_images(&self) -> BoxFut<'_, Vec<ImageInfo>> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "listing images is not supported by the {name} runtime"
+            )))
+        })
+    }
+
+    /// Remove one image by tag or id. Not forced: an in-use conflict is the
+    /// daemon's report to surface, not to override.
+    fn remove_image(&self, _image: &str) -> BoxFut<'_, ()> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "removing images is not supported by the {name} runtime"
+            )))
+        })
+    }
 }
 
 /// Resolve the effective remote user by checking the devcontainer config first,
