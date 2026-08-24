@@ -169,9 +169,7 @@ impl ExplainReport {
                 if layer.present { "" } else { "   (absent)" }
             ));
         }
-        let mut entries: Vec<(&String, &LayerId)> = self.origins.iter().collect();
-        entries.sort_by_key(|(path, _)| origin_sort_key(path));
-        for (path, layer) in entries {
+        for (path, layer) in self.sorted_origins() {
             let Some(value) = resolve_path(&self.config, path) else {
                 continue; // replaced wholesale by a later layer, or selector-pruned
             };
@@ -190,6 +188,14 @@ impl ExplainReport {
         out
     }
 
+    /// Origin entries with array indexes in numeric order (`mounts[2]` before
+    /// `mounts[10]`), where the map's plain string order would interleave them.
+    fn sorted_origins(&self) -> Vec<(&String, &LayerId)> {
+        let mut entries: Vec<(&String, &LayerId)> = self.origins.iter().collect();
+        entries.sort_by_cached_key(|(path, _)| origin_sort_key(path));
+        entries
+    }
+
     fn to_json(&self) -> Value {
         serde_json::json!({
             "workspace": self.workspace.display().to_string(),
@@ -201,7 +207,10 @@ impl ExplainReport {
                 "present": l.present,
             })).collect::<Vec<_>>(),
             "config": self.config,
-            "origins": self.origins.iter()
+            // serde_json's `preserve_order` feature keeps this insertion order
+            // in the emitted JSON, so `--json` shows the same numeric array
+            // ordering `render` does.
+            "origins": self.sorted_origins().into_iter()
                 .map(|(k, v)| (k.clone(), Value::String(v.to_string())))
                 .collect::<serde_json::Map<_, _>>(),
             "dropped": self.dropped,
@@ -214,32 +223,48 @@ impl ExplainReport {
     }
 }
 
-/// Sort key that keeps array entries in numeric order (`mounts[2]` before
-/// `mounts[10]`), where plain string order would interleave them.
-fn origin_sort_key(path: &str) -> (String, usize) {
-    if let Some((key, rest)) = path.split_once('[')
-        && let Some(index) = rest.strip_suffix(']').and_then(|i| i.parse::<usize>().ok())
-    {
-        return (key.to_string(), index);
-    }
-    (path.to_string(), 0)
+/// An origin path split into its selector shape. `Provenance::set` call sites
+/// in merge.rs render exactly these four shapes (`key`, `key.sub`,
+/// `key[index]`, `key["quoted id"]`); parsing them once here keeps the sort
+/// key and the config lookup from drifting apart.
+enum OriginPath<'a> {
+    Plain(&'a str),
+    Sub(&'a str, &'a str),
+    Index(&'a str, usize),
+    Quoted(&'a str, &'a str),
 }
 
-/// Look an origin path back up in the merged config. Origin paths take three
-/// shapes: `key`, `key.sub`, `key[index]`, and `key["quoted id"]`.
-fn resolve_path<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
+fn parse_origin_path(path: &str) -> Option<OriginPath<'_>> {
     if let Some((key, rest)) = path.split_once('[') {
         let inner = rest.strip_suffix(']')?;
-        let field = config.get(key)?;
         if let Some(id) = inner.strip_prefix('"').and_then(|i| i.strip_suffix('"')) {
-            return field.get(id);
+            return Some(OriginPath::Quoted(key, id));
         }
-        return field.get(inner.parse::<usize>().ok()?);
+        return Some(OriginPath::Index(key, inner.parse().ok()?));
     }
     if let Some((key, sub)) = path.split_once('.') {
-        return config.get(key)?.get(sub);
+        return Some(OriginPath::Sub(key, sub));
     }
-    config.get(path)
+    Some(OriginPath::Plain(path))
+}
+
+/// Sort key that keeps array entries in numeric order (`mounts[2]` before
+/// `mounts[10]`); every other shape keeps plain string order.
+fn origin_sort_key(path: &str) -> (String, usize) {
+    match parse_origin_path(path) {
+        Some(OriginPath::Index(key, index)) => (key.to_string(), index),
+        _ => (path.to_string(), 0),
+    }
+}
+
+/// Look an origin path back up in the merged config.
+fn resolve_path<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
+    match parse_origin_path(path)? {
+        OriginPath::Plain(key) => config.get(key),
+        OriginPath::Sub(key, sub) => config.get(key)?.get(sub),
+        OriginPath::Index(key, index) => config.get(key)?.get(index),
+        OriginPath::Quoted(key, id) => config.get(key)?.get(id),
+    }
 }
 
 #[cfg(test)]
@@ -401,5 +426,40 @@ mod tests {
             "recipe-customizations"
         );
         assert_eq!(json["layers"].as_array().unwrap().len(), 5);
+    }
+
+    /// `--json` origins follow the same numeric array ordering `render` uses;
+    /// serde_json's `preserve_order` keeps the map's insertion order on output.
+    #[test]
+    fn json_origins_keep_numeric_array_order() {
+        let mut origins = BTreeMap::new();
+        for i in [0, 1, 2, 10, 11] {
+            origins.insert(format!("mounts[{i}]"), LayerId::Project);
+        }
+        let report = ExplainReport {
+            workspace: PathBuf::from("/ws"),
+            kind: "direct",
+            runtime_layer: "docker".to_string(),
+            layers: vec![],
+            config: serde_json::json!({}),
+            origins,
+            dropped: vec![],
+        };
+        let keys: Vec<String> = report.to_json()["origins"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "mounts[0]",
+                "mounts[1]",
+                "mounts[2]",
+                "mounts[10]",
+                "mounts[11]"
+            ]
+        );
     }
 }
