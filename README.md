@@ -191,6 +191,27 @@ legitimate and their left-to-right order is semantically meaningful (see
 
 Command-line overrides such as `dev up --ports` are applied last, on top of the merged result.
 
+### Where did this value come from? (`dev config explain`)
+
+`dev config explain` prints the effective merged config annotated with the layer each value came from, the way `git config --show-origin` does for git:
+
+```
+# effective config for /Users/me/proj (recipe project, runtime layer: docker)
+# layers (lowest to highest priority):
+#   global-template:rust-dev   ~/.dev/global/rust-dev/.devcontainer/devcontainer.json
+#   base                       ~/.dev/base/devcontainer.json
+#   runtime:docker             ~/.dev/docker/devcontainer.json   (absent)
+#   recipe-features            .devcontainer/recipe.json
+#   recipe-customizations      .devcontainer/recipe.json
+containerEnv.EDITOR = "vim"  <- base
+features["ghcr.io/devcontainers/features/node:1"] = {}  <- recipe-features
+image = "mcr.microsoft.com/devcontainers/rust:1"  <- global-template:rust-dev
+postCreateCommand.setup = "cargo fetch"  <- recipe-customizations
+# dropped by selector precedence: build (the highest layer's image/build/compose choice wins)
+```
+
+It runs the same tracked merge `dev up` performs, so it always agrees with what a container would actually get — unlike `dev config list`, which shows the project file alone on a direct-config project. `--json` emits the report as a machine-readable object; `--no-base` previews the merge without the base layer; the global `--runtime` flag picks which runtime layer is applied. Duplicate array entries are credited to the first layer that contributed them, and `${...}` variables are shown unexpanded, since substitution happens per consumer at run time.
+
 ### Derived images and disk use
 
 When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `vsc-<folder>-<workspace-hash>-features-<digest>` — the base image name `dev` derives for the workspace, plus a `-features-` suffix. The digest covers the effective config values that shape the image: the base image *selector* (`image`, or `build.dockerfile`/`context`/`args`), the declared `features`, `remoteUser`, `containerEnv`, and `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one — which is what keeps a cached image from silently omitting base-config changes.

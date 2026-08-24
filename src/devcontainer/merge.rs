@@ -1,4 +1,60 @@
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Which configuration layer a merged value came from, for `dev config explain`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayerId {
+    GlobalTemplate(String),
+    Base,
+    Runtime(String),
+    Project,
+    RecipeFeatures,
+    RecipeCustomizations,
+}
+
+impl std::fmt::Display for LayerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LayerId::GlobalTemplate(name) => write!(f, "global-template:{name}"),
+            LayerId::Base => write!(f, "base"),
+            LayerId::Runtime(name) => write!(f, "runtime:{name}"),
+            LayerId::Project => write!(f, "project"),
+            LayerId::RecipeFeatures => write!(f, "recipe-features"),
+            LayerId::RecipeCustomizations => write!(f, "recipe-customizations"),
+        }
+    }
+}
+
+/// Origin sink for a tracked merge.
+///
+/// Production merges pass `Noop` and pay nothing; `dev config explain` passes
+/// `Recording` and gets, for every written key path (`"image"`,
+/// `"containerEnv.EDITOR"`, `"mounts[2]"`, `features["…/node:1"]`), the layer
+/// that wrote it. A deduplicated array entry records nothing on the skip, so a
+/// duplicate stays credited to the first layer that contributed it.
+pub enum Provenance {
+    Noop,
+    Recording(BTreeMap<String, LayerId>),
+}
+
+impl Provenance {
+    pub fn recording() -> Self {
+        Provenance::Recording(BTreeMap::new())
+    }
+
+    pub fn into_origins(self) -> BTreeMap<String, LayerId> {
+        match self {
+            Provenance::Noop => BTreeMap::new(),
+            Provenance::Recording(map) => map,
+        }
+    }
+
+    fn set(&mut self, path: String, layer: &LayerId) {
+        if let Provenance::Recording(map) = self {
+            map.insert(path, layer.clone());
+        }
+    }
+}
 
 /// Fields where the base config value should override the template (scalar semantics).
 const SCALAR_FIELDS: &[&str] = &["name", "image", "remoteUser", "shutdownAction", "waitFor"];
@@ -38,7 +94,26 @@ const FEATURE_FIELDS: &[&str] = &["features"];
 /// - Map fields: merge (overlay keys override base keys)
 /// - Feature fields: union (overlay features added to base features)
 /// - Unknown fields: overlay wins
+///
+/// Production callers use [`merge_layer_tracked`] with a `Noop` sink; this
+/// untracked form remains as the reference the equivalence test compares against.
+#[cfg(test)]
 pub fn merge_layer(base: &mut Value, overlay: &Value) {
+    // The layer id is a placeholder: a Noop sink records nothing.
+    merge_layer_tracked(base, overlay, &LayerId::Project, &mut Provenance::Noop);
+}
+
+/// [`merge_layer`] with per-value origin recording for `dev config explain`.
+///
+/// Behavior over the merged value is identical to `merge_layer`; the only
+/// addition is that each terminal write also records its key path against
+/// `layer` in `prov`.
+pub fn merge_layer_tracked(
+    base: &mut Value,
+    overlay: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
+) {
     let overlay_obj = match overlay.as_object() {
         Some(obj) if !obj.is_empty() => obj,
         _ => return,
@@ -52,18 +127,20 @@ pub fn merge_layer(base: &mut Value, overlay: &Value) {
     for (key, overlay_val) in overlay_obj {
         if SCALAR_FIELDS.contains(&key.as_str()) {
             base_obj.insert(key.clone(), overlay_val.clone());
+            prov.set(key.clone(), layer);
         } else if LIFECYCLE_FIELDS.contains(&key.as_str()) {
-            merge_lifecycle_command(base_obj, key, overlay_val);
+            merge_lifecycle_command(base_obj, key, overlay_val, layer, prov);
         } else if FEATURE_FIELDS.contains(&key.as_str()) {
-            merge_feature_map(base_obj, key, overlay_val);
+            merge_feature_map(base_obj, key, overlay_val, layer, prov);
         } else if ARRAY_CONCAT_FIELDS.contains(&key.as_str()) {
-            merge_array_concat(base_obj, key, overlay_val);
+            merge_array_concat(base_obj, key, overlay_val, layer, prov);
         } else if ARRAY_FIELDS.contains(&key.as_str()) {
-            merge_array(base_obj, key, overlay_val);
+            merge_array(base_obj, key, overlay_val, layer, prov);
         } else if MAP_FIELDS.contains(&key.as_str()) {
-            merge_map(base_obj, key, overlay_val);
+            merge_map(base_obj, key, overlay_val, layer, prov);
         } else {
             base_obj.insert(key.clone(), overlay_val.clone());
+            prov.set(key.clone(), layer);
         }
     }
 }
@@ -72,9 +149,12 @@ fn merge_lifecycle_command(
     dest_obj: &mut serde_json::Map<String, Value>,
     key: &str,
     overlay_val: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
 ) {
     let Some(overlay_map) = overlay_val.as_object() else {
         dest_obj.insert(key.to_string(), overlay_val.clone());
+        prov.set(key.to_string(), layer);
         return;
     };
 
@@ -85,14 +165,17 @@ fn merge_lifecycle_command(
     if let Some(dest_map) = dest_val.as_object_mut() {
         for (name, command) in overlay_map {
             dest_map.insert(name.clone(), command.clone());
+            prov.set(format!("{key}.{name}"), layer);
         }
     } else {
         dest_obj.insert(key.to_string(), overlay_val.clone());
+        prov.set(key.to_string(), layer);
     }
 }
 
 /// Compose N layers in order (first = lowest priority, last = highest priority).
 /// Returns the merged result.
+#[cfg(test)]
 pub fn merge_layers(layers: &[Value]) -> Value {
     let mut result = Value::Object(serde_json::Map::new());
     for layer in layers {
@@ -101,9 +184,24 @@ pub fn merge_layers(layers: &[Value]) -> Value {
     result
 }
 
+/// [`merge_layers`] with per-value origin recording for `dev config explain`.
+pub fn merge_layers_tracked(layers: &[(LayerId, Value)], prov: &mut Provenance) -> Value {
+    let mut result = Value::Object(serde_json::Map::new());
+    for (id, layer) in layers {
+        merge_layer_tracked(&mut result, layer, id, prov);
+    }
+    result
+}
+
 /// Union feature maps: base features are added to template features.
 /// If both have the same feature, base options override.
-fn merge_feature_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
+fn merge_feature_map(
+    dest_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    base_val: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
+) {
     let base_features = match base_val.as_object() {
         Some(obj) => obj,
         None => return,
@@ -116,12 +214,19 @@ fn merge_feature_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, b
     if let Some(dest_map) = dest_features.as_object_mut() {
         for (feature_key, feature_val) in base_features {
             dest_map.insert(feature_key.clone(), feature_val.clone());
+            prov.set(format!("{key}[\"{feature_key}\"]"), layer);
         }
     }
 }
 
 /// Concatenate arrays: base values appended to template values, skipping duplicates.
-fn merge_array(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
+fn merge_array(
+    dest_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    base_val: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
+) {
     let base_arr = match base_val.as_array() {
         Some(arr) => arr,
         None => return,
@@ -134,7 +239,10 @@ fn merge_array(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_va
     if let Some(dest_vec) = dest_arr.as_array_mut() {
         for item in base_arr {
             if !dest_vec.contains(item) {
+                // Indices are final: merging only ever appends. A duplicate
+                // records nothing, so the first contributing layer keeps credit.
                 dest_vec.push(item.clone());
+                prov.set(format!("{key}[{}]", dest_vec.len() - 1), layer);
             }
         }
     }
@@ -142,7 +250,13 @@ fn merge_array(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_va
 
 /// Concatenate arrays without deduplication. Used for `runArgs`, where repeated
 /// flags are legitimate and the left-to-right order is semantically meaningful.
-fn merge_array_concat(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
+fn merge_array_concat(
+    dest_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    base_val: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
+) {
     let base_arr = match base_val.as_array() {
         Some(arr) => arr,
         None => return,
@@ -155,12 +269,19 @@ fn merge_array_concat(dest_obj: &mut serde_json::Map<String, Value>, key: &str, 
     if let Some(dest_vec) = dest_arr.as_array_mut() {
         for item in base_arr {
             dest_vec.push(item.clone());
+            prov.set(format!("{key}[{}]", dest_vec.len() - 1), layer);
         }
     }
 }
 
 /// Merge maps: base keys override template keys.
-fn merge_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
+fn merge_map(
+    dest_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    base_val: &Value,
+    layer: &LayerId,
+    prov: &mut Provenance,
+) {
     let base_map = match base_val.as_object() {
         Some(obj) => obj,
         None => return,
@@ -173,6 +294,7 @@ fn merge_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val:
     if let Some(dest_m) = dest_map.as_object_mut() {
         for (k, v) in base_map {
             dest_m.insert(k.clone(), v.clone());
+            prov.set(format!("{key}.{k}"), layer);
         }
     }
 }
@@ -183,6 +305,95 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// The tracked merge is the production merge: a Noop sink must yield a
+    /// bit-identical result to the untracked entry points.
+    #[test]
+    fn noop_provenance_changes_nothing() {
+        let base = serde_json::json!({
+            "remoteUser": "vscode",
+            "mounts": ["source=a,target=/a,type=volume"],
+            "containerEnv": {"EDITOR": "vim"},
+            "features": {"ghcr.io/x/y:1": {}},
+            "runArgs": ["--env-file", ".env"],
+            "postCreateCommand": {"setup": "make setup"}
+        });
+        let project = serde_json::json!({
+            "image": "ubuntu:24.04",
+            "mounts": ["source=a,target=/a,type=volume", "source=b,target=/b,type=volume"],
+            "containerEnv": {"TERM": "xterm"},
+            "runArgs": ["--env-file", ".env"],
+            "postCreateCommand": {"lint": "make lint"}
+        });
+
+        let plain = merge_layers(&[base.clone(), project.clone()]);
+        let tracked = merge_layers_tracked(
+            &[(LayerId::Base, base), (LayerId::Project, project)],
+            &mut Provenance::Noop,
+        );
+
+        assert_eq!(plain, tracked);
+    }
+
+    /// Every write class records the layer that performed it, keyed the way
+    /// `dev config explain` prints: scalars by key, maps and lifecycle
+    /// commands by sub-key, arrays by final index, features by quoted id.
+    #[test]
+    fn tracked_merge_credits_values_to_their_layers() {
+        let base = serde_json::json!({
+            "remoteUser": "vscode",
+            "containerEnv": {"EDITOR": "vim"},
+            "mounts": ["source=a,target=/a,type=volume"],
+            "features": {"ghcr.io/x/y:1": {}},
+            "postCreateCommand": {"setup": "make setup"}
+        });
+        let project = serde_json::json!({
+            "image": "ubuntu:24.04",
+            "containerEnv": {"EDITOR": "nano", "TERM": "xterm"},
+            "mounts": ["source=b,target=/b,type=volume"],
+            "postCreateCommand": {"lint": "make lint"}
+        });
+
+        let mut prov = Provenance::recording();
+        merge_layers_tracked(
+            &[(LayerId::Base, base), (LayerId::Project, project)],
+            &mut prov,
+        );
+        let origins = prov.into_origins();
+
+        assert_eq!(origins["image"], LayerId::Project);
+        assert_eq!(origins["remoteUser"], LayerId::Base);
+        assert_eq!(
+            origins["containerEnv.EDITOR"],
+            LayerId::Project,
+            "overridden sub-key"
+        );
+        assert_eq!(origins["containerEnv.TERM"], LayerId::Project);
+        assert_eq!(origins["mounts[0]"], LayerId::Base);
+        assert_eq!(origins["mounts[1]"], LayerId::Project);
+        assert_eq!(origins["features[\"ghcr.io/x/y:1\"]"], LayerId::Base);
+        assert_eq!(origins["postCreateCommand.setup"], LayerId::Base);
+        assert_eq!(origins["postCreateCommand.lint"], LayerId::Project);
+    }
+
+    /// A deduplicated array entry is dropped on the later layer, so the first
+    /// contributing layer keeps the credit.
+    #[test]
+    fn deduped_array_entry_keeps_lower_layer_credit() {
+        let mount = "source=a,target=/a,type=volume";
+        let base = serde_json::json!({ "mounts": [mount] });
+        let project = serde_json::json!({ "mounts": [mount] });
+
+        let mut prov = Provenance::recording();
+        let merged = merge_layers_tracked(
+            &[(LayerId::Base, base), (LayerId::Project, project)],
+            &mut prov,
+        );
+        let origins = prov.into_origins();
+
+        assert_eq!(merged["mounts"].as_array().unwrap().len(), 1);
+        assert_eq!(origins["mounts[0]"], LayerId::Base);
+    }
 
     fn setup_merge_test(
         base_content: &str,
@@ -227,16 +438,17 @@ mod tests {
         let dest_obj = dest_json.as_object_mut().unwrap();
 
         for (key, base_val) in base_obj {
+            let mut prov = Provenance::Noop;
             if SCALAR_FIELDS.contains(&key.as_str()) {
                 dest_obj.insert(key.clone(), base_val.clone());
             } else if FEATURE_FIELDS.contains(&key.as_str()) {
-                merge_feature_map(dest_obj, key, base_val);
+                merge_feature_map(dest_obj, key, base_val, &LayerId::Project, &mut prov);
             } else if ARRAY_CONCAT_FIELDS.contains(&key.as_str()) {
-                merge_array_concat(dest_obj, key, base_val);
+                merge_array_concat(dest_obj, key, base_val, &LayerId::Project, &mut prov);
             } else if ARRAY_FIELDS.contains(&key.as_str()) {
-                merge_array(dest_obj, key, base_val);
+                merge_array(dest_obj, key, base_val, &LayerId::Project, &mut prov);
             } else if MAP_FIELDS.contains(&key.as_str()) {
-                merge_map(dest_obj, key, base_val);
+                merge_map(dest_obj, key, base_val, &LayerId::Project, &mut prov);
             } else {
                 dest_obj.insert(key.clone(), base_val.clone());
             }

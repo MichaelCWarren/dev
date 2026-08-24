@@ -34,15 +34,23 @@ enum ConfigTargetKind {
 /// Entry point for `dev config` (workspace-scoped).
 pub async fn run_workspace(
     workspace: &Path,
+    runtime_override: Option<&str>,
     action: Option<ConfigAction>,
     verbose: u8,
 ) -> anyhow::Result<()> {
+    if let Some(ConfigAction::Explain { json, no_base }) = action {
+        return super::config_explain::run(workspace, runtime_override, json, no_base).await;
+    }
     match find_config_source(workspace)? {
         ConfigSource::Direct(path) => run(&path, action, verbose).await,
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            let composed =
-                compose_recipe_config(&recipe_path, &recipe, &detected_runtime_name().await, true)?;
+            let composed = compose_recipe_config(
+                &recipe_path,
+                &recipe,
+                &detected_runtime_name(runtime_override).await,
+                true,
+            )?;
             let target = ConfigTarget {
                 config_path: None,
                 config_value: Some(composed.value),
@@ -59,8 +67,8 @@ pub async fn run_workspace(
 /// `dev config` only reads, so a machine with no reachable runtime should still be
 /// able to inspect its config; falling back to `docker` keeps that working and
 /// matches the layer `dev up` picks by default.
-async fn detected_runtime_name() -> String {
-    match detect_runtime(None).await {
+pub(crate) async fn detected_runtime_name(runtime_override: Option<&str>) -> String {
+    match detect_runtime(runtime_override).await {
         Ok(runtime) => runtime.runtime_name().to_string(),
         Err(_) => "docker".to_string(),
     }
@@ -91,6 +99,12 @@ async fn run_with_kind(
     verbose: u8,
     kind: ConfigTargetKind,
 ) -> anyhow::Result<()> {
+    if matches!(action, Some(ConfigAction::Explain { .. })) {
+        anyhow::bail!(
+            "`explain` shows which configuration layer each value came from, so it is \
+             workspace-scoped; run `dev config explain` inside a project"
+        );
+    }
     let target = ConfigTarget {
         config_path: Some(config_path),
         config_value: None,
@@ -112,6 +126,11 @@ async fn run_with_target(
         Some(ConfigAction::Add { property, value }) => config_add(target, &property, &value),
         Some(ConfigAction::Remove { property, value }) => config_remove(target, &property, &value),
         Some(ConfigAction::List) => config_list(target),
+        // Intercepted by `run_workspace` / rejected by `run_with_kind` before
+        // a target is built; reaching here is a wiring bug.
+        Some(ConfigAction::Explain { .. }) => {
+            unreachable!("explain handled before target dispatch")
+        }
         None => interactive(target, verbose).await,
     }
 }

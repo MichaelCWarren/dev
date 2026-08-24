@@ -11,7 +11,7 @@ use super::config::DevcontainerConfig;
 use super::features::{ResolvedFeature, features_required_by};
 use super::jsonc::parse_jsonc;
 use super::lockfile::{handle_lockfile, lockfile_path};
-use super::merge::merge_layers;
+use super::merge::{LayerId, Provenance, merge_layers_tracked};
 
 /// A project configuration with the base layer merged in, plus the provenance
 /// needed to keep base-contributed state out of project-owned artifacts.
@@ -118,6 +118,23 @@ pub(crate) fn load_effective_config_value(
     include_base: bool,
     base_config_path: &Path,
 ) -> anyhow::Result<(Value, HashSet<String>)> {
+    let (merged, base_feature_ids, _dropped) = load_effective_config_value_tracked(
+        config_path,
+        include_base,
+        base_config_path,
+        &mut Provenance::Noop,
+    )?;
+    Ok((merged, base_feature_ids))
+}
+
+/// [`load_effective_config_value`] with origin recording for `dev config
+/// explain`. The third element names keys deleted by selector precedence.
+pub(crate) fn load_effective_config_value_tracked(
+    config_path: &Path,
+    include_base: bool,
+    base_config_path: &Path,
+    prov: &mut Provenance,
+) -> anyhow::Result<(Value, HashSet<String>, Vec<String>)> {
     let mut layers = Vec::new();
     let mut base_feature_ids = HashSet::new();
     if include_base && base_config_path.is_file() {
@@ -127,7 +144,7 @@ pub(crate) fn load_effective_config_value(
                 absolutize_config_paths(&mut base, base_dir);
             }
             base_feature_ids = declared_feature_ids(&base);
-            layers.push(base);
+            layers.push((LayerId::Base, base));
         }
     }
 
@@ -136,11 +153,30 @@ pub(crate) fn load_effective_config_value(
     for id in declared_feature_ids(&project) {
         base_feature_ids.remove(&id);
     }
-    layers.push(project);
+    layers.push((LayerId::Project, project));
 
-    let mut merged = merge_layers(&layers);
-    prune_lower_priority_definitions(&mut merged, project_definition);
-    Ok((merged, base_feature_ids))
+    let mut merged = merge_layers_tracked(&layers, prov);
+    let dropped = prune_reporting_dropped(&mut merged, project_definition);
+    Ok((merged, base_feature_ids, dropped))
+}
+
+/// Run the selector prune and name what it deleted, so `explain` can show a
+/// lower layer's competing selector as dropped rather than silently absent.
+pub(crate) fn prune_reporting_dropped(
+    merged: &mut Value,
+    definition: Option<ConfigDefinition>,
+) -> Vec<String> {
+    const SELECTOR_KEYS: [&str; 4] = ["image", "build", "dockerComposeFile", "service"];
+    let before: Vec<String> = SELECTOR_KEYS
+        .iter()
+        .filter(|k| merged.get(**k).is_some())
+        .map(|k| k.to_string())
+        .collect();
+    prune_lower_priority_definitions(merged, definition);
+    before
+        .into_iter()
+        .filter(|k| merged.get(k).is_none())
+        .collect()
 }
 
 fn declared_feature_ids(value: &Value) -> HashSet<String> {

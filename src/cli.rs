@@ -319,6 +319,17 @@ pub enum ConfigAction {
 
     /// Show current configuration summary
     List,
+
+    /// Show the effective config and which layer each value came from
+    Explain {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Do not apply ~/.dev/base/devcontainer.json
+        #[arg(long)]
+        no_base: bool,
+    },
 }
 
 #[cfg(test)]
@@ -356,6 +367,20 @@ mod tests {
                 Some("apple".to_string()),
                 "{command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn config_explain_parses_with_its_flags() {
+        let cli = Cli::try_parse_from(["dev", "config", "explain", "--json", "--no-base"]).unwrap();
+        match cli.command {
+            Command::Config {
+                action: Some(ConfigAction::Explain { json, no_base }),
+            } => {
+                assert!(json);
+                assert!(no_base);
+            }
+            other => panic!("expected config explain, parsed {other:?}"),
         }
     }
 

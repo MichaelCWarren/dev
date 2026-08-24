@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::effective::{
-    absolutize_config_paths, config_definition, prune_lower_priority_definitions,
+    absolutize_config_paths, config_definition, prune_reporting_dropped,
 };
 use crate::devcontainer::jsonc::parse_jsonc;
-use crate::devcontainer::merge::{merge_layer, merge_layers};
+use crate::devcontainer::merge::{LayerId, Provenance, merge_layer_tracked, merge_layers_tracked};
 use crate::devcontainer::recipe::{Recipe, is_empty_object};
 use crate::error::DevError;
 use crate::util::paths::DevHome;
@@ -64,7 +64,14 @@ pub(crate) fn compose_config_in(
     runtime_name: &str,
     include_base: bool,
 ) -> anyhow::Result<Value> {
-    Ok(compose_config_details_in(dev_home, recipe, runtime_name, include_base)?.value)
+    Ok(compose_config_details_tracked_in(
+        dev_home,
+        recipe,
+        runtime_name,
+        include_base,
+        &mut Provenance::Noop,
+    )?
+    .value)
 }
 
 pub(crate) struct RecipeConfig {
@@ -100,13 +107,48 @@ pub(crate) fn compose_recipe_config_in(
     runtime_name: &str,
     include_base: bool,
 ) -> anyhow::Result<RecipeConfig> {
+    let (config, _dropped) = compose_recipe_config_tracked_in(
+        dev_home,
+        recipe_path,
+        recipe,
+        runtime_name,
+        include_base,
+        &mut Provenance::Noop,
+    )?;
+    Ok(config)
+}
+
+/// [`compose_recipe_config_in`] with origin recording for `dev config explain`.
+/// The second element names keys the selector prune deleted.
+pub(crate) fn compose_recipe_config_tracked_in(
+    dev_home: &DevHome,
+    recipe_path: &Path,
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+    prov: &mut Provenance,
+) -> anyhow::Result<(RecipeConfig, Vec<String>)> {
     let recipe_dir = recipe_dir_of(recipe_path)?;
-    let details = compose_config_details_in(dev_home, recipe, runtime_name, include_base)?;
-    Ok(RecipeConfig {
-        config_path: recipe_dir.join("devcontainer.json"),
-        value: details.value,
-        base_feature_ids: details.base_feature_ids,
-    })
+    let details =
+        compose_config_details_tracked_in(dev_home, recipe, runtime_name, include_base, prov)?;
+    Ok((
+        RecipeConfig {
+            config_path: recipe_dir.join("devcontainer.json"),
+            value: details.value,
+            base_feature_ids: details.base_feature_ids,
+        },
+        details.dropped,
+    ))
+}
+
+/// Record a recipe-injected feature's origin in a tracked merge.
+fn inject_feature_origin(prov: &mut Provenance, feature_ref: &str) {
+    if let Provenance::Recording(map) = prov {
+        map.insert(
+            format!("features[\"{feature_ref}\"]"),
+            LayerId::RecipeFeatures,
+        );
+    }
 }
 
 /// Load a workspace's effective devcontainer config for read-only consumers such
@@ -204,13 +246,18 @@ pub(crate) fn materialize_recipe_directory_in(
 struct ComposeDetails {
     value: Value,
     base_feature_ids: HashSet<String>,
+    /// Keys the selector prune deleted, for `dev config explain`.
+    dropped: Vec<String>,
 }
 
-fn compose_config_details_in(
+/// Compose the recipe's layer stack; `prov` records per-value origins for
+/// `dev config explain` (pass `Provenance::Noop` outside explain).
+fn compose_config_details_tracked_in(
     dev_home: &DevHome,
     recipe: &Recipe,
     runtime_name: &str,
     include_base: bool,
+    prov: &mut Provenance,
 ) -> anyhow::Result<ComposeDetails> {
     // Layer 1: Global template
     let global_config_path = dev_home.global_template_config(&recipe.global_template);
@@ -266,15 +313,18 @@ fn compose_config_details_in(
     }
 
     // Merge layers in priority order
-    let mut layers = vec![global];
+    let mut layers = vec![(
+        LayerId::GlobalTemplate(recipe.global_template.clone()),
+        global,
+    )];
     if let Some(b) = base {
-        layers.push(b);
+        layers.push((LayerId::Base, b));
     }
     if let Some(r) = runtime {
-        layers.push(r);
+        layers.push((LayerId::Runtime(runtime_name.to_string()), r));
     }
 
-    let mut composed = merge_layers(&layers);
+    let mut composed = merge_layers_tracked(&layers, prov);
 
     // Inject recipe features
     if !recipe.features.is_empty() {
@@ -286,9 +336,11 @@ fn compose_config_details_in(
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Some(features_map) = features.as_object_mut() {
             for feature_ref in &recipe.features {
-                // Don't overwrite existing feature options
+                // Don't overwrite existing feature options — an id already
+                // present keeps its options and its origin credit.
                 if !features_map.contains_key(feature_ref) {
                     features_map.insert(feature_ref.clone(), serde_json::json!({}));
+                    inject_feature_origin(prov, feature_ref);
                 }
             }
         }
@@ -305,18 +357,24 @@ fn compose_config_details_in(
         if let Some(definition) = config_definition(&recipe.customizations) {
             selected_definition = Some(definition);
         }
-        merge_layer(&mut composed, &recipe.customizations);
+        merge_layer_tracked(
+            &mut composed,
+            &recipe.customizations,
+            &LayerId::RecipeCustomizations,
+            prov,
+        );
     }
 
     for id in global_feature_ids {
         base_feature_ids.remove(&id);
     }
 
-    prune_lower_priority_definitions(&mut composed, selected_definition);
+    let dropped = prune_reporting_dropped(&mut composed, selected_definition);
 
     Ok(ComposeDetails {
         value: composed,
         base_feature_ids,
+        dropped,
     })
 }
 

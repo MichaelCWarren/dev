@@ -158,7 +158,7 @@ async fn run() -> anyhow::Result<()> {
             commands::logs::run(&workspace, runtime_override, hooks, follow, tail).await?;
         }
         Command::Config { action } => {
-            commands::config::run_workspace(&workspace, action, verbose).await?;
+            commands::config::run_workspace(&workspace, runtime_override, action, verbose).await?;
         }
         Command::Base { action } => match action {
             BaseAction::New => {
