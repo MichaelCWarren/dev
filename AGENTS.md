@@ -31,6 +31,14 @@
   Apple accepts only the env subset. Compose rejects project-declared `runArgs` but ignores
   inherited lower-layer `runArgs`. `extra_args` on `ContainerConfig` is now always empty
   (kept for struct compatibility).
+- Feature contributions (mounts, entrypoints, capabilities, hooks) round-trip through the
+  image's `devcontainer.metadata` label: written by `build_metadata_label`, recovered on the
+  cache-hit path by `features_from_metadata` (both `src/devcontainer/features.rs`). The label's
+  Dockerfile escaping must be `\$` — `$$` is Compose syntax and Docker's builder strips the
+  dollar, corrupting `${devcontainerId}` mounts.
+- `merge_layer_tracked`/`Provenance` in `src/devcontainer/merge.rs` IS the production merge
+  (`dev config explain` records origins through it); the untracked `merge_layer(s)` wrappers are
+  `#[cfg(test)]` reference implementations. Instrument new merge strategies there or explain drifts.
 - Lifecycle hooks are split by moment in `src/devcontainer/lifecycle.rs`: `run_create_hooks`
   (onCreate/updateContent/postCreate/postStart) versus `run_start_hooks` (postStart only).
   Pick by whether the container already existed — never re-run create-time hooks on reuse.
