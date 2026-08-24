@@ -359,6 +359,8 @@ fn mount_to_compose_volume(mount_str: &str) -> Option<serde_json::Value> {
     let mut target = None;
     let mut mount_type = "bind".to_string();
     let mut readonly = false;
+    let mut tmpfs_size = None;
+    let mut tmpfs_mode = None;
 
     for part in s.split(',') {
         let part = part.trim();
@@ -370,11 +372,32 @@ fn mount_to_compose_volume(mount_str: &str) -> Option<serde_json::Value> {
                 "readonly" | "ro" => {
                     readonly = val.is_empty() || val == "true" || val == "1";
                 }
+                "tmpfs-size" => tmpfs_size = Some(val.to_string()),
+                "tmpfs-mode" => tmpfs_mode = Some(val.to_string()),
                 _ => {}
             }
         } else if part == "readonly" || part == "ro" {
             readonly = true;
         }
+    }
+
+    // A tmpfs mount has no source; its options nest under `tmpfs`.
+    if mount_type == "tmpfs" {
+        let tgt = target?;
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), json!("tmpfs"));
+        entry.insert("target".into(), json!(tgt));
+        let mut opts = serde_json::Map::new();
+        if let Some(size) = tmpfs_size {
+            opts.insert("size".into(), number_or_string(&size));
+        }
+        if let Some(mode) = tmpfs_mode {
+            opts.insert("mode".into(), number_or_string(&mode));
+        }
+        if !opts.is_empty() {
+            entry.insert("tmpfs".into(), serde_json::Value::Object(opts));
+        }
+        return Some(serde_json::Value::Object(entry));
     }
 
     match (source, target) {
@@ -390,6 +413,12 @@ fn mount_to_compose_volume(mount_str: &str) -> Option<serde_json::Value> {
         }
         _ => None,
     }
+}
+
+/// Compose expects tmpfs `size`/`mode` as numbers; byte-suffix sizes like
+/// `128m` stay strings, which compose also accepts for `size`.
+fn number_or_string(val: &str) -> serde_json::Value {
+    val.parse::<u64>().map_or_else(|_| json!(val), |n| json!(n))
 }
 
 /// Generate a Docker Compose override YAML that injects devcontainer properties
@@ -739,6 +768,18 @@ mod tests {
         assert_eq!(result["source"], "/host/path");
         assert_eq!(result["target"], "/container/path");
         assert_eq!(result["read_only"], true);
+    }
+
+    #[test]
+    fn test_mount_to_compose_volume_tmpfs_type() {
+        let result =
+            mount_to_compose_volume("type=tmpfs,target=/tmp,tmpfs-size=2147483648,tmpfs-mode=1777")
+                .unwrap();
+        assert_eq!(result["type"], "tmpfs");
+        assert_eq!(result["target"], "/tmp");
+        assert_eq!(result["tmpfs"]["size"], 2147483648u64);
+        assert_eq!(result["tmpfs"]["mode"], 1777);
+        assert!(result.get("source").is_none(), "tmpfs has no source");
     }
 
     #[test]

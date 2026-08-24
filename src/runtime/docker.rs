@@ -420,6 +420,20 @@ impl BollardRuntime {
             binds.push(format!("{}:{}", ws.source.display(), ws.target));
         }
 
+        let tmpfs: HashMap<String, String> = config
+            .tmpfs
+            .iter()
+            .map(|t| {
+                let opts: Vec<String> = t
+                    .size
+                    .iter()
+                    .map(|s| format!("size={s}"))
+                    .chain(t.mode.iter().map(|m| format!("mode={m}")))
+                    .collect();
+                (t.target.clone(), opts.join(","))
+            })
+            .collect();
+
         let env: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         let exposed_ports: Vec<String> = config
@@ -444,6 +458,7 @@ impl BollardRuntime {
 
         let host_config = bollard::models::HostConfig {
             binds: Some(binds),
+            tmpfs: (!tmpfs.is_empty()).then_some(tmpfs),
             port_bindings: Some(port_bindings),
             init: if config.init { Some(true) } else { None },
             privileged: if config.privileged { Some(true) } else { None },
@@ -1331,6 +1346,7 @@ mod tests {
             env: HashMap::new(),
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: Some(WorkspaceMount {
                 source: std::path::PathBuf::from("/host/monorepo"),
@@ -1345,6 +1361,30 @@ mod tests {
             security_opt: vec![],
             userns_mode: None,
         }
+    }
+
+    /// Tmpfs mounts land in `HostConfig.tmpfs` as a target → options map, not
+    /// in `binds`.
+    #[test]
+    fn create_body_carries_tmpfs_mounts() {
+        let mut config = container_config(None);
+        config.tmpfs = vec![crate::runtime::TmpfsMount {
+            target: "/tmp".to_string(),
+            size: Some("2147483648".to_string()),
+            mode: Some("1777".to_string()),
+        }];
+
+        let body = BollardRuntime::to_create_body(&config);
+        let host = body.host_config.expect("host config");
+        let tmpfs = host.tmpfs.expect("tmpfs map");
+        assert_eq!(
+            tmpfs.get("/tmp").map(String::as_str),
+            Some("size=2147483648,mode=1777")
+        );
+        assert!(
+            host.binds.unwrap().iter().all(|b| !b.contains("/tmp")),
+            "tmpfs must not leak into binds"
+        );
     }
 
     /// The container's `WorkingDir` is the resolved `workspaceFolder`, which

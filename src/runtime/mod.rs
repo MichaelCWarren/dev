@@ -76,6 +76,7 @@ pub struct ContainerConfig {
     pub env: HashMap<String, String>,
     pub mounts: Vec<BindMount>,
     pub volumes: Vec<VolumeMount>,
+    pub tmpfs: Vec<TmpfsMount>,
     pub ports: Vec<PortMapping>,
     pub workspace_mount: Option<WorkspaceMount>,
     /// Resolved `workspaceFolder`: where commands run inside the container.
@@ -128,6 +129,7 @@ impl std::fmt::Debug for ContainerConfig {
             .field("env", &RedactedValues(&self.env))
             .field("mounts", &self.mounts)
             .field("volumes", &self.volumes)
+            .field("tmpfs", &self.tmpfs)
             .field("ports", &self.ports)
             .field("workspace_mount", &self.workspace_mount)
             .field("workspace_folder", &self.workspace_folder)
@@ -155,6 +157,15 @@ pub struct VolumeMount {
     pub name: String,
     pub target: String,
     pub readonly: bool,
+}
+
+/// A tmpfs mounted into the container; no host-side source. `size` and `mode`
+/// are passed to the runtime verbatim (`tmpfs-size` / `tmpfs-mode` values).
+#[derive(Debug, Clone)]
+pub struct TmpfsMount {
+    pub target: String,
+    pub size: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -820,6 +831,7 @@ mod tests {
                 .collect(),
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: None,
             workspace_folder: None,

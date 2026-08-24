@@ -1155,6 +1155,18 @@ fn to_apple_config(
     image: ImageDescription,
     image_config: &CachedImageConfig,
 ) -> ContainerConfiguration {
+    for v in &config.volumes {
+        eprintln!(
+            "Warning: Apple Containers cannot mount named volume '{}'; skipping mount of '{}'",
+            v.name, v.target
+        );
+    }
+    for t in &config.tmpfs {
+        eprintln!(
+            "Warning: Apple Containers cannot mount a tmpfs; skipping mount of '{}'",
+            t.target
+        );
+    }
     let mounts: Vec<Filesystem> = config
         .mounts
         .iter()
@@ -2822,6 +2834,7 @@ mod tests {
             env: HashMap::new(),
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: None,
             workspace_folder: None,
@@ -2942,6 +2955,7 @@ mod tests {
             env: HashMap::new(),
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: Some(WorkspaceMount {
                 source: workspace.to_path_buf(),
@@ -3188,6 +3202,7 @@ mod tests {
             },
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: Some(crate::runtime::WorkspaceMount {
                 source: workspace_path.clone(),

@@ -24,7 +24,7 @@ use crate::devcontainer::{
 use crate::error::DevError;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, ExecResult, PortMapping,
-    VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
+    TmpfsMount, VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
 use crate::util::paths::DevHome;
 use crate::util::{
@@ -624,15 +624,17 @@ pub(crate) async fn run_with_runtime_with_providers(
         final_image
     };
 
-    // Feature mounts first, then config mounts — the same feature-first order
-    // capabilities use, so a project mount can override a feature's target.
+    // Feature mounts first, then config mounts, then config volumes — later
+    // entries win when targets collide (see `dedupe_mounts_by_target`), so a
+    // project mount overrides a feature's target instead of the runtime
+    // rejecting the duplicate.
     let mut mount_strings = feature_mount_strings(&ordered_features, workspace, remote_user);
     mount_strings.extend(substitute_mounts(
         config.mounts.as_deref().unwrap_or(&[]),
         workspace,
         remote_user,
     ));
-    let mounts = parse_mounts(&mount_strings);
+    let mut all_mounts = parse_mounts(&mount_strings)?;
 
     let volume_strings: Vec<String> = config
         .volumes
@@ -641,7 +643,13 @@ pub(crate) async fn run_with_runtime_with_providers(
         .iter()
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
-    let volumes = parse_volumes(&volume_strings);
+    all_mounts.extend(
+        parse_volumes(&volume_strings)
+            .into_iter()
+            .map(ParsedMount::Volume),
+    );
+
+    let (mounts, volumes, tmpfs) = partition_mounts(dedupe_mounts_by_target(all_mounts));
 
     // `runArgs` env was validated before any side effects. Apply it after the
     // effective create-time env map. `run_args::resolve_run_args` already
@@ -667,6 +675,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         env,
         mounts,
         volumes,
+        tmpfs,
         ports,
         workspace_mount: Some(WorkspaceMount {
             source: workspace.to_path_buf(),
@@ -1773,6 +1782,8 @@ async fn run_compose(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
+    let (mounts, volume_strings) = dedupe_mount_strings(mounts, volume_strings)?;
+
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports_compose = caddy_ports_from_config(config);
 
@@ -2081,24 +2092,45 @@ fn substitute_mounts(
     out
 }
 
-/// Parse mount strings from devcontainer.json into `BindMount` structs.
-///
-/// Supports two formats:
-/// - Docker long form: `source=X,target=Y,type=bind[,readonly]`
-/// - Docker short form: `/host:/container[:ro]`
-fn parse_mounts(mount_strings: &[String]) -> Vec<BindMount> {
-    let mut mounts = Vec::new();
-    for s in mount_strings {
-        if let Some(m) = parse_single_mount(s) {
-            mounts.push(m);
-        } else {
-            eprintln!("Warning: could not parse mount string: {s}");
-        }
-    }
-    mounts
+/// A mount parsed from a devcontainer mount string, routed by `type`.
+#[derive(Debug, Clone)]
+enum ParsedMount {
+    Bind(BindMount),
+    Volume(VolumeMount),
+    Tmpfs(TmpfsMount),
 }
 
-fn parse_single_mount(s: &str) -> Option<BindMount> {
+impl ParsedMount {
+    fn target(&self) -> &str {
+        match self {
+            ParsedMount::Bind(m) => &m.target,
+            ParsedMount::Volume(v) => &v.target,
+            ParsedMount::Tmpfs(t) => &t.target,
+        }
+    }
+}
+
+/// Parse mount strings from devcontainer.json.
+///
+/// Supports two formats:
+/// - Docker long form: `source=X,target=Y,type=bind|volume|tmpfs[,readonly]`
+/// - Docker short form: `/host:/container[:ro]`
+///
+/// Entries missing required fields are skipped with a warning; an unsupported
+/// `type` is an error, so a mount the config asked for is never silently
+/// turned into something else.
+fn parse_mounts(mount_strings: &[String]) -> anyhow::Result<Vec<ParsedMount>> {
+    let mut mounts = Vec::new();
+    for s in mount_strings {
+        match parse_single_mount(s)? {
+            Some(m) => mounts.push(m),
+            None => eprintln!("Warning: could not parse mount string: {s}"),
+        }
+    }
+    Ok(mounts)
+}
+
+fn parse_single_mount(s: &str) -> anyhow::Result<Option<ParsedMount>> {
     let s = s.trim();
 
     // Short form: /host:/container[:ro]
@@ -2106,19 +2138,22 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() >= 2 {
             let readonly = parts.get(2).map(|&p| p == "ro").unwrap_or(false);
-            return Some(BindMount {
+            return Ok(Some(ParsedMount::Bind(BindMount {
                 source: PathBuf::from(parts[0]),
                 target: parts[1].to_string(),
                 readonly,
-            });
+            })));
         }
-        return None;
+        return Ok(None);
     }
 
     // Long form: key=value pairs separated by commas
+    let mut mount_type = "bind".to_string();
     let mut source = None;
     let mut target = None;
     let mut readonly = false;
+    let mut tmpfs_size = None;
+    let mut tmpfs_mode = None;
 
     for part in s.split(',') {
         let part = part.trim();
@@ -2129,7 +2164,9 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
                 "readonly" | "ro" => {
                     readonly = val.is_empty() || val == "true" || val == "1";
                 }
-                "type" => {} // Acknowledged but we only support bind mounts in this context
+                "type" => mount_type = val.to_string(),
+                "tmpfs-size" => tmpfs_size = Some(val.to_string()),
+                "tmpfs-mode" => tmpfs_mode = Some(val.to_string()),
                 _ => {}
             }
         } else if part == "readonly" || part == "ro" {
@@ -2137,14 +2174,106 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
         }
     }
 
-    match (source, target) {
-        (Some(src), Some(tgt)) => Some(BindMount {
-            source: PathBuf::from(src),
-            target: tgt,
-            readonly,
+    match mount_type.as_str() {
+        "bind" => Ok(match (source, target) {
+            (Some(src), Some(tgt)) => Some(ParsedMount::Bind(BindMount {
+                source: PathBuf::from(src),
+                target: tgt,
+                readonly,
+            })),
+            _ => None,
         }),
-        _ => None,
+        "volume" => Ok(match (source, target) {
+            (Some(name), Some(tgt)) => Some(ParsedMount::Volume(VolumeMount {
+                name,
+                target: tgt,
+                readonly,
+            })),
+            _ => None,
+        }),
+        "tmpfs" => {
+            anyhow::ensure!(source.is_none(), "a tmpfs mount cannot have a source: {s}");
+            Ok(target.map(|tgt| {
+                ParsedMount::Tmpfs(TmpfsMount {
+                    target: tgt,
+                    size: tmpfs_size,
+                    mode: tmpfs_mode,
+                })
+            }))
+        }
+        other => anyhow::bail!("unsupported mount type '{other}' in mount: {s}"),
     }
+}
+
+/// Keep the last entry declared for each target, in declaration order of the
+/// survivors. Callers assemble entries feature-first (feature mounts, config
+/// `mounts`, config `volumes`), so a project mount overrides a feature's on
+/// the same target instead of the runtime rejecting the duplicate.
+fn keep_last_by_target<T>(items: Vec<T>, target_of: impl Fn(&T) -> Option<String>) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut targets: Vec<Option<String>> = Vec::new();
+    for item in items {
+        let tgt = target_of(&item);
+        if let Some(t) = &tgt
+            && let Some(pos) = targets.iter().position(|e| e.as_deref() == Some(t))
+        {
+            eprintln!("Note: multiple mounts declare target '{t}'; keeping the last one");
+            out.remove(pos);
+            targets.remove(pos);
+        }
+        out.push(item);
+        targets.push(tgt);
+    }
+    out
+}
+
+fn dedupe_mounts_by_target(mounts: Vec<ParsedMount>) -> Vec<ParsedMount> {
+    keep_last_by_target(mounts, |m| Some(m.target().to_string()))
+}
+
+/// Compose-path twin of `dedupe_mounts_by_target`: the override generator
+/// consumes raw strings, so collisions are resolved (and mount types
+/// validated) on the strings before any side effects.
+fn dedupe_mount_strings(
+    mount_strings: Vec<String>,
+    volume_strings: Vec<String>,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut tagged: Vec<(bool, String, Option<String>)> = Vec::new();
+    for s in mount_strings {
+        let target = parse_single_mount(&s)?.map(|m| m.target().to_string());
+        tagged.push((false, s, target));
+    }
+    for s in volume_strings {
+        let target = s.split(':').nth(1).map(str::to_string);
+        tagged.push((true, s, target));
+    }
+    let kept = keep_last_by_target(tagged, |(_, _, target)| target.clone());
+    let mut mounts = Vec::new();
+    let mut volumes = Vec::new();
+    for (is_volume, s, _) in kept {
+        if is_volume {
+            volumes.push(s);
+        } else {
+            mounts.push(s);
+        }
+    }
+    Ok((mounts, volumes))
+}
+
+fn partition_mounts(
+    mounts: Vec<ParsedMount>,
+) -> (Vec<BindMount>, Vec<VolumeMount>, Vec<TmpfsMount>) {
+    let mut binds = Vec::new();
+    let mut volumes = Vec::new();
+    let mut tmpfs = Vec::new();
+    for m in mounts {
+        match m {
+            ParsedMount::Bind(b) => binds.push(b),
+            ParsedMount::Volume(v) => volumes.push(v),
+            ParsedMount::Tmpfs(t) => tmpfs.push(t),
+        }
+    }
+    (binds, volumes, tmpfs)
 }
 
 /// Parse CLI `--ports` values into `PortMapping` structs.
@@ -2205,10 +2334,11 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, apply_run_args_capabilities, apply_secrets_to_env,
-        caddy_ports_from_config, ensure_image_present, merge_caddy_ports, parse_mounts,
-        parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
-        reject_secrets_for_compose, reject_secrets_override_for_compose, substitute_mounts,
+        ParsedMount, apply_cli_overrides, apply_run_args_capabilities, apply_secrets_to_env,
+        caddy_ports_from_config, dedupe_mount_strings, ensure_image_present, merge_caddy_ports,
+        parse_mounts, parse_single_mount, project_declares_run_args,
+        reject_project_run_args_for_compose, reject_secrets_for_compose,
+        reject_secrets_override_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
@@ -2221,6 +2351,7 @@ mod tests {
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
+    use crate::runtime::{BindMount, VolumeMount};
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::Path;
@@ -2738,11 +2869,27 @@ mod tests {
         );
     }
 
+    fn expect_bind(m: ParsedMount) -> BindMount {
+        match m {
+            ParsedMount::Bind(b) => b,
+            other => panic!("expected a bind mount, got {other:?}"),
+        }
+    }
+
+    fn expect_volume(m: ParsedMount) -> VolumeMount {
+        match m {
+            ParsedMount::Volume(v) => v,
+            other => panic!("expected a volume mount, got {other:?}"),
+        }
+    }
+
     /// `parse_single_mount` must accept a bind-mount long-form string.
     #[test]
     fn parse_single_mount_accepts_bind_long_form() {
         let m = parse_single_mount("source=./,target=/workspace,type=bind,readonly=true")
+            .unwrap()
             .expect("long-form bind mount should parse");
+        let m = expect_bind(m);
         assert_eq!(m.source, std::path::PathBuf::from("./"));
         assert_eq!(m.target, "/workspace");
         assert!(m.readonly);
@@ -2752,23 +2899,61 @@ mod tests {
     #[test]
     fn parse_single_mount_accepts_long_form_with_ro() {
         let m = parse_single_mount("source=/host,target=/container,readonly,ro")
+            .unwrap()
             .expect("long-form bind mount with ro keyword should parse");
-        assert!(m.readonly);
+        assert!(expect_bind(m).readonly);
     }
 
-    /// `parse_single_mount` accepts a non-bind long-form string (type is
-    /// ignored; Docker treats a bare source name as a named volume).
+    /// A `type=volume` long-form string parses as a named volume, not a bind
+    /// mount from a relative path.
     #[test]
-    fn parse_single_mount_accepts_non_bind_type() {
+    fn parse_single_mount_routes_volume_type() {
         let m = parse_single_mount("source=myvol,target=/data,type=volume")
-            .expect("non-bind mount should still parse (type is ignored)");
-        assert_eq!(m.source, std::path::PathBuf::from("myvol"));
-        assert_eq!(m.target, "/data");
-        assert!(!m.readonly);
+            .unwrap()
+            .expect("volume mount should parse");
+        let v = expect_volume(m);
+        assert_eq!(v.name, "myvol");
+        assert_eq!(v.target, "/data");
+        assert!(!v.readonly);
+    }
+
+    /// A `type=tmpfs` long-form string parses with no source, carrying its
+    /// size and mode options.
+    #[test]
+    fn parse_single_mount_routes_tmpfs_type() {
+        let m = parse_single_mount("type=tmpfs,target=/tmp,tmpfs-size=2147483648,tmpfs-mode=1777")
+            .unwrap()
+            .expect("tmpfs mount should parse");
+        match m {
+            ParsedMount::Tmpfs(t) => {
+                assert_eq!(t.target, "/tmp");
+                assert_eq!(t.size.as_deref(), Some("2147483648"));
+                assert_eq!(t.mode.as_deref(), Some("1777"));
+            }
+            other => panic!("expected a tmpfs mount, got {other:?}"),
+        }
+    }
+
+    /// An unknown `type=` is an error, not a silent bind.
+    #[test]
+    fn parse_single_mount_rejects_unknown_type() {
+        let err = parse_single_mount("source=x,target=/y,type=nfs")
+            .expect_err("unknown mount type must be rejected");
+        assert!(
+            err.to_string().contains("nfs"),
+            "error names the type: {err}"
+        );
+    }
+
+    /// A tmpfs mount with a source is contradictory and rejected.
+    #[test]
+    fn parse_single_mount_rejects_tmpfs_with_source() {
+        parse_single_mount("source=x,target=/tmp,type=tmpfs")
+            .expect_err("tmpfs with a source must be rejected");
     }
 
     /// Non-bind mounts must NOT be dropped: a `type=volume` mount, in either
-    /// string or object form, is rendered as a `BindMount` through the same
+    /// string or object form, is rendered as a `VolumeMount` through the same
     /// `substitute_mounts` + `parse_mounts` chain `run` uses.
     #[test]
     fn volume_type_mount_is_rendered_not_dropped() {
@@ -2783,13 +2968,15 @@ mod tests {
             }),
         ];
         let strings = substitute_mounts(&specs, ws, None);
-        let mounts = parse_mounts(&strings);
+        let mounts = parse_mounts(&strings).unwrap();
         assert_eq!(mounts.len(), 2, "volume-type mounts must not be dropped");
-        assert_eq!(mounts[0].source, std::path::PathBuf::from("myvol"));
-        assert_eq!(mounts[0].target, "/data");
-        assert!(!mounts[0].readonly);
-        assert_eq!(mounts[1].source, std::path::PathBuf::from("othervol"));
-        assert_eq!(mounts[1].target, "/cache");
+        let v0 = expect_volume(mounts[0].clone());
+        assert_eq!(v0.name, "myvol");
+        assert_eq!(v0.target, "/data");
+        assert!(!v0.readonly);
+        let v1 = expect_volume(mounts[1].clone());
+        assert_eq!(v1.name, "othervol");
+        assert_eq!(v1.target, "/cache");
     }
 
     /// An object mount missing `source` is skipped (with a warning) rather
@@ -2806,9 +2993,9 @@ mod tests {
             MountSpec::Plain("/host:/container".to_string()),
         ];
         let strings = substitute_mounts(&specs, ws, None);
-        let mounts = parse_mounts(&strings);
+        let mounts = parse_mounts(&strings).unwrap();
         assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].target, "/container");
+        assert_eq!(expect_bind(mounts[0].clone()).target, "/container");
     }
 
     // ---- issue #4 regression coverage: create/start error propagation and
@@ -4194,18 +4381,18 @@ mod tests {
             .await
             .expect("a feature mount must not break container creation");
 
-        let mounts = rt.created_config().mounts;
+        let volumes = rt.created_config().volumes;
         let expected = format!(
             "dind-var-lib-docker-{}",
             crate::util::naming::devcontainer_id(workspace.path())
         );
-        assert_eq!(mounts.len(), 1, "the feature volume mount must be applied");
-        assert_eq!(mounts[0].source, std::path::PathBuf::from(&expected));
-        assert_eq!(mounts[0].target, "/var/lib/docker");
+        assert_eq!(volumes.len(), 1, "the feature volume mount must be applied");
+        assert_eq!(volumes[0].name, expected);
+        assert_eq!(volumes[0].target, "/var/lib/docker");
     }
 
-    /// Feature mounts come first, so a project mount can override a feature's
-    /// target — the same feature-first order capabilities use.
+    /// Feature mounts come first, then config mounts — distinct targets all
+    /// survive, in that order.
     #[tokio::test(start_paused = true)]
     async fn feature_mounts_precede_config_mounts() {
         let workspace = TempDir::new().unwrap();
@@ -4226,13 +4413,177 @@ mod tests {
             .await
             .expect("feature and config mounts must coexist");
 
-        let sources: Vec<String> = rt
+        let names: Vec<String> = rt
             .created_config()
-            .mounts
+            .volumes
             .iter()
-            .map(|m| m.source.display().to_string())
+            .map(|v| v.name.clone())
             .collect();
-        assert_eq!(sources, ["featvol", "projvol"]);
+        assert_eq!(names, ["featvol", "projvol"]);
+    }
+
+    /// A config `mounts` entry on a feature's target replaces the feature
+    /// mount instead of reaching the runtime as a duplicate target, which
+    /// Docker rejects with a 400.
+    #[tokio::test(start_paused = true)]
+    async fn config_mount_overrides_feature_mount_on_same_target() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"./dind": {}},
+                "mounts": ["source=projvol,target=/var/lib/docker,type=volume"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": [{
+                "source": "dind-var-lib-docker-${devcontainerId}",
+                "target": "/var/lib/docker",
+                "type": "volume"
+            }]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a config mount on a feature's target must not fail create");
+
+        let volumes = rt.created_config().volumes;
+        assert_eq!(volumes.len(), 1, "exactly one mount on the shared target");
+        assert_eq!(volumes[0].name, "projvol", "the config mount wins");
+        assert!(rt.created_config().mounts.is_empty());
+    }
+
+    /// The in-the-wild collision: a config `volumes` entry on a feature's
+    /// target (docker-in-docker's `/var/lib/docker`) wins over the feature
+    /// mount. `volumes` and `mounts` parse separately, so this exercises the
+    /// dedupe across the union.
+    #[tokio::test(start_paused = true)]
+    async fn config_volume_overrides_feature_mount_on_same_target() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"./dind": {}},
+                "volumes": ["dind-var-lib-docker-myproject:/var/lib/docker"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": [{
+                "source": "dind-var-lib-docker-${devcontainerId}",
+                "target": "/var/lib/docker",
+                "type": "volume"
+            }]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a config volume on a feature's target must not fail create");
+
+        let volumes = rt.created_config().volumes;
+        assert_eq!(volumes.len(), 1, "exactly one mount on the shared target");
+        assert_eq!(volumes[0].name, "dind-var-lib-docker-myproject");
+    }
+
+    /// Feature + config `mounts` + config `volumes` all on one target: the
+    /// `volumes` entry, declared last, wins.
+    #[tokio::test(start_paused = true)]
+    async fn three_way_target_collision_config_volume_wins() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"./dind": {}},
+                "mounts": ["source=mountvol,target=/data,type=volume"],
+                "volumes": ["volumesvol:/data"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": ["source=featvol,target=/data,type=volume"]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a three-way target collision must not fail create");
+
+        let volumes = rt.created_config().volumes;
+        assert_eq!(volumes.len(), 1, "exactly one mount on the shared target");
+        assert_eq!(volumes[0].name, "volumesvol");
+    }
+
+    /// A config tmpfs mount reaches the created container and beats a feature
+    /// mount on the same target.
+    #[tokio::test(start_paused = true)]
+    async fn config_tmpfs_overrides_feature_mount_on_same_target() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"./dind": {}},
+                "mounts": ["type=tmpfs,target=/tmp,tmpfs-size=2147483648,tmpfs-mode=1777"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok().with_metadata_entries(vec![serde_json::json!({
+            "id": "dind",
+            "mounts": ["source=featvol,target=/tmp,type=volume"]
+        })]);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a config tmpfs on a feature's target must not fail create");
+
+        let config = rt.created_config();
+        assert!(config.volumes.is_empty(), "the feature mount is replaced");
+        assert_eq!(config.tmpfs.len(), 1);
+        assert_eq!(config.tmpfs[0].target, "/tmp");
+        assert_eq!(config.tmpfs[0].size.as_deref(), Some("2147483648"));
+        assert_eq!(config.tmpfs[0].mode.as_deref(), Some("1777"));
+    }
+
+    /// An unsupported mount type fails `up` before any container is created,
+    /// naming the type — it is never coerced into a bind mount.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_mount_type_fails_before_create() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "mounts": ["source=x,target=/y,type=nfs"]
+            }"#,
+        );
+
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("an unsupported mount type must fail up");
+        assert!(
+            err.to_string().contains("nfs"),
+            "the error names the type: {err}"
+        );
+    }
+
+    /// Compose-path dedupe: the string lists handed to the override generator
+    /// resolve target collisions the same way the create path does, config
+    /// `volumes` last and winning.
+    #[test]
+    fn dedupe_mount_strings_config_volume_wins() {
+        let (mounts, volumes) = dedupe_mount_strings(
+            vec![
+                "source=featvol,target=/data,type=volume".to_string(),
+                "source=/host,target=/keep,type=bind".to_string(),
+            ],
+            vec!["projvol:/data".to_string()],
+        )
+        .unwrap();
+        assert_eq!(mounts, ["source=/host,target=/keep,type=bind"]);
+        assert_eq!(volumes, ["projvol:/data"]);
     }
 
     /// Issue #15: feature entrypoints chain into the created container in

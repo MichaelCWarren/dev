@@ -256,6 +256,7 @@ mod tests {
             env: HashMap::from([("FROM_RUNARGS".to_string(), "1".to_string())]),
             mounts: vec![],
             volumes: vec![],
+            tmpfs: vec![],
             ports: vec![],
             workspace_mount: Some(WorkspaceMount {
                 source: std::path::PathBuf::from("/host/workspace"),
