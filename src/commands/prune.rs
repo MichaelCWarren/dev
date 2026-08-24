@@ -46,7 +46,10 @@ pub(crate) async fn run_with_runtime(
         .await?
         .into_iter()
         .flat_map(|image| image.repo_tags)
-        .filter(|tag| tag.starts_with(&prefix) && !keep.contains(tag))
+        .filter(|tag| {
+            let bare = bare_tag(tag);
+            bare.starts_with(&prefix) && !keep.contains(bare)
+        })
         .collect();
 
     if stale.is_empty() {
@@ -114,13 +117,19 @@ async fn keep_set(
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     for container in runtime.list_containers(&filters).await? {
-        keep.insert(container.image);
+        keep.insert(bare_tag(&container.image).to_string());
     }
     let compose_filter = vec![format!("com.docker.compose.project={folder_image}")];
     for container in runtime.list_containers(&compose_filter).await? {
-        keep.insert(container.image);
+        keep.insert(bare_tag(&container.image).to_string());
     }
     Ok(keep)
+}
+
+/// A tag as `dev` names it: the daemon reports untagged references as
+/// `name:latest`, while the keep set holds the bare names `dev` builds with.
+fn bare_tag(tag: &str) -> &str {
+    tag.strip_suffix(":latest").unwrap_or(tag)
 }
 
 /// Resolve the effective config the same way `dev up`/`dev build` do, without
@@ -279,11 +288,13 @@ mod tests {
             unused()
         }
         fn list_images(&self) -> BoxFut<'_, Vec<ImageInfo>> {
+            // The daemon reports untagged references as `name:latest`; the
+            // fake does the same so the normalization stays pinned.
             let images: Vec<ImageInfo> = self
                 .images
                 .iter()
                 .map(|tag| ImageInfo {
-                    repo_tags: vec![tag.clone()],
+                    repo_tags: vec![format!("{tag}:latest")],
                 })
                 .collect();
             Box::pin(async move { Ok(images) })
@@ -343,7 +354,7 @@ mod tests {
         removed.sort();
         assert_eq!(
             removed,
-            vec![stale.clone(), stale_uid.clone()],
+            vec![format!("{stale_uid}:latest"), format!("{stale}:latest")],
             "only this workspace's superseded tags go; the current family and \
              other workspaces' images stay"
         );
@@ -400,7 +411,8 @@ mod tests {
         let (home, workspace, folder_image, current) = features_workspace();
         let stale_a = format!("{folder_image}-features-aaaaaaaaaaaa");
         let stale_b = format!("{folder_image}-features-cccccccccccc");
-        let rt = PruneFakeRuntime::with_images(&[&current, &stale_a, &stale_b]).refusing(&stale_a);
+        let rt = PruneFakeRuntime::with_images(&[&current, &stale_a, &stale_b])
+            .refusing(&format!("{stale_a}:latest"));
 
         let err = run_with_runtime(workspace.path(), &rt, &DevHome::at(home.path()), false)
             .await
@@ -408,7 +420,7 @@ mod tests {
 
         assert_eq!(
             rt.removed(),
-            vec![stale_b],
+            vec![format!("{stale_b}:latest")],
             "the sweep continues past a refusal"
         );
         assert!(format!("{err}").contains(&stale_a));
