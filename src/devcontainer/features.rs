@@ -788,13 +788,14 @@ pub fn generate_feature_dockerfile_with_opts(
 
     // Build and emit the devcontainer.metadata label (Gap 4).
     let metadata_label = build_metadata_label(features, config, remote_user);
-    // Escape the JSON for use in a Dockerfile LABEL.
-    // Dollar signs must be doubled so Docker's builder treats them as literals
-    // rather than variable substitutions (e.g. ${localEnv:...} would fail).
+    // Escape the JSON for use in a Dockerfile LABEL. Dollar signs take a
+    // backslash escape (`\$`): `$$` is Compose syntax, and Docker's builder
+    // strips the dollar from `$${...}`, corrupting stored `${devcontainerId}`
+    // mounts and `$`-bearing hook commands on the metadata-recovery path.
     let escaped = metadata_label
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('$', "$$");
+        .replace('$', "\\$");
     lines.push(format!("LABEL devcontainer.metadata=\"{escaped}\""));
 
     lines.join("\n")
@@ -1201,6 +1202,36 @@ mod tests {
             "a non-array capAdd must be ignored"
         );
         assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
+    }
+
+    /// The metadata LABEL must escape `$` with a backslash: `$$` is Compose
+    /// syntax, and Docker's builder strips the dollar from `$${...}`, so a
+    /// `${devcontainerId}` mount stored that way comes back corrupted on the
+    /// cached-image recovery path (found live against Docker 29).
+    #[test]
+    fn metadata_label_escapes_dollars_for_the_dockerfile_builder() {
+        let mut dind = feature("ghcr.io/devcontainers/features/docker-in-docker:2");
+        dind.mounts = vec![serde_json::json!({
+            "source": "dind-var-lib-docker-${devcontainerId}",
+            "target": "/var/lib/docker",
+            "type": "volume"
+        })];
+
+        let dockerfile =
+            generate_feature_dockerfile_with_opts("ubuntu:24.04", &[dind], None, &empty_config());
+        let label_line = dockerfile
+            .lines()
+            .find(|l| l.starts_with("LABEL devcontainer.metadata="))
+            .expect("the metadata label is emitted");
+
+        assert!(
+            label_line.contains("dind-var-lib-docker-\\${devcontainerId}"),
+            "dollars take the backslash escape Docker preserves: {label_line}"
+        );
+        assert!(
+            !label_line.contains("$$"),
+            "no Compose-style doubling: {label_line}"
+        );
     }
 
     /// Everything the label writer records for a feature must be recoverable, in
