@@ -906,7 +906,6 @@ impl BollardRuntime {
             Ok(images
                 .into_iter()
                 .map(|i| ImageInfo {
-                    id: i.id,
                     repo_tags: i.repo_tags,
                 })
                 .collect())

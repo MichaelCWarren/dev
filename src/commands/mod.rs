@@ -11,6 +11,7 @@ pub mod list;
 pub mod logs;
 pub mod new;
 pub mod open;
+pub mod prune;
 pub mod shell;
 pub mod status;
 pub mod up;

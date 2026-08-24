@@ -212,6 +212,13 @@ pub enum Command {
         list: bool,
     },
 
+    /// Remove superseded derived feature images for this workspace
+    Prune {
+        /// Show what would be removed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Open VS Code attached to the running devcontainer
     Open {
         /// Use VS Code Insiders
@@ -361,6 +368,8 @@ mod tests {
             vec!["dev", "status", "--runtime", "apple"],
             vec!["dev", "--runtime", "apple", "logs"],
             vec!["dev", "logs", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "prune"],
+            vec!["dev", "prune", "--runtime", "apple"],
         ] {
             assert_eq!(
                 parsed_runtime(&command),

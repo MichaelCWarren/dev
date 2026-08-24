@@ -150,6 +150,9 @@ async fn run() -> anyhow::Result<()> {
         Command::Status { json } => {
             commands::status::run(&workspace, runtime_override, json).await?;
         }
+        Command::Prune { dry_run } => {
+            commands::prune::run(&workspace, runtime_override, dry_run).await?;
+        }
         Command::Logs {
             hooks,
             follow,

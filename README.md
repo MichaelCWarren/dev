@@ -224,12 +224,14 @@ Feature-declared entrypoints are applied too, chained in install order ahead of 
 
 A cached features image carries a `devcontainer.metadata` label, and `dev up` restores the feature contributions recorded there — mounts, entrypoints, capabilities, and lifecycle hooks — when it creates a container from that image without rebuilding. Lifecycle hooks are container-scoped: `dev down --remove` followed by `dev up` creates a *new* container, so `onCreateCommand`, `postCreateCommand`, and `postStartCommand` run again even though the image came from cache.
 
-Superseded images are left behind rather than overwritten in place — `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim space with your runtime's own tooling when it matters:
+Superseded images are left behind rather than overwritten in place, so editing features or base config accumulates old `-features-` tags over time. `dev prune` removes exactly the stale ones for the current workspace:
 
 ```sh
-docker image ls --filter 'reference=vsc-*-features-*'
-docker image prune
+dev prune --dry-run   # list what would be removed and what is kept
+dev prune             # remove superseded feature images
 ```
+
+The keep set is resolved the same way `dev up` resolves the current image — both with and without the base layer, so a `dev up --no-base` image survives — plus every image an existing container still references, including secondary compose services. Removal is never forced: an image the daemon reports in use is skipped and reported. Prune fails closed when no devcontainer config can be resolved, and is not yet supported on Apple Containers. The manual runtime commands (`docker image ls --filter 'reference=vsc-*-features-*'`, `docker image prune`) still work if you prefer them.
 
 ## Container runtimes
 

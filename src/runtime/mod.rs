@@ -180,11 +180,9 @@ pub struct ContainerInfo {
     pub image: String,
 }
 
-/// A locally stored image: its id and the tags that reference it.
+/// A locally stored image: the tags that reference it.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by `dev prune`
 pub struct ImageInfo {
-    pub id: String,
     pub repo_tags: Vec<String>,
 }
 
