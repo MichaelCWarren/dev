@@ -240,7 +240,13 @@ pub fn feature_image_tag(
             pairs
         })
     }
+    // Bump whenever the generated Dockerfile or label encoding changes shape:
+    // the digest is the cache key, so images built with the old scheme must
+    // stop being cache hits. 2: `\$` label escaping (pre-fix images carry
+    // dollar-stripped `${devcontainerId}` mounts) and the workspace label.
+    const TAG_FORMAT: u32 = 2;
     let inputs = serde_json::json!({
+        "tagFormat": TAG_FORMAT,
         "image": config.image,
         "build": build,
         "features": declared,
