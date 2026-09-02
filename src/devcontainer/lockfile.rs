@@ -180,6 +180,7 @@ pub fn handle_lockfile(
 mod tests {
     use super::*;
     use crate::devcontainer::features::FeatureLifecycleHooks;
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -192,7 +193,8 @@ mod tests {
             options: serde_json::Value::Null,
             install_script_path: path,
             install_after: Vec::new(),
-            container_env: HashMap::new(),
+            container_env: BTreeMap::new(),
+            option_defaults: BTreeMap::new(),
             mounts: Vec::new(),
             init: false,
             privileged: false,

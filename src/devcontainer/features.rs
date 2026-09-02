@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -9,6 +9,15 @@ use crate::oci::{download_artifact, extract_archive, sha256_hex};
 use super::config::{DevcontainerConfig, LifecycleCommand};
 use super::jsonc::parse_jsonc;
 
+/// One entry of a feature's `options` block. Only `default` is used: the spec has
+/// the orchestrating tool export every declared option, falling back to this when
+/// the project does not set one.
+#[derive(Deserialize, Default)]
+struct FeatureOptionDef {
+    #[serde(default)]
+    default: Option<serde_json::Value>,
+}
+
 /// Metadata from `devcontainer-feature.json` inside a feature artifact.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +27,9 @@ struct FeatureJsonMeta {
     #[serde(default)]
     depends_on: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
-    container_env: Option<HashMap<String, String>>,
+    container_env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    options: Option<BTreeMap<String, FeatureOptionDef>>,
     #[serde(default)]
     mounts: Option<Vec<serde_json::Value>>,
     #[serde(default)]
@@ -52,7 +63,9 @@ pub struct ResolvedFeature {
     /// Features that must be installed before this one (soft ordering hint).
     pub install_after: Vec<String>,
     /// Environment variables to set in the container from this feature.
-    pub container_env: HashMap<String, String>,
+    pub container_env: BTreeMap<String, String>,
+    /// Defaults for options the project did not set, from the feature's own metadata.
+    pub option_defaults: BTreeMap<String, serde_json::Value>,
     /// Mount specifications from this feature.
     pub mounts: Vec<serde_json::Value>,
     /// Whether this feature requires an init process.
@@ -96,7 +109,7 @@ fn parse_lifecycle_command(val: &serde_json::Value) -> Option<LifecycleCommand> 
             }
         }
         serde_json::Value::Object(obj) => {
-            let map: HashMap<String, String> = obj
+            let map: BTreeMap<String, String> = obj
                 .iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect();
@@ -144,7 +157,8 @@ pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeatu
             options: options.clone(),
             install_script_path: PathBuf::new(),
             install_after: Vec::new(),
-            container_env: HashMap::new(),
+            container_env: BTreeMap::new(),
+            option_defaults: BTreeMap::new(),
             mounts: Vec::new(),
             init: false,
             privileged: false,
@@ -244,7 +258,9 @@ pub fn feature_image_tag(
     // the digest is the cache key, so images built with the old scheme must
     // stop being cache hits. 2: `\$` label escaping (pre-fix images carry
     // dollar-stripped `${devcontainerId}` mounts) and the workspace label.
-    const TAG_FORMAT: u32 = 2;
+    // 3: options a feature declares but the project did not set are now exported
+    // from the feature's own defaults, so install scripts see different input.
+    const TAG_FORMAT: u32 = 3;
     let inputs = serde_json::json!({
         "tagFormat": TAG_FORMAT,
         "image": config.image,
@@ -374,6 +390,12 @@ fn apply_feature_metadata(feature: &mut ResolvedFeature, meta: &FeatureJsonMeta)
     if let Some(ref container_env) = meta.container_env {
         feature.container_env = container_env.clone();
     }
+    if let Some(ref options) = meta.options {
+        feature.option_defaults = options
+            .iter()
+            .filter_map(|(name, def)| def.default.clone().map(|d| (name.clone(), d)))
+            .collect();
+    }
     if let Some(ref mounts) = meta.mounts {
         feature.mounts = mounts.clone();
     }
@@ -484,7 +506,8 @@ async fn resolve_depends_on(
             options: dep_opts,
             install_script_path: PathBuf::new(),
             install_after: Vec::new(),
-            container_env: HashMap::new(),
+            container_env: BTreeMap::new(),
+            option_defaults: BTreeMap::new(),
             mounts: Vec::new(),
             init: false,
             privileged: false,
@@ -638,6 +661,17 @@ fn parse_feature_ref(id: &str) -> (String, String) {
 
 /// Sort features by their `install_after` dependencies (topological sort).
 pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
+    // Features reach here in `HashMap` iteration order — from devcontainer.json's
+    // `features` object and from the `dependsOn` closure — which reshuffles every
+    // process. Sorting by id first makes the generated Dockerfile byte-identical
+    // between builds, so Docker's layer cache holds and installs are not re-run.
+    let sorted: Vec<ResolvedFeature> = {
+        let mut v = features.to_vec();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    };
+    let features = &sorted[..];
+
     let id_to_idx: HashMap<&str, usize> = features
         .iter()
         .enumerate()
@@ -656,8 +690,9 @@ pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
         }
     }
 
-    // Kahn's algorithm
-    let mut queue: Vec<usize> = in_degree
+    // Kahn's algorithm, FIFO so features with no ordering constraint between
+    // them stay in sorted id order rather than coming out reversed.
+    let mut queue: VecDeque<usize> = in_degree
         .iter()
         .enumerate()
         .filter(|&(_, d)| *d == 0)
@@ -666,12 +701,12 @@ pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
 
     let mut ordered = Vec::with_capacity(features.len());
 
-    while let Some(idx) = queue.pop() {
+    while let Some(idx) = queue.pop_front() {
         ordered.push(features[idx].clone());
         for &dep_idx in &dependents[idx] {
             in_degree[dep_idx] -= 1;
             if in_degree[dep_idx] == 0 {
-                queue.push(dep_idx);
+                queue.push_back(dep_idx);
             }
         }
     }
@@ -759,28 +794,40 @@ pub fn generate_feature_dockerfile_with_opts(
         // across all subsequent Dockerfile steps. A feature setting e.g.
         // VERSION=3.12 would leak into later features that use $VERSION with
         // a different meaning (e.g. copilot-cli defaulting to "latest").
-        let mut option_exports = Vec::new();
+        // The spec has the tool export every option the feature declares, so a
+        // script can read an option it never told the project about. Project
+        // values win; the feature's own defaults fill the rest.
+        let mut effective: BTreeMap<&str, &serde_json::Value> = feature
+            .option_defaults
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
         if let Some(obj) = feature.options.as_object() {
             for (key, val) in obj {
-                let env_name = option_name_to_env(key);
-                let val_str = match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                // Escape special characters for safe embedding in a printf '%b'
-                // expression inside a Dockerfile RUN step. This handles newlines,
-                // tabs, carriage returns, backslashes, and single quotes without
-                // breaking the Dockerfile syntax.
-                let escaped_val = val_str
-                    .replace('\\', "\\\\")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t")
-                    .replace('\'', "'\\''");
-                option_exports.push(format!(
-                    "export {env_name}=\"$(printf '%b' '{escaped_val}')\""
-                ));
+                effective.insert(key.as_str(), val);
             }
+        }
+
+        let mut option_exports = Vec::new();
+        for (key, val) in effective {
+            let env_name = option_name_to_env(key);
+            let val_str = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            // Escape special characters for safe embedding in a printf '%b'
+            // expression inside a Dockerfile RUN step. This handles newlines,
+            // tabs, carriage returns, backslashes, and single quotes without
+            // breaking the Dockerfile syntax.
+            let escaped_val = val_str
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t")
+                .replace('\'', "'\\''");
+            option_exports.push(format!(
+                "export {env_name}=\"$(printf '%b' '{escaped_val}')\""
+            ));
         }
 
         // Always use ADD to extract the feature tarball from the uploaded build
@@ -949,20 +996,24 @@ fn build_metadata_label(
         );
     }
     if let Some(ref env) = config.container_env {
-        base_entry.insert(
-            "containerEnv".into(),
-            serde_json::to_value(env).unwrap_or_default(),
-        );
+        base_entry.insert("containerEnv".into(), sorted_env_value(env));
     }
     if let Some(ref remote_env) = config.remote_env {
-        base_entry.insert(
-            "remoteEnv".into(),
-            serde_json::to_value(remote_env).unwrap_or_default(),
-        );
+        base_entry.insert("remoteEnv".into(), sorted_env_value(remote_env));
     }
     metadata.push(serde_json::Value::Object(base_entry));
 
     serde_json::to_string(&metadata).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Serialize an env map with its keys in sorted order.
+///
+/// `serde_json`'s `preserve_order` feature makes its maps insertion-ordered, so a
+/// `HashMap` would otherwise land in the `devcontainer.metadata` label in a
+/// different order on every build.
+fn sorted_env_value(env: &HashMap<String, String>) -> serde_json::Value {
+    let sorted: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    serde_json::to_value(sorted).unwrap_or_default()
 }
 
 /// Insert a lifecycle hook into a metadata entry if it's Some.
@@ -1054,7 +1105,8 @@ fn feature_from_metadata_entry(entry: &serde_json::Value) -> Option<ResolvedFeat
         options: serde_json::Value::Null,
         install_script_path: PathBuf::new(),
         install_after: Vec::new(),
-        container_env: HashMap::new(),
+        container_env: BTreeMap::new(),
+        option_defaults: BTreeMap::new(),
         mounts: entry
             .get("mounts")
             .and_then(serde_json::Value::as_array)
@@ -1109,7 +1161,8 @@ mod tests {
             options: serde_json::Value::Null,
             install_script_path: PathBuf::new(),
             install_after: Vec::new(),
-            container_env: HashMap::new(),
+            container_env: BTreeMap::new(),
+            option_defaults: BTreeMap::new(),
             mounts: Vec::new(),
             init: false,
             privileged: false,
@@ -1319,6 +1372,104 @@ mod tests {
         resolved.options = options;
         resolved.install_script_path = PathBuf::from("/tmp/fake");
         resolved
+    }
+
+    #[test]
+    fn dockerfile_is_identical_whatever_order_features_arrive_in() {
+        // devcontainer.json's `features` object is a HashMap, so the resolved list
+        // arrives shuffled. A shuffled Dockerfile misses Docker's layer cache and
+        // reinstalls every feature on every build.
+        let mut a = make_feature("ghcr.io/x/alpha:1", serde_json::json!({}));
+        a.container_env.insert("ZED".to_string(), "z".to_string());
+        a.container_env.insert("ALPHA".to_string(), "a".to_string());
+        let b = make_feature("ghcr.io/x/beta:1", serde_json::json!({}));
+        let c = make_feature("ghcr.io/x/gamma:1", serde_json::json!({}));
+
+        let config = empty_config();
+        let render = |features: &[ResolvedFeature]| {
+            let ordered = order_features(features);
+            generate_feature_dockerfile_with_opts(
+                "base:latest",
+                "vsc-test",
+                &ordered,
+                Some("root"),
+                &config,
+            )
+        };
+
+        let forward = render(&[a.clone(), b.clone(), c.clone()]);
+        let shuffled = render(&[c, a, b]);
+        assert_eq!(
+            forward, shuffled,
+            "feature order must not depend on input order"
+        );
+        assert!(
+            forward.find("ENV ALPHA=").unwrap() < forward.find("ENV ZED=").unwrap(),
+            "containerEnv should be emitted in sorted key order.\nDockerfile:\n{forward}"
+        );
+    }
+
+    #[test]
+    fn metadata_label_is_identical_whatever_order_features_arrive_in() {
+        let mut config = empty_config();
+        config.container_env = Some(HashMap::from([
+            ("ZED".to_string(), "z".to_string()),
+            ("ALPHA".to_string(), "a".to_string()),
+            ("MID".to_string(), "m".to_string()),
+        ]));
+        let a = make_feature("ghcr.io/x/alpha:1", serde_json::json!({}));
+        let b = make_feature("ghcr.io/x/beta:1", serde_json::json!({}));
+
+        let first = build_metadata_label(
+            &order_features(&[a.clone(), b.clone()]),
+            &config,
+            Some("root"),
+        );
+        let second = build_metadata_label(&order_features(&[b, a]), &config, Some("root"));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn declared_option_defaults_are_exported_and_project_values_win() {
+        let mut feature = make_feature("feature-a", serde_json::json!({"version": "3.12"}));
+        feature.option_defaults.insert(
+            "version".to_string(),
+            serde_json::Value::String("latest".to_string()),
+        );
+        feature.option_defaults.insert(
+            "terragrunt".to_string(),
+            serde_json::Value::String("latest".to_string()),
+        );
+        feature.option_defaults.insert(
+            "installSentinel".to_string(),
+            serde_json::Value::Bool(false),
+        );
+
+        let config = empty_config();
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &[feature],
+            Some("root"),
+            &config,
+        );
+
+        assert!(
+            dockerfile.contains(r#"export TERRAGRUNT="$(printf '%b' 'latest')""#),
+            "an option the project left unset should come from the feature default.\nDockerfile:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains(r#"export INSTALLSENTINEL="$(printf '%b' 'false')""#),
+            "non-string defaults should be exported too.\nDockerfile:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains(r#"export VERSION="$(printf '%b' '3.12')""#),
+            "the project's value should win over the default.\nDockerfile:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains(r#"export VERSION="$(printf '%b' 'latest')""#),
+            "the default must not also be exported for an option the project set.\nDockerfile:\n{dockerfile}"
+        );
     }
 
     #[test]

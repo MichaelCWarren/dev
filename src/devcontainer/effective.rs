@@ -397,7 +397,7 @@ mod tests {
     use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
     use crate::devcontainer::features::{ResolvedFeature, feature_image_tag};
     use crate::devcontainer::resolve_features;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -456,7 +456,8 @@ mod tests {
             options: serde_json::Value::Null,
             install_script_path: std::path::PathBuf::new(),
             install_after: Vec::new(),
-            container_env: HashMap::new(),
+            container_env: BTreeMap::new(),
+            option_defaults: BTreeMap::new(),
             mounts: Vec::new(),
             init: false,
             privileged: false,

@@ -375,7 +375,7 @@ async fn run_parallel<R: ContainerRuntime + ?Sized>(
     runtime: &R,
     container_id: &str,
     name: &str,
-    commands: &std::collections::HashMap<String, String>,
+    commands: &std::collections::BTreeMap<String, String>,
     user: Option<&str>,
     workdir: Option<&str>,
     log: Option<&HookLog>,

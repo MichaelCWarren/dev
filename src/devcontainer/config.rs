@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::path::Path;
 
@@ -60,7 +60,7 @@ where
 pub enum LifecycleCommand {
     Single(String),
     Multiple(Vec<String>),
-    Parallel(HashMap<String, String>),
+    Parallel(BTreeMap<String, String>),
 }
 
 /// Build configuration within devcontainer.json.
