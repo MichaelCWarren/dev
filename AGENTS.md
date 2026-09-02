@@ -41,7 +41,22 @@
   `#[cfg(test)]` reference implementations. Instrument new merge strategies there or explain drifts.
 - `feature_image_tag` hashes a `TAG_FORMAT` constant (src/devcontainer/features.rs). Bump it
   whenever the generated Dockerfile or label encoding changes shape, so images cached under the
-  old scheme stop being cache hits; prune then sweeps them as superseded.
+  old scheme stop being cache hits; prune then sweeps them as superseded. A pure reordering of
+  content-equivalent output does not need a bump; a change to what install scripts receive does.
+- The generated Dockerfile must be byte-identical between processes or Docker's layer cache
+  misses and every feature reinstalls. Config's `features` map and `containerEnv` are `HashMap`s,
+  so anything baked into the image goes through a sorted view: `order_features` sorts by feature
+  id (the one choke point every build path calls), `ResolvedFeature.container_env` is a
+  `BTreeMap`, and `build_metadata_label` routes config env maps through `sorted_env_value`.
+  serde_json's `preserve_order` feature is on, so `to_value(&hashmap)` is NOT sorted any more.
+- Feature options exported into the RUN step are the project's values merged over the defaults
+  in the feature's own `devcontainer-feature.json` (`ResolvedFeature.option_defaults`), per the
+  spec. Exporting only what the project named leaves scripts that don't self-default with empty
+  options.
+- `BollardRuntime::build_image` buffers the build output tail when `-v` is off and dumps it on
+  every error path, so a failing feature install.sh is not reported as a bare exit code. Keep new
+  error returns in that loop going through `dump_build_tail`. The Apple runtime builds through the
+  external `apple_container` crate and has no equivalent.
 - Lifecycle hooks are split by moment in `src/devcontainer/lifecycle.rs`: `run_create_hooks`
   (onCreate/updateContent/postCreate/postStart) versus `run_start_hooks` (postStart only).
   Pick by whether the container already existed — never re-run create-time hooks on reuse.
