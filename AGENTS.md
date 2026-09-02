@@ -49,6 +49,10 @@
   id (the one choke point every build path calls), `ResolvedFeature.container_env` is a
   `BTreeMap`, and `build_metadata_label` routes config env maps through `sorted_env_value`.
   serde_json's `preserve_order` feature is on, so `to_value(&hashmap)` is NOT sorted any more.
+- `resolve_depends_on` (src/devcontainer/features.rs) records `install_after` edges in a
+  pass over the whole closure, after the discovery queue drains. Recording them during the
+  drain loses any edge whose dependent is discovered after the dependency was popped, which
+  can install a feature before the one it dependsOn. Keep edge recording out of that loop.
 - Feature options exported into the RUN step are the project's values merged over the defaults
   in the feature's own `devcontainer-feature.json` (`ResolvedFeature.option_defaults`), per the
   spec. Exporting only what the project named leaves scripts that don't self-default with empty

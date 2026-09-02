@@ -260,7 +260,9 @@ pub fn feature_image_tag(
     // dollar-stripped `${devcontainerId}` mounts) and the workspace label.
     // 3: options a feature declares but the project did not set are now exported
     // from the feature's own defaults, so install scripts see different input.
-    const TAG_FORMAT: u32 = 3;
+    // 4: dependsOn edges dropped by the old closure walk are recorded again, so
+    // images cached with a feature installed before its dependency must rebuild.
+    const TAG_FORMAT: u32 = 4;
     let inputs = serde_json::json!({
         "tagFormat": TAG_FORMAT,
         "image": config.image,
@@ -531,17 +533,24 @@ async fn resolve_depends_on(
             deps_cache.insert(dep_feature.id.clone(), deps);
         }
 
-        // Add the dependency as an install_after for feature(s) that depend on it,
-        // using the cached metadata instead of re-reading files.
-        for f in features.iter_mut() {
-            if let Some(deps) = deps_cache.get(&f.id)
-                && deps.contains_key(&dep_id)
-            {
+        features.push(dep_feature);
+    }
+
+    // Record every dependsOn edge as an install_after, from the cached metadata
+    // rather than by re-reading files. This has to happen after the whole closure
+    // is known: a feature discovered later than the dependency it declares would
+    // otherwise never see that dependency popped, and lose the edge entirely.
+    for f in features.iter_mut() {
+        let Some(deps) = deps_cache.get(&f.id) else {
+            continue;
+        };
+        let mut dep_ids: Vec<&String> = deps.keys().collect();
+        dep_ids.sort();
+        for dep_id in dep_ids {
+            if !f.install_after.contains(dep_id) {
                 f.install_after.push(dep_id.clone());
             }
         }
-
-        features.push(dep_feature);
     }
 
     Ok(())
@@ -1152,6 +1161,7 @@ fn union_string_array(value: Option<&serde_json::Value>, target: &mut Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn feature(id: &str) -> ResolvedFeature {
         ResolvedFeature {
@@ -1427,6 +1437,168 @@ mod tests {
         );
         let second = build_metadata_label(&order_features(&[b, a]), &config, Some("root"));
         assert_eq!(first, second);
+    }
+
+    /// Reference form a local feature directory is named by in devcontainer.json.
+    fn local_ref(name: &str) -> String {
+        format!("./{name}")
+    }
+
+    /// Write a feature directory that `local_ref(name)` resolves to.
+    fn write_local_feature(devcontainer_dir: &std::path::Path, name: &str, depends_on: &[&str]) {
+        let dir = devcontainer_dir.join(name);
+        std::fs::create_dir_all(&dir).expect("feature directory should be creatable");
+        let mut meta = serde_json::json!({ "id": name, "version": "1.0.0" });
+        if !depends_on.is_empty() {
+            let deps: serde_json::Map<String, serde_json::Value> = depends_on
+                .iter()
+                .map(|dep| (local_ref(dep), serde_json::json!({})))
+                .collect();
+            meta["dependsOn"] = serde_json::Value::Object(deps);
+        }
+        std::fs::write(
+            dir.join("devcontainer-feature.json"),
+            serde_json::to_string(&meta).expect("feature metadata should serialize"),
+        )
+        .expect("feature metadata should be writable");
+        std::fs::write(dir.join("install.sh"), "#!/bin/sh\nexit 0\n")
+            .expect("install.sh should be writable");
+    }
+
+    /// The build path for local features up to the ordering step: resolve the listed
+    /// ids, then download them, which walks the `dependsOn` closure off disk.
+    async fn resolve_closure(
+        devcontainer_dir: &std::path::Path,
+        listed: &[&str],
+    ) -> Vec<ResolvedFeature> {
+        let mut config = empty_config();
+        config.features = Some(
+            listed
+                .iter()
+                .map(|name| (local_ref(name), serde_json::json!({})))
+                .collect(),
+        );
+        let mut resolved = resolve_features(&config).expect("local features should resolve");
+        download_features(&mut resolved, Some(devcontainer_dir))
+            .await
+            .expect("local features should resolve off disk");
+        resolved
+    }
+
+    fn feature_ids(features: &[ResolvedFeature]) -> Vec<String> {
+        features.iter().map(|f| f.id.clone()).collect()
+    }
+
+    fn install_position(features: &[ResolvedFeature], name: &str) -> usize {
+        let id = local_ref(name);
+        features
+            .iter()
+            .position(|f| f.id == id)
+            .unwrap_or_else(|| panic!("{id} missing from closure {:?}", feature_ids(features)))
+    }
+
+    /// `dependsOn` features never pass through devcontainer.json's `features` object:
+    /// `resolve_depends_on` discovers them by draining a queue seeded from a HashMap,
+    /// so they arrive in a different order every process. `order_features` is the one
+    /// choke point both paths share, and the sort has to cover this one too.
+    #[tokio::test]
+    async fn depends_on_closure_installs_in_one_order_however_it_is_discovered() {
+        let tmp = TempDir::new().expect("tempdir should be creatable");
+        let dir = tmp.path();
+        // A diamond, so `base` is reached twice by different routes.
+        write_local_feature(dir, "app", &["lib", "tool"]);
+        write_local_feature(dir, "lib", &["base"]);
+        write_local_feature(dir, "tool", &["base"]);
+        write_local_feature(dir, "base", &[]);
+        write_local_feature(dir, "solo", &[]);
+
+        let closure = resolve_closure(dir, &["app", "solo"]).await;
+        assert_eq!(closure.len(), 5, "closure: {:?}", feature_ids(&closure));
+
+        // Every declared dependsOn has to survive as an install_after edge. `base` is
+        // the one that gets dropped when the edge is only recorded for features
+        // already resolved at the moment the dependency is popped: whichever of `lib`
+        // and `tool` is discovered second loses it.
+        let declared: &[(&str, &[&str])] = &[
+            ("app", &["lib", "tool"]),
+            ("lib", &["base"]),
+            ("tool", &["base"]),
+            ("solo", &[]),
+            ("base", &[]),
+        ];
+        for (name, deps) in declared {
+            let found = &closure[install_position(&closure, name)].install_after;
+            let mut expected: Vec<String> = deps.iter().map(|d| local_ref(d)).collect();
+            expected.sort();
+            let mut actual = found.clone();
+            actual.sort();
+            assert_eq!(actual, expected, "install_after edges for {name}");
+        }
+
+        // The closure arrives in whatever order the HashMap-seeded queue drained it.
+        // Reversing it is the cheap stand-in for that reshuffle, and unlike relying on
+        // HashMap randomness it fails deterministically if the sort is dropped.
+        let forward = order_features(&closure);
+        let reversed = order_features(&closure.iter().rev().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            feature_ids(&forward),
+            feature_ids(&reversed),
+            "discovery order must not reach the install order"
+        );
+
+        let relisted = order_features(&resolve_closure(dir, &["solo", "app"]).await);
+        assert_eq!(
+            feature_ids(&forward),
+            feature_ids(&relisted),
+            "listing order in devcontainer.json must not reach the install order"
+        );
+
+        let config = empty_config();
+        let render = |features: &[ResolvedFeature]| {
+            generate_feature_dockerfile_with_opts(
+                "base:latest",
+                "vsc-test",
+                features,
+                Some("root"),
+                &config,
+            )
+        };
+        assert_eq!(render(&forward), render(&reversed));
+
+        assert!(install_position(&forward, "base") < install_position(&forward, "lib"));
+        assert!(install_position(&forward, "base") < install_position(&forward, "tool"));
+        assert!(install_position(&forward, "lib") < install_position(&forward, "app"));
+        assert!(install_position(&forward, "tool") < install_position(&forward, "app"));
+    }
+
+    /// `read_depends_on` hands back a HashMap, so `resolve_depends_on` appends to
+    /// `install_after` in an order that reshuffles every process. Only the set of
+    /// edges may reach the output, never the order they were recorded in.
+    #[test]
+    fn install_after_order_within_a_feature_does_not_reach_the_install_order() {
+        let mut app = feature("./app");
+        app.install_after = vec![
+            "./base".to_string(),
+            "./lib".to_string(),
+            "./tool".to_string(),
+        ];
+        let mut lib = feature("./lib");
+        lib.install_after = vec!["./base".to_string()];
+        let mut tool = feature("./tool");
+        tool.install_after = vec!["./base".to_string()];
+        let base = feature("./base");
+
+        let forward = order_features(&[app.clone(), lib.clone(), tool.clone(), base.clone()]);
+
+        app.install_after.reverse();
+        let reversed = order_features(&[base, tool, lib, app]);
+
+        assert_eq!(feature_ids(&forward), feature_ids(&reversed));
+        assert_eq!(
+            feature_ids(&forward),
+            vec!["./base", "./lib", "./tool", "./app"],
+            "unconstrained features should stay in sorted id order"
+        );
     }
 
     #[test]
