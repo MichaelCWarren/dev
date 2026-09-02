@@ -5,7 +5,7 @@ use bollard::query_parameters::{
     BuildImageOptions, BuilderVersion, CreateContainerOptions, CreateImageOptions,
     ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -229,6 +229,32 @@ struct ExecStreams {
     tty: bool,
 }
 
+/// How much of a failing build's output to keep for the error report.
+const BUILD_TAIL_CHUNKS: usize = 200;
+
+/// Record a chunk of build output, dropping the oldest once the cap is reached.
+fn record_build_output(tail: &mut VecDeque<String>, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if tail.len() == BUILD_TAIL_CHUNKS {
+        tail.pop_front();
+    }
+    tail.push_back(chunk.to_string());
+}
+
+/// Print the buffered build output so a failing step's error is visible without `-v`.
+fn dump_build_tail(tail: &VecDeque<String>) {
+    if tail.is_empty() {
+        return;
+    }
+    eprintln!("--- build output (last {} chunks) ---", tail.len());
+    for chunk in tail {
+        eprint!("{chunk}");
+    }
+    eprintln!("--- end build output ---");
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -350,15 +376,24 @@ impl BollardRuntime {
         let mut stream = self
             .client
             .build_image(opts, Some(HashMap::new()), Some(body));
+        // Without `-v` the build output is dropped as it streams by, which leaves a
+        // failing feature install.sh reported as nothing but Docker's exit code.
+        // Keep the tail so the failure can be printed with the output that caused it.
+        let mut tail: VecDeque<String> = VecDeque::new();
         while let Some(result) = stream.next().await {
             let info = match result {
                 Ok(info) => info,
                 Err(e) => {
+                    dump_build_tail(&tail);
                     return Err(DevError::BuildFailed(format!("Docker stream error: {e}")));
                 }
             };
-            if verbose && let Some(ref stream_text) = info.stream {
-                eprint!("{stream_text}");
+            if let Some(ref stream_text) = info.stream {
+                if verbose {
+                    eprint!("{stream_text}");
+                } else {
+                    record_build_output(&mut tail, stream_text);
+                }
             }
             // Check for BuildKit trace messages with vertex errors or log output.
             if is_buildkit
@@ -366,19 +401,23 @@ impl BollardRuntime {
             {
                 for vertex in &status.vertexes {
                     if !vertex.error.is_empty() {
+                        dump_build_tail(&tail);
                         return Err(DevError::BuildFailed(vertex.error.clone()));
                     }
                 }
-                if verbose {
-                    for log in &status.logs {
-                        let text = String::from_utf8_lossy(&log.msg);
+                for log in &status.logs {
+                    let text = String::from_utf8_lossy(&log.msg);
+                    if verbose {
                         eprint!("{text}");
+                    } else {
+                        record_build_output(&mut tail, &text);
                     }
                 }
             }
             if let Some(ref detail) = info.error_detail {
                 let msg = detail.message.clone().unwrap_or_default();
                 if !msg.is_empty() {
+                    dump_build_tail(&tail);
                     return Err(DevError::BuildFailed(msg));
                 }
             }
