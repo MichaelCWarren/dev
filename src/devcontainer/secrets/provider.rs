@@ -401,7 +401,7 @@ fn is_single_path_component(name: &str) -> bool {
 }
 
 /// Follows symlinks: a symlink to an executable is executable.
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)

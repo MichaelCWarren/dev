@@ -1,5 +1,6 @@
 mod caddy;
 mod cli;
+mod cmux;
 mod collection;
 mod commands;
 mod devcontainer;

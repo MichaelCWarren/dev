@@ -1,12 +1,14 @@
 use std::path::Path;
 
+use crate::cmux::{Cmux, SESSION_PILL_STYLE, SHELL_KEY, StatusGuard};
 use crate::commands::exec::resolve_exec_secrets;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
+use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
 use crate::runtime::{
     ContainerInfo, ContainerRuntime, ContainerState, detect_runtime, resolve_remote_user,
 };
-use crate::session::{self, HostIdentity, SessionKind};
+use crate::session::{self, HostIdentity, SessionKind, SessionMarker};
 use crate::util::{workspace_folder_name, workspace_labels};
 
 pub async fn run(
@@ -16,7 +18,8 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let registry = ProviderRegistry::with_builtins(workspace);
-    let exit_code = run_with_runtime(workspace, runtime.as_ref(), shell, &registry).await?;
+    let cmux = Cmux::detect(true);
+    let exit_code = run_with_runtime(workspace, runtime.as_ref(), shell, &registry, &cmux).await?;
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -30,6 +33,7 @@ pub(crate) async fn run_with_runtime(
     runtime: &dyn ContainerRuntime,
     shell: Option<&str>,
     registry: &ProviderRegistry,
+    cmux: &Cmux,
 ) -> anyhow::Result<i32> {
     let container = running_container(runtime, workspace).await?;
 
@@ -38,16 +42,14 @@ pub(crate) async fn run_with_runtime(
     let config_path = loaded.as_ref().map(|(path, _)| path.as_path());
     let config = loaded.as_ref().map(|(_, config)| config);
     let config_user = config.and_then(|c| c.remote_user.as_deref());
+    let pill_enabled =
+        config.is_some_and(DevcontainerConfig::cmux_status_enabled) && cmux.available();
+    let mut pill = cmux.guard(SHELL_KEY, pill_enabled);
     let user = resolve_remote_user(runtime, &container.image, config_user).await?;
 
     let shell_cmd = resolve_shell(runtime, &container.id, user.as_deref(), shell).await?;
 
-    // Resolve workspaceFolder the same way `dev up` does, so the shell starts
-    // where lifecycle hooks ran.
-    let workdir = match config {
-        Some(config) => config.workspace_folder_path(workspace, user.as_deref())?,
-        None => format!("/workspaces/{}", workspace_folder_name(workspace)),
-    };
+    let workdir = resolve_workdir(config, workspace, user.as_deref())?;
 
     // Fresh every session, so a secret rotated since `dev up` reaches this shell
     // without a recreate. A compose container is not re-checked: `dev up`
@@ -58,8 +60,11 @@ pub(crate) async fn run_with_runtime(
     sweep_orphans(runtime, &container.id, user.as_deref()).await;
 
     let host = session::host_identity().await;
+    let pill_ctx =
+        SessionPillContext::new(workspace, runtime, &container, user.as_deref(), host.pid);
+    paint_session_pill(pill_enabled, &pill_ctx, true, &mut pill).await;
     let cmd = session_command(&shell_cmd, &workdir, &host);
-    attend_session(
+    let exit_code = attend_session(
         runtime,
         &container.id,
         &cmd,
@@ -68,7 +73,145 @@ pub(crate) async fn run_with_runtime(
         host.pid,
         &secrets,
     )
-    .await
+    .await;
+    paint_session_pill(pill_enabled, &pill_ctx, false, &mut pill).await;
+    exit_code
+}
+
+/// Where the shell starts: `workspaceFolder` resolved the same way `dev up`
+/// resolves it, so a session lands where the lifecycle hooks ran.
+fn resolve_workdir(
+    config: Option<&DevcontainerConfig>,
+    workspace: &Path,
+    user: Option<&str>,
+) -> anyhow::Result<String> {
+    match config {
+        Some(config) => Ok(config.workspace_folder_path(workspace, user)?),
+        None => Ok(format!("/workspaces/{}", workspace_folder_name(workspace))),
+    }
+}
+
+/// The pieces of a `dev shell` session that stay the same between painting
+/// the pill on entry and again after `attend_session` returns.
+struct SessionPillContext<'a> {
+    workspace: &'a Path,
+    runtime: &'a dyn ContainerRuntime,
+    container: &'a ContainerInfo,
+    user: Option<&'a str>,
+    own_host_pid: u32,
+}
+
+impl<'a> SessionPillContext<'a> {
+    fn new(
+        workspace: &'a Path,
+        runtime: &'a dyn ContainerRuntime,
+        container: &'a ContainerInfo,
+        user: Option<&'a str>,
+        own_host_pid: u32,
+    ) -> Self {
+        Self {
+            workspace,
+            runtime,
+            container,
+            user,
+            own_host_pid,
+        }
+    }
+}
+
+/// Recount live shells and update the pill: painted on entry (this session's
+/// own marker not written yet) and again once `attend_session` returns
+/// (this session's marker gone or going). `counting_self` is what tells the
+/// two apart.
+///
+/// `enabled` is checked first, so a disabled pill never lists the session,
+/// the same as before this feature existed. What each read means is
+/// [`SessionPill`]'s to say.
+async fn paint_session_pill(
+    enabled: bool,
+    ctx: &SessionPillContext<'_>,
+    counting_self: bool,
+    pill: &mut StatusGuard,
+) {
+    if !enabled {
+        return;
+    }
+    let read = session::list_sessions(ctx.runtime, &ctx.container.id, ctx.user)
+        .await
+        .ok();
+    match session_pill_action(
+        read.as_deref(),
+        ctx.own_host_pid,
+        counting_self,
+        &workspace_folder_name(ctx.workspace),
+        ctx.runtime.runtime_name(),
+    ) {
+        SessionPill::Show(value) => pill.phase(&value, SESSION_PILL_STYLE),
+        SessionPill::Clear => pill.clear(),
+        SessionPill::Leave => {}
+    }
+    // The exit decision is carried out above, so the guard's `Drop` has
+    // nothing left to do.
+    if !counting_self {
+        pill.disarm();
+    }
+}
+
+/// What a read of the live session list tells a paint site to do.
+///
+/// The invariant every paint site shares: zero live shells is painted only
+/// from evidence. A read that found none, and a workspace with no running
+/// container, are both evidence of zero and clear the pill. A read that
+/// failed is evidence of nothing, so the pill stays as it is and the next
+/// read corrects it — a shell whose sibling's `docker exec` hiccuped keeps
+/// its pill.
+///
+/// The second invariant, which `dev shell` is the only caller to need: a
+/// session decides the pill's state at exactly two moments, entry and exit,
+/// and each decision is carried out at the moment it is made. None is
+/// deferred. The guard's `Drop` is the safety net for ending without ever
+/// reaching the exit decision, and is never the mechanism for a decision that
+/// was reached.
+pub(crate) enum SessionPill {
+    /// Paint this value.
+    Show(String),
+    /// Take the pill down.
+    Clear,
+    /// Leave whatever is up there alone.
+    Leave,
+}
+
+/// Decide from one read of the session list: `None` is a read that failed.
+///
+/// Shared by both paint sites in this file and `dev status`'s repaint, so the
+/// decision and the value's shape live in exactly one place.
+pub(crate) fn session_pill_action(
+    sessions: Option<&[(SessionMarker, bool)]>,
+    own_host_pid: u32,
+    counting_self: bool,
+    workspace_name: &str,
+    runtime_name: &str,
+) -> SessionPill {
+    let Some(sessions) = sessions else {
+        return SessionPill::Leave;
+    };
+    let shells =
+        session::count_other_live_shells(sessions, own_host_pid) + usize::from(counting_self);
+    if shells == 0 {
+        return SessionPill::Clear;
+    }
+    SessionPill::Show(pill_value(workspace_name, runtime_name, shells))
+}
+
+/// `<name> · <runtime>` for one shell, `<n> shells · <name> · <runtime>` for
+/// more. The runtime stays in both forms so it does not vanish and reappear
+/// as a second shell opens and closes.
+fn pill_value(name: &str, runtime_name: &str, shells: usize) -> String {
+    if shells > 1 {
+        format!("{shells} shells · {name} · {runtime_name}")
+    } else {
+        format!("{name} · {runtime_name}")
+    }
 }
 
 /// Before starting one more, collect the sessions whose clients are gone: this
@@ -215,7 +358,11 @@ fn single_quoted(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostIdentity, run_with_runtime, session_command, single_quoted};
+    use super::{
+        HostIdentity, SessionPill, pill_value, run_with_runtime, session_command,
+        session_pill_action, single_quoted,
+    };
+    use crate::cmux::Cmux;
     use crate::devcontainer::secrets::SecretValue;
     use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
     use crate::error::DevError;
@@ -223,10 +370,11 @@ mod tests {
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
-    use crate::util::workspace_labels;
+    use crate::util::{workspace_folder_name, workspace_labels};
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -241,9 +389,29 @@ mod tests {
         Vec<(String, String)>,
     );
 
+    type ExecCall = (
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+    );
+
     struct ShellFakeRuntime {
         containers: Vec<ContainerInfo>,
         sessions: Arc<Mutex<Vec<SessionCall>>>,
+        execs: Arc<Mutex<Vec<ExecCall>>>,
+        /// Stdout `dev`'s own session-bookkeeping execs (the sweep's and the
+        /// release's reads) receive, standing in for the live session list a
+        /// real container would report. `None` keeps the default of no other
+        /// session, which every existing test relies on.
+        machinery_reply: Option<String>,
+        /// Session reads fail once the interactive session has run, standing
+        /// in for a daemon that hiccups while a shell is on its way out.
+        machinery_fails_after_session: bool,
+        /// The same hiccup, but before the session runs, so the entry paint
+        /// reads nothing and the exit paint reads cleanly.
+        machinery_fails_before_session: bool,
+        session_started: Arc<AtomicBool>,
     }
 
     impl ShellFakeRuntime {
@@ -259,11 +427,43 @@ mod tests {
                     image: "ubuntu:24.04".to_string(),
                 }],
                 sessions: Arc::new(Mutex::new(Vec::new())),
+                execs: Arc::new(Mutex::new(Vec::new())),
+                machinery_reply: None,
+                machinery_fails_after_session: false,
+                machinery_fails_before_session: false,
+                session_started: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        fn answering_machinery_with(mut self, reply: &str) -> Self {
+            self.machinery_reply = Some(reply.to_string());
+            self
+        }
+
+        fn failing_machinery_after_the_session(mut self) -> Self {
+            self.machinery_fails_after_session = true;
+            self
+        }
+
+        fn failing_machinery_before_the_session(mut self) -> Self {
+            self.machinery_fails_before_session = true;
+            self
         }
 
         fn sessions(&self) -> Vec<SessionCall> {
             self.sessions.lock().unwrap().clone()
+        }
+
+        /// `dev`'s own bookkeeping execs: the sweep's and the release's reads,
+        /// which must never be mistaken for a command the user asked for.
+        fn session_execs(&self) -> Vec<ExecCall> {
+            self.execs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(cmd, ..)| crate::session::is_session_machinery(cmd))
+                .cloned()
+                .collect()
         }
     }
 
@@ -304,20 +504,44 @@ mod tests {
             unused()
         }
 
-        /// Answers the shell probe and the sweep, both of which want status 0
-        /// and no output.
+        /// Answers the shell probe with status 0. Session-bookkeeping execs
+        /// (the sweep's and the release's reads) get `machinery_reply`, so a
+        /// test can stand in a sibling shell's marker without a real
+        /// container; everything else gets no output, same as before this
+        /// field existed.
         fn exec(
             &self,
             _id: &str,
-            _cmd: &[String],
-            _user: Option<&str>,
-            _workdir: Option<&str>,
-            _env: &[(String, SecretValue)],
+            cmd: &[String],
+            user: Option<&str>,
+            workdir: Option<&str>,
+            env: &[(String, SecretValue)],
         ) -> BoxFut<'_, ExecResult> {
-            Box::pin(async {
+            self.execs.lock().unwrap().push((
+                cmd.to_vec(),
+                user.map(str::to_string),
+                workdir.map(str::to_string),
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.expose().to_string()))
+                    .collect(),
+            ));
+            let machinery = crate::session::is_session_machinery(cmd);
+            let started = self.session_started.load(Ordering::SeqCst);
+            if machinery
+                && ((self.machinery_fails_after_session && started)
+                    || (self.machinery_fails_before_session && !started))
+            {
+                return Box::pin(async { Err(DevError::Runtime("session read failed".into())) });
+            }
+            let stdout = if machinery {
+                self.machinery_reply.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Box::pin(async move {
                 Ok(ExecResult {
                     exit_code: 0,
-                    stdout: String::new(),
+                    stdout,
                     stderr: String::new(),
                 })
             })
@@ -331,6 +555,7 @@ mod tests {
             workdir: Option<&str>,
             env: &[(String, SecretValue)],
         ) -> BoxFut<'_, i32> {
+            self.session_started.store(true, Ordering::SeqCst);
             self.sessions.lock().unwrap().push((
                 cmd.to_vec(),
                 user.map(str::to_string),
@@ -401,6 +626,21 @@ mod tests {
         (workspace, config_path)
     }
 
+    /// A workspace with the session pill turned on: `"cmux": {"status": true}`
+    /// beside the fixture image `workspace_with` writes.
+    fn workspace_with_pill_enabled() -> (TempDir, std::path::PathBuf) {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+        let config_path = devcontainer_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{"image": "ubuntu:24.04", "cmux": {"status": true}}"#,
+        )
+        .unwrap();
+        (workspace, config_path)
+    }
+
     /// A registry holding only `provider`, with the plugin search path pointed
     /// at nothing so no `dev-secret-*` on the real `PATH` can answer.
     fn registry_with(workspace: &Path, provider: FakeProvider) -> ProviderRegistry {
@@ -429,6 +669,7 @@ mod tests {
             &runtime,
             None,
             &registry_with(workspace.path(), answers()),
+            &Cmux::recording().0,
         )
         .await
         .expect("dev shell should open a session");
@@ -452,6 +693,7 @@ mod tests {
             &runtime,
             None,
             &registry_with(workspace.path(), answers()),
+            &Cmux::recording().0,
         )
         .await
         .expect("dev shell should open a session");
@@ -474,6 +716,7 @@ mod tests {
             &runtime,
             None,
             &registry_with(workspace.path(), provider.clone()),
+            &Cmux::recording().0,
         )
         .await
         .expect("dev shell should open a session");
@@ -494,6 +737,7 @@ mod tests {
             &runtime,
             None,
             &registry_with(workspace.path(), FakeProvider::failing_for("TOKEN")),
+            &Cmux::recording().0,
         )
         .await
         .expect_err("a required secret that cannot resolve fails the command");
@@ -516,6 +760,7 @@ mod tests {
             &runtime,
             None,
             &registry_with(workspace.path(), answers()),
+            &Cmux::recording().0,
         )
         .await
         .expect("dev shell should open a session");
@@ -536,9 +781,15 @@ mod tests {
         let registry = registry_with(workspace.path(), provider.clone());
 
         for _ in 0..2 {
-            run_with_runtime(workspace.path(), &runtime, None, &registry)
-                .await
-                .expect("dev shell should open a session");
+            run_with_runtime(
+                workspace.path(),
+                &runtime,
+                None,
+                &registry,
+                &Cmux::recording().0,
+            )
+            .await
+            .expect("dev shell should open a session");
         }
 
         assert_eq!(provider.calls(), 2);
@@ -605,5 +856,247 @@ mod tests {
         // reopened — never leaving the quoted state.
         assert_eq!(single_quoted("/tmp/it's"), r"'/tmp/it'\''s'");
         assert_eq!(single_quoted("';id;'"), r"''\'';id;'\'''");
+    }
+
+    /// The runtime stays in both forms so it never vanishes and reappears as
+    /// a second shell opens and closes; the count only shows once there is
+    /// more than one to distinguish from a lone shell.
+    #[test]
+    fn pill_value_shows_a_count_only_above_one_shell() {
+        assert_eq!(pill_value("myproject", "docker", 1), "myproject · docker");
+        assert_eq!(
+            pill_value("myproject", "docker", 3),
+            "3 shells · myproject · docker"
+        );
+    }
+
+    /// A config without the `cmux` key must cost nothing beyond what `dev
+    /// shell` already does: no call into the handle, and no more session
+    /// reads than the sweep's and the release's.
+    #[tokio::test]
+    async fn a_disabled_gate_makes_no_cmux_call_and_reads_no_extra_sessions() {
+        let (workspace, config_path) = workspace_with(None);
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path);
+        let (cmux, recorder) = Cmux::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &registry_with(workspace.path(), FakeProvider::recording()),
+            &cmux,
+        )
+        .await
+        .expect("dev shell should open a session");
+
+        assert!(recorder.calls().is_empty());
+        assert_eq!(runtime.session_execs().len(), 2);
+    }
+
+    /// With nothing else running, the pill appears on entry and disappears on
+    /// exit through the guard's own `Drop` — `paint_session_pill` makes no
+    /// explicit clear call itself.
+    #[tokio::test]
+    async fn one_shell_paints_on_entry_and_clears_on_exit() {
+        let (workspace, config_path) = workspace_with_pill_enabled();
+        let name = workspace_folder_name(workspace.path());
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path);
+        let (cmux, recorder) = Cmux::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &registry_with(workspace.path(), FakeProvider::recording()),
+            &cmux,
+        )
+        .await
+        .expect("dev shell should open a session");
+
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                vec![
+                    "set-status".to_string(),
+                    "dev_shell".to_string(),
+                    format!("{name} · docker"),
+                    "--icon".to_string(),
+                    "terminal".to_string(),
+                    "--color".to_string(),
+                    "#3B82F6".to_string(),
+                ],
+                vec!["clear-status".to_string(), "dev_shell".to_string()],
+            ]
+        );
+    }
+
+    /// A live sibling shell, owned by `host_pid`.
+    fn live_shell(host_pid: u32) -> (crate::session::SessionMarker, bool) {
+        (
+            crate::session::SessionMarker {
+                container_pid: 720,
+                container_sid: 720,
+                host_pid,
+                host_start: "-".to_string(),
+                kind: crate::session::SessionKind::Shell,
+                host_tty: "ttys001".to_string(),
+            },
+            true,
+        )
+    }
+
+    /// The half of the invariant that costs a live shell its pill when it is
+    /// broken: a read that failed says nothing about how many shells are
+    /// open, so nothing may be painted from it.
+    #[test]
+    fn a_failed_read_paints_nothing() {
+        assert!(matches!(
+            session_pill_action(None, 4131, false, "myproject", "docker"),
+            SessionPill::Leave
+        ));
+        assert!(matches!(
+            session_pill_action(None, 4131, true, "myproject", "docker"),
+            SessionPill::Leave
+        ));
+    }
+
+    /// The other half: a read that succeeded and found no live shell is
+    /// evidence of zero, and takes the pill down.
+    #[test]
+    fn a_read_that_found_no_shell_clears() {
+        assert!(matches!(
+            session_pill_action(Some(&[]), 4131, false, "myproject", "docker"),
+            SessionPill::Clear
+        ));
+        assert!(matches!(
+            session_pill_action(
+                Some(&[live_shell(4131)]),
+                4131,
+                false,
+                "myproject",
+                "docker"
+            ),
+            SessionPill::Clear
+        ));
+    }
+
+    #[test]
+    fn a_read_that_found_shells_paints_their_count() {
+        let entering = session_pill_action(Some(&[]), 4131, true, "myproject", "docker");
+        assert!(matches!(entering, SessionPill::Show(value) if value == "myproject · docker"));
+
+        let two = session_pill_action(Some(&[live_shell(5000)]), 4131, true, "myproject", "docker");
+        assert!(
+            matches!(two, SessionPill::Show(value) if value == "2 shells · myproject · docker")
+        );
+    }
+
+    /// The exit read failing is not evidence that this was the last shell, so
+    /// the pill stays up for the next read to correct. Were it cleared here,
+    /// a sibling shell would lose its pill to this one's daemon hiccup.
+    #[tokio::test]
+    async fn a_failed_exit_read_leaves_the_pill_up() {
+        let (workspace, config_path) = workspace_with_pill_enabled();
+        let name = workspace_folder_name(workspace.path());
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .failing_machinery_after_the_session();
+        let (cmux, recorder) = Cmux::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &registry_with(workspace.path(), FakeProvider::recording()),
+            &cmux,
+        )
+        .await
+        .expect("dev shell should open a session");
+
+        assert_eq!(
+            recorder.calls(),
+            vec![vec![
+                "set-status".to_string(),
+                "dev_shell".to_string(),
+                format!("{name} · docker"),
+                "--icon".to_string(),
+                "terminal".to_string(),
+                "--color".to_string(),
+                "#3B82F6".to_string(),
+            ]]
+        );
+    }
+
+    /// An entry read that failed paints nothing, so the guard is never armed;
+    /// the exit read then finding no shell must still take the pill down. The
+    /// exit decision is the session's last word on the key, and leaving it to
+    /// the guard's `Drop` strands the pill of the shell that wrote it.
+    #[tokio::test]
+    async fn an_unpainted_entry_still_clears_when_the_exit_read_finds_no_shell() {
+        let (workspace, config_path) = workspace_with_pill_enabled();
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .failing_machinery_before_the_session();
+        let (cmux, recorder) = Cmux::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &registry_with(workspace.path(), FakeProvider::recording()),
+            &cmux,
+        )
+        .await
+        .expect("dev shell should open a session");
+
+        assert_eq!(
+            recorder.calls(),
+            vec![vec!["clear-status".to_string(), "dev_shell".to_string()]]
+        );
+    }
+
+    /// A sibling's marker keeps the pill counting rather than clearing it,
+    /// which is what lets the first of two shells to exit fall back to the
+    /// other's count instead of blanking the sidebar.
+    #[tokio::test]
+    async fn a_sibling_shell_keeps_the_pill_and_recounts_on_exit() {
+        let (workspace, config_path) = workspace_with_pill_enabled();
+        let name = workspace_folder_name(workspace.path());
+        let ppid = std::os::unix::process::parent_id();
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .answering_machinery_with(&format!("720 720 {ppid} - shell ttys001"));
+        let (cmux, recorder) = Cmux::recording();
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &registry_with(workspace.path(), FakeProvider::recording()),
+            &cmux,
+        )
+        .await
+        .expect("dev shell should open a session");
+
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                vec![
+                    "set-status".to_string(),
+                    "dev_shell".to_string(),
+                    format!("2 shells · {name} · docker"),
+                    "--icon".to_string(),
+                    "terminal".to_string(),
+                    "--color".to_string(),
+                    "#3B82F6".to_string(),
+                ],
+                vec![
+                    "set-status".to_string(),
+                    "dev_shell".to_string(),
+                    format!("{name} · docker"),
+                    "--icon".to_string(),
+                    "terminal".to_string(),
+                    "--color".to_string(),
+                    "#3B82F6".to_string(),
+                ],
+            ]
+        );
     }
 }

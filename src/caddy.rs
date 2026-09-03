@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::util::paths::dev_home;
+use crate::util::process::wait_bounded;
 
 const TLD: &str = "test";
 
@@ -230,7 +231,7 @@ fn start_caddy(caddyfile: &Path) {
     };
 
     let log = caddy_log_path();
-    match wait_bounded(&mut child, START_TIMEOUT) {
+    match wait_bounded(&mut child, START_TIMEOUT, Duration::from_millis(100)) {
         Some(status) if status.success() => eprintln!("Caddy started."),
         Some(status) => eprintln!(
             "Warning: caddy start failed ({status}); see {}",
@@ -246,23 +247,6 @@ fn start_caddy(caddyfile: &Path) {
                 log.display()
             );
         }
-    }
-}
-
-/// Wait for `child` to exit, giving up after `timeout`. `None` means it was
-/// still running (or could not be polled) when the deadline passed.
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -346,27 +330,5 @@ mod tests {
             "Error: adapting config using caddyfile: /Users/x/.dev/caddy/Caddyfile:3: unrecognized directive: reverse_prox"
         ));
         assert!(!is_caddy_not_running(""));
-    }
-
-    #[test]
-    fn wait_bounded_returns_status_when_child_exits() {
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        let status = wait_bounded(&mut child, Duration::from_secs(5));
-        assert!(status.expect("exited within timeout").success());
-    }
-
-    #[test]
-    fn wait_bounded_gives_up_on_a_long_running_child() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let started = Instant::now();
-        let status = wait_bounded(&mut child, Duration::from_millis(300));
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(status.is_none(), "should not have waited for the child");
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

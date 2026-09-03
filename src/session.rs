@@ -375,6 +375,20 @@ pub async fn list_sessions<R: ContainerRuntime + ?Sized>(
         .collect())
 }
 
+/// How many entries are a live `dev shell`, excluding one host pid.
+///
+/// The exclusion is explicit rather than trusting `release_own_sessions` to
+/// have removed the caller's own marker first: on the signalled arm of
+/// `attend_session` the marker can still be there when this is read.
+pub fn count_other_live_shells(sessions: &[(SessionMarker, bool)], except_host_pid: u32) -> usize {
+    sessions
+        .iter()
+        .filter(|(marker, live)| {
+            *live && marker.kind == SessionKind::Shell && marker.host_pid != except_host_pid
+        })
+        .count()
+}
+
 /// When each of the clients these markers name started.
 ///
 /// Collected in one `ps` call so a sweep costs one child process rather than
@@ -656,6 +670,29 @@ mod tests {
         assert_eq!(orphaned[0].host_pid, 9002);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].host_pid, 4131);
+    }
+
+    /// Own live shell excluded, other live shell counted, other dead shell
+    /// excluded, other live non-shell excluded. Own must be excluded even
+    /// though it is live: after a signalled release its marker can still be
+    /// there, and counting it would leave the pill one too high and never
+    /// let it fall back to a sibling's true count.
+    #[test]
+    fn count_other_live_shells_excludes_self_dead_and_non_shell_entries() {
+        let own = 4131;
+        let sessions = vec![
+            (marker(1, 1, own), true),
+            (marker(2, 2, 5000), true),
+            (marker(3, 3, 6000), false),
+            (
+                SessionMarker {
+                    kind: SessionKind::Exec,
+                    ..marker(4, 4, 7000)
+                },
+                true,
+            ),
+        ];
+        assert_eq!(count_other_live_shells(&sessions, own), 1);
     }
 
     /// The whole point of the start token: a client's pid outliving it, taken

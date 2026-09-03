@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
 use crate::devcontainer::DevcontainerConfig;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::runtime::{ContainerState, detect_runtime};
@@ -13,8 +14,12 @@ pub async fn run(
     let runtime = detect_runtime(runtime_override).await?;
 
     // Try compose-aware teardown first.
-    if let Some((config_path, config)) =
-        load_workspace_config_or_warn(workspace, runtime.runtime_name())
+    let loaded = load_workspace_config_or_warn(workspace, runtime.runtime_name());
+    let pill_enabled = loaded
+        .as_ref()
+        .is_some_and(|(_, config)| config.cmux_status_enabled());
+    let mut pill = Cmux::detect(pill_enabled).guard(BUILD_KEY, pill_enabled);
+    if let Some((config_path, config)) = loaded
         && config.is_compose()
     {
         return run_compose_down(
@@ -23,12 +28,20 @@ pub async fn run(
             &config_path,
             runtime.runtime_name(),
             remove,
+            &mut pill,
         )
         .await;
     }
 
     // Non-compose: label-based container stop/remove.
-    run_with_runtime(workspace, &*runtime, remove, crate::caddy::unregister_site).await
+    run_with_runtime(
+        workspace,
+        &*runtime,
+        remove,
+        crate::caddy::unregister_site,
+        &mut pill,
+    )
+    .await
 }
 
 /// Internal: run the non-compose teardown path against a specific runtime.
@@ -39,6 +52,7 @@ pub async fn run_with_runtime(
     runtime: &dyn crate::runtime::ContainerRuntime,
     remove: bool,
     unregister_caddy: impl FnOnce(&Path) -> anyhow::Result<()>,
+    pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -53,6 +67,7 @@ pub async fn run_with_runtime(
 
     for container in &containers {
         let stopped = if container.state == ContainerState::Running {
+            pill.phase("down: stopping container", BUILD_STYLE);
             eprintln!("Stopping container '{}'...", container.name);
             stop_container_safe(runtime, &container.id).await
         } else {
@@ -60,6 +75,7 @@ pub async fn run_with_runtime(
         };
 
         if remove {
+            pill.phase("down: removing container", BUILD_STYLE);
             eprintln!("Removing container '{}'...", container.name);
             if let Err(e) = runtime.remove_container(&container.id).await {
                 if let Err(stop_err) = &stopped {
@@ -131,6 +147,7 @@ async fn run_compose_down(
     config_path: &Path,
     runtime_name: &str,
     remove: bool,
+    pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -138,6 +155,7 @@ async fn run_compose_down(
     let project_name = container_name(workspace);
 
     if remove {
+        pill.phase("down: removing compose services", BUILD_STYLE);
         eprintln!("Removing compose services...");
         crate::runtime::compose::compose_down(
             runtime_name,
@@ -148,6 +166,7 @@ async fn run_compose_down(
         .await?;
         println!("Compose services removed.");
     } else {
+        pill.phase("down: stopping compose services", BUILD_STYLE);
         eprintln!("Stopping compose services...");
         crate::runtime::compose::compose_stop(
             runtime_name,
@@ -180,6 +199,7 @@ mod tests {
     //!   2. A stop failure on container 0 does not skip removal for container 1.
     //!   3. Removal success after stop failure does not fail the command.
     use super::run_with_runtime;
+    use crate::cmux::{BUILD_KEY, Cmux};
     use crate::devcontainer::secrets::SecretValue;
     use crate::error::DevError;
     use crate::runtime::{
@@ -423,7 +443,8 @@ mod tests {
         rt.inspect_states
             .insert("2222".to_string(), ContainerState::Stopped);
 
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
 
         // remove_container must be called for each container, including the one whose stop failed.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -453,7 +474,8 @@ mod tests {
             .insert("2222".to_string(), ContainerState::Stopped);
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
 
         // remove_container was called for each container — no error.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -484,7 +506,8 @@ mod tests {
         rt.remove_responses.insert("1111".to_string(), Ok(()));
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
 
         // remove_container should have been called for both containers: a stop
         // failure must not skip removal, so both are removed.
@@ -494,6 +517,47 @@ mod tests {
             res.is_ok(),
             "run_with_runtime should succeed (all removals went through despite stop failures: {:?})",
             res.err()
+        );
+    }
+
+    /// The stop phase fires before the container is stopped, and the guard
+    /// clears it once `run_with_runtime` returns.
+    #[tokio::test]
+    async fn down_sets_stop_phase_and_clears() {
+        let mut rt = FakeRuntime::new();
+        let workspace = Path::new("/tmp/fake-workspace");
+        rt.inspect_states
+            .insert("1111".to_string(), ContainerState::Stopped);
+        rt.inspect_states
+            .insert("2222".to_string(), ContainerState::Stopped);
+
+        let (cmux, recorder) = Cmux::recording();
+        let mut pill = cmux.guard(BUILD_KEY, true);
+        let res = run_with_runtime(workspace, &rt, false, |_: &Path| Ok(()), &mut pill).await;
+        assert!(
+            res.is_ok(),
+            "run_with_runtime should succeed: {:?}",
+            res.err()
+        );
+        drop(pill);
+
+        let calls = recorder.calls();
+        assert_eq!(
+            calls.first().map(|c| &c[..3]),
+            Some(
+                [
+                    "set-status".to_string(),
+                    BUILD_KEY.to_string(),
+                    "down: stopping container".to_string()
+                ]
+                .as_slice()
+            ),
+            "first call must be the stop phase: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&vec!["clear-status".to_string(), BUILD_KEY.to_string()]),
+            "last call must be the clear: {calls:?}"
         );
     }
 }

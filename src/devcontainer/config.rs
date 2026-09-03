@@ -191,6 +191,8 @@ pub struct DevcontainerConfig {
     pub update_remote_user_uid: Option<bool>,
     /// Dotfiles configuration for cloning a user's dotfiles repo into the container.
     pub dotfiles: Option<DotfilesConfig>,
+    /// Cmux status reporting configuration.
+    pub cmux: Option<CmuxSettings>,
 }
 
 /// Configuration for cloning a dotfiles repository into the container.
@@ -204,6 +206,21 @@ pub struct DotfilesConfig {
     pub target_path: Option<String>,
     /// Command to run after cloning (e.g. "~/dotfiles/install.sh").
     pub install_command: Option<String>,
+}
+
+/// Configuration for cmux status reporting integration.
+///
+/// A dev-only extension, not part of the devcontainer spec — other tooling
+/// ignores it. `status` gates the cmux sidebar reporting through `cmux_status_enabled`.
+/// `agent` is reserved and read by nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CmuxSettings {
+    /// Whether to enable cmux status reporting.
+    pub status: bool,
+    /// Reserved for future use; read by nothing until the transport lands.
+    #[allow(dead_code)]
+    pub agent: bool,
 }
 
 impl DevcontainerConfig {
@@ -221,6 +238,11 @@ impl DevcontainerConfig {
     /// Returns true if this config uses Docker Compose rather than image/Dockerfile.
     pub fn is_compose(&self) -> bool {
         self.docker_compose_file.is_some()
+    }
+
+    /// Returns true only when cmux is Some and its status is true; an absent key returns false.
+    pub fn cmux_status_enabled(&self) -> bool {
+        self.cmux.as_ref().is_some_and(|c| c.status)
     }
 
     /// Returns the effective workspace bind-mount target inside the container,
@@ -352,6 +374,7 @@ mod workspace_mount_tests {
             caddy: None,
             update_remote_user_uid: None,
             dotfiles: None,
+            cmux: None,
         }
     }
 
@@ -727,5 +750,41 @@ mod tests {
             emitted,
             "source=./,target=/workspace,type=bind,readonly=false"
         );
+    }
+
+    #[test]
+    fn cmux_parses_both_flags() {
+        let config = parse(r#"{"cmux": {"status": true, "agent": true}}"#);
+        assert!(config.cmux.is_some());
+        let cmux = config.cmux.unwrap();
+        assert!(cmux.status);
+        assert!(cmux.agent);
+    }
+
+    #[test]
+    fn cmux_missing_sub_key_defaults_to_false() {
+        let config = parse(r#"{"cmux": {"status": true}}"#);
+        assert!(config.cmux.is_some());
+        let cmux = config.cmux.unwrap();
+        assert!(cmux.status);
+        assert!(!cmux.agent);
+    }
+
+    #[test]
+    fn absent_cmux_is_none() {
+        let config = parse(r#"{"image": "alpine:latest"}"#);
+        assert!(config.cmux.is_none());
+    }
+
+    #[test]
+    fn cmux_status_enabled_requires_present_true() {
+        let config1 = parse(r#"{"image": "alpine:latest"}"#);
+        assert!(!config1.cmux_status_enabled());
+
+        let config2 = parse(r#"{"cmux": {"status": false}}"#);
+        assert!(!config2.cmux_status_enabled());
+
+        let config3 = parse(r#"{"cmux": {"status": true}}"#);
+        assert!(config3.cmux_status_enabled());
     }
 }

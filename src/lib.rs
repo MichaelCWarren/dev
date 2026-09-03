@@ -1,5 +1,6 @@
 pub mod caddy;
 pub mod cli;
+pub mod cmux;
 pub mod collection;
 pub mod commands;
 pub mod devcontainer;

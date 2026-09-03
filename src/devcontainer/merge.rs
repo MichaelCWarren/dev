@@ -81,7 +81,7 @@ const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts"];
 const ARRAY_CONCAT_FIELDS: &[&str] = &["runArgs"];
 
 /// Fields that are key-value maps and should be merged (base keys override template keys).
-const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy"];
+const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy", "cmux"];
 
 /// Fields that are feature maps (special merge: union of keys).
 const FEATURE_FIELDS: &[&str] = &["features"];
@@ -376,6 +376,29 @@ mod tests {
         assert_eq!(origins["postCreateCommand.lint"], LayerId::Project);
     }
 
+    #[test]
+    fn cmux_sub_keys_are_credited_per_layer() {
+        let base = serde_json::json!({
+            "cmux": {"status": true}
+        });
+        let project = serde_json::json!({
+            "cmux": {"agent": true}
+        });
+
+        let mut prov = Provenance::recording();
+        let merged = merge_layers_tracked(
+            &[(LayerId::Base, base), (LayerId::Project, project)],
+            &mut prov,
+        );
+        let origins = prov.into_origins();
+
+        assert_eq!(origins["cmux.status"], LayerId::Base);
+        assert_eq!(origins["cmux.agent"], LayerId::Project);
+        let cmux = merged["cmux"].as_object().unwrap();
+        assert_eq!(cmux["status"], true);
+        assert_eq!(cmux["agent"], true);
+    }
+
     /// A deduplicated array entry is dropped on the later layer, so the first
     /// contributing layer keeps the credit.
     #[test]
@@ -526,6 +549,22 @@ mod tests {
         let caddy = json["caddy"].as_object().unwrap();
         assert_eq!(caddy["5247"], "chuckos");
         assert_eq!(caddy["5163"], "api.chuckos"); // base wins
+    }
+
+    #[test]
+    fn test_merge_cmux_per_sub_key() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"cmux": {"status": true}}"#,
+            r#"{"cmux": {"agent": true, "status": false}}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let cmux = json["cmux"].as_object().unwrap();
+        assert_eq!(cmux["status"], true); // base wins
+        assert_eq!(cmux["agent"], true); // template sub-key survives
     }
 
     #[test]

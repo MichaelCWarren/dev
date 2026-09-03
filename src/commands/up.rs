@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
 use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::effective::{
@@ -23,13 +25,17 @@ use crate::devcontainer::{
 };
 use crate::error::DevError;
 use crate::runtime::{
-    BindMount, ContainerConfig, ContainerRuntime, ContainerState, ExecResult, PortMapping,
-    TmpfsMount, VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
+    BindMount, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState, ExecResult,
+    PortMapping, TmpfsMount, VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
 use crate::util::paths::DevHome;
 use crate::util::{
     ConfigSource, container_name, find_config_source, workspace_folder_name, workspace_labels,
 };
+
+/// A `dev up` finishing under this looks instant enough that a notification
+/// would just be noise; every already-running and cache-hit run stays quiet.
+const NOTIFY_AFTER: Duration = Duration::from_secs(30);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -47,6 +53,7 @@ pub async fn run(
     secrets_override: Option<&Path>,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
+    let cmux = Cmux::detect(true);
     run_with_runtime(
         workspace,
         runtime.as_ref(),
@@ -59,6 +66,7 @@ pub async fn run(
         secrets_file,
         no_base,
         secrets_override,
+        &cmux,
     )
     .await
 }
@@ -155,6 +163,7 @@ pub(crate) async fn run_with_runtime(
     secrets_file: Option<&Path>,
     no_base: bool,
     secrets_override: Option<&Path>,
+    cmux: &Cmux,
 ) -> anyhow::Result<()> {
     let providers = ProviderRegistry::with_builtins(workspace);
     run_with_runtime_with_providers(
@@ -171,6 +180,7 @@ pub(crate) async fn run_with_runtime(
         secrets_override,
         &providers,
         &DevHome::current(),
+        cmux,
     )
     .await
 }
@@ -194,6 +204,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     secrets_override: Option<&Path>,
     providers: &ProviderRegistry,
     dev_home: &DevHome,
+    cmux: &Cmux,
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
         match find_config_source(workspace)? {
@@ -227,6 +238,10 @@ pub(crate) async fn run_with_runtime_with_providers(
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
+    let mut pill = cmux
+        .guard(BUILD_KEY, config.cmux_status_enabled())
+        .notify_after("dev up", NOTIFY_AFTER);
+
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
         reject_project_run_args_for_compose(&config, project_declared_run_args)?;
@@ -254,6 +269,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             update_remote_user_uid_default,
             &lockfile,
             dev_home,
+            &mut pill,
         )
         .await;
     }
@@ -327,34 +343,11 @@ pub(crate) async fn run_with_runtime_with_providers(
     if let Some(container) = existing.first() {
         match container.state {
             ContainerState::Running if !rebuild && !has_port_overrides => {
-                // Gated like every other exit that claims readiness. "Already
-                // running" is a readiness claim, and the container this arm
-                // reuses may be exactly the one a previous `dev up` refused:
-                // the runtime leaves a container it started but cannot exec
-                // into in the running state, so without the gate the first
-                // `dev up` fails honestly and every later one hands the user a
-                // green light for a container no command can run in.
-                let user =
-                    resolve_remote_user(runtime, &container.image, config.remote_user.as_deref())
-                        .await?;
-                let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
-                verify_container_usable(
-                    runtime,
-                    &container.id,
-                    workspace,
-                    user.as_deref(),
-                    Some(&workspace_folder),
-                )
-                .await?;
-                // Same self-healing as the restart path below: a route set
-                // edited in config (renamed host, added port) has no other
-                // moment to reach Caddy, since a running container never takes
-                // that path.
-                register_caddy_routes(workspace, &config);
-                println!("Container '{}' is already running.", container.name);
-                return Ok(());
+                return reuse_running_container(runtime, workspace, &config, container, &mut pill)
+                    .await;
             }
             ContainerState::Stopped if !rebuild && !has_port_overrides => {
+                pill.phase("up: starting container", BUILD_STYLE);
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
                 // Resolved before the gate, not just for the hooks: the probe
@@ -376,6 +369,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 // toolchains get installed and databases get seeded.
                 let features = restart_feature_hooks(&config, &config_path).await?;
                 let hook_log = begin_hook_log(dev_home, workspace, "start");
+                pill.phase("up: running hooks", BUILD_STYLE);
                 run_start_hooks(
                     runtime,
                     &container.id,
@@ -389,6 +383,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 // A plain `dev down` deletes the Caddy fragment but leaves the
                 // container stopped, so restore the routes on restart (issue #52).
                 register_caddy_routes(workspace, &config);
+                pill.succeeded(&format!("Container '{}' started", container.name));
                 println!("Container '{}' started.", container.name);
                 return Ok(());
             }
@@ -403,6 +398,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 if rebuild {
                     eprintln!("Removing existing container '{}'...", container.name);
                 }
+                pill.phase("up: removing container", BUILD_STYLE);
                 if container.state == ContainerState::Running {
                     runtime.stop_container(&container.id).await?;
                 }
@@ -437,7 +433,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                 "devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'"
             )
         })?;
-        ensure_image_present(runtime, image).await?;
+        ensure_image_present(runtime, image, &mut pill).await?;
         image.clone()
     } else if !rebuild && !no_cache && runtime.image_exists(&final_tag).await? {
         // Image already built (e.g. by `dev build`), skip rebuild.
@@ -446,7 +442,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     } else {
         // Determine base image
         let base_image = if let Some(ref image) = config.image {
-            ensure_image_present(runtime, image).await?;
+            ensure_image_present(runtime, image, &mut pill).await?;
             image.clone()
         } else if let Some(ref build) = config.build {
             let context_dir = config_path
@@ -457,6 +453,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             let dockerfile_content = std::fs::read_to_string(&dockerfile_path)?;
             if !has_features {
                 // No features — build directly with the final tag.
+                pill.phase("up: building image", BUILD_STYLE);
                 eprintln!("Building image from Dockerfile...");
                 runtime
                     .build_image(
@@ -470,6 +467,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                     .await?;
                 final_tag.clone()
             } else {
+                pill.phase("up: building image", BUILD_STYLE);
                 eprintln!("Building image from Dockerfile...");
                 runtime
                     .build_image(
@@ -493,6 +491,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         if has_features {
             let mut features = initial_features;
             let original_count = features.len();
+            pill.phase("up: downloading features", BUILD_STYLE);
             eprintln!("Downloading {} feature(s)...", original_count);
             if verbose {
                 for f in &features {
@@ -536,6 +535,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             if verbose {
                 eprintln!("Features Dockerfile:\n{dockerfile}");
             }
+            pill.phase("up: building features", BUILD_STYLE);
             eprintln!("Building features image...");
             let result = runtime
                 .build_image(
@@ -609,6 +609,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     // Optionally build a UID-remapping layer to match host UID/GID.
     let final_image = if uid::should_remap_uid(&config, remote_user, update_remote_user_uid_default)
     {
+        pill.phase("up: remapping uid", BUILD_STYLE);
         let image_meta = runtime.inspect_image_metadata(&final_image).await?;
         let image_user = image_meta.container_user.as_deref().unwrap_or("root");
         uid::build_uid_image(
@@ -702,9 +703,11 @@ pub(crate) async fn run_with_runtime_with_providers(
         );
     }
 
+    pill.phase("up: creating container", BUILD_STYLE);
     eprintln!("Creating container '{name}'...");
     let container_id = runtime.create_container(&container_config).await?;
 
+    pill.phase("up: starting container", BUILD_STYLE);
     eprintln!("Starting container '{name}'...");
     runtime.start_container(&container_id).await?;
     verify_container_usable(
@@ -723,6 +726,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         Some(ordered_features.as_slice())
     };
     let hook_log = begin_hook_log(dev_home, workspace, "create");
+    pill.phase("up: running hooks", BUILD_STYLE);
     run_create_hooks(
         runtime,
         &container_id,
@@ -736,9 +740,11 @@ pub(crate) async fn run_with_runtime_with_providers(
 
     // Clone dotfiles if configured (Gap 15).
     if let Some(ref dotfiles) = config.dotfiles {
+        pill.phase("up: installing dotfiles", BUILD_STYLE);
         install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
 
+    pill.succeeded(&format!("Container '{name}' is ready"));
     println!("Container '{name}' is ready.");
 
     if !caddy_host_ports.is_empty()
@@ -747,6 +753,44 @@ pub(crate) async fn run_with_runtime_with_providers(
         eprintln!("Warning: Caddy setup failed: {e}");
     }
 
+    Ok(())
+}
+
+/// Take an already-running container as it is.
+///
+/// Gated like every other exit that claims readiness. "Already running" is a
+/// readiness claim, and the container reused here may be exactly the one a
+/// previous `dev up` refused: the runtime leaves a container it started but
+/// cannot exec into in the running state, so without the gate the first `dev
+/// up` fails honestly and every later one hands the user a green light for a
+/// container no command can run in.
+async fn reuse_running_container(
+    runtime: &dyn ContainerRuntime,
+    workspace: &Path,
+    config: &DevcontainerConfig,
+    container: &ContainerInfo,
+    pill: &mut StatusGuard,
+) -> anyhow::Result<()> {
+    let user =
+        resolve_remote_user(runtime, &container.image, config.remote_user.as_deref()).await?;
+    let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
+    verify_container_usable(
+        runtime,
+        &container.id,
+        workspace,
+        user.as_deref(),
+        Some(&workspace_folder),
+    )
+    .await?;
+    // Same self-healing as the restart path: a route set edited in config
+    // (renamed host, added port) has no other moment to reach Caddy, since a
+    // running container never takes that path.
+    register_caddy_routes(workspace, config);
+    pill.succeeded(&format!(
+        "Container '{}' is already running",
+        container.name
+    ));
+    println!("Container '{}' is already running.", container.name);
     Ok(())
 }
 
@@ -1422,10 +1466,12 @@ fn apply_cli_overrides(
 pub(crate) async fn ensure_image_present(
     runtime: &dyn ContainerRuntime,
     image: &str,
+    pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     if runtime.image_exists(image).await? {
         eprintln!("Using local image '{image}'...");
     } else {
+        pill.phase("up: pulling image", BUILD_STYLE);
         eprintln!("Pulling image '{image}'...");
         runtime.pull_image(image).await?;
     }
@@ -1569,6 +1615,7 @@ async fn run_compose(
     update_remote_user_uid_default: &str,
     lockfile: &LockfilePolicy,
     dev_home: &DevHome,
+    pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -1617,6 +1664,7 @@ async fn run_compose(
     }
 
     // 2. Always build the service (features need the base image).
+    pill.phase("up: building compose services", BUILD_STYLE);
     eprintln!("Building compose services...");
     crate::runtime::compose::compose_build(
         runtime_name,
@@ -1651,6 +1699,7 @@ async fn run_compose(
     let featured_image = if has_features {
         let mut features = initial_features;
         let original_count = features.len();
+        pill.phase("up: downloading features", BUILD_STYLE);
         eprintln!("Downloading {} feature(s)...", original_count);
         if verbose {
             for f in &features {
@@ -1696,6 +1745,7 @@ async fn run_compose(
         if verbose {
             eprintln!("Features Dockerfile:\n{dockerfile}");
         }
+        pill.phase("up: building features", BUILD_STYLE);
         eprintln!("Building features image...");
         let result = runtime
             .build_image(
@@ -1724,6 +1774,7 @@ async fn run_compose(
     // 6. UID remapping.
     let final_image = if uid::should_remap_uid(config, remote_user, update_remote_user_uid_default)
     {
+        pill.phase("up: remapping uid", BUILD_STYLE);
         let image_meta = runtime
             .inspect_image_metadata(&featured_image)
             .await
@@ -1853,6 +1904,7 @@ async fn run_compose(
     let existed_before = running_before || probe(true).await.is_ok();
     let owed = compose_hooks_owed(running_before, existed_before, rebuild);
 
+    pill.phase("up: starting compose services", BUILD_STYLE);
     eprintln!("Starting compose services...");
     crate::runtime::compose::compose_up(
         runtime_name,
@@ -1886,6 +1938,9 @@ async fn run_compose(
     } else {
         Some(ordered_features.as_slice())
     };
+    if owed != ComposeHooks::None {
+        pill.phase("up: running hooks", BUILD_STYLE);
+    }
     match owed {
         ComposeHooks::Create => {
             let hook_log = begin_hook_log(dev_home, workspace, "create");
@@ -1918,6 +1973,7 @@ async fn run_compose(
 
     // 14. Install dotfiles.
     if let Some(ref dotfiles) = config.dotfiles {
+        pill.phase("up: installing dotfiles", BUILD_STYLE);
         install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
 
@@ -1927,6 +1983,7 @@ async fn run_compose(
         let _ = std::fs::remove_file(p);
     }
 
+    pill.succeeded(&format!("Compose service '{service}' is ready"));
     println!(
         "Compose service '{service}' is ready (container {}).",
         &container_id[..12.min(container_id.len())]
@@ -2342,6 +2399,7 @@ mod tests {
         reject_project_run_args_for_compose, reject_secrets_for_compose,
         reject_secrets_override_for_compose, substitute_mounts,
     };
+    use crate::cmux::{BUILD_KEY, Cmux};
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
     use crate::devcontainer::features::MergedCapabilities;
@@ -2828,7 +2886,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_image_present_skips_pull_when_image_exists() {
         let rt = FakeRuntime::new(true);
-        ensure_image_present(&rt, "localimg:latest")
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        ensure_image_present(&rt, "localimg:latest", &mut pill)
             .await
             .expect("helper should succeed when image exists");
         assert_eq!(
@@ -2843,7 +2902,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_image_present_pulls_when_image_missing() {
         let rt = FakeRuntime::new(false);
-        ensure_image_present(&rt, "remoteimg:latest")
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        ensure_image_present(&rt, "remoteimg:latest", &mut pill)
             .await
             .expect("helper should succeed after pulling");
         assert_eq!(
@@ -2861,7 +2921,8 @@ mod tests {
         let rt = FakeRuntime::new(true);
         // Base-image determination in the build/features branch:
         let image_name = "localimg:latest";
-        ensure_image_present(&rt, image_name)
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        ensure_image_present(&rt, image_name, &mut pill)
             .await
             .expect("helper should succeed when image exists locally");
         assert_eq!(
@@ -3027,6 +3088,10 @@ mod tests {
     struct UpFakeRuntime {
         runtime_name: &'static str,
         image_exists: bool,
+        /// `pull_image` returns `Ok(())` instead of the default `unused()`
+        /// panic, modelling Apple's no-op pull (it pulls inside
+        /// `create_container` instead).
+        pull_is_noop: bool,
         create_fails: bool,
         start_fails: bool,
         discoverable: bool,
@@ -3081,6 +3146,7 @@ mod tests {
             Self {
                 runtime_name: "fake",
                 image_exists: true,
+                pull_is_noop: false,
                 create_fails: false,
                 start_fails: false,
                 discoverable: true,
@@ -3179,6 +3245,17 @@ mod tests {
             Self {
                 create_fails: create,
                 start_fails: start,
+                ..Self::ok()
+            }
+        }
+
+        /// No local image, and a `pull_image` that succeeds without doing
+        /// anything — the shape of Apple's runtime, which pulls inside
+        /// `create_container` instead.
+        fn apple_shaped() -> Self {
+            Self {
+                image_exists: false,
+                pull_is_noop: true,
                 ..Self::ok()
             }
         }
@@ -3303,6 +3380,9 @@ mod tests {
         }
 
         fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
+            if self.pull_is_noop {
+                return Box::pin(async { Ok(()) });
+            }
             // image_exists returns true, so pull_image must never be reached.
             unused()
         }
@@ -3594,6 +3674,7 @@ mod tests {
             /* secrets_file */ secrets_file,
             /* no_base */ true,
             /* secrets_override */ secrets_override,
+            &Cmux::recording().0,
         )
         .await
     }
@@ -3659,8 +3740,239 @@ mod tests {
             /* secrets_override */ secrets_override,
             providers,
             &DevHome::at(dev_home_dir.path()),
+            &Cmux::recording().0,
         )
         .await
+    }
+
+    /// [`run_up_with_providers_and_flags`] with a caller-supplied `Cmux`
+    /// handle, so a cmux test can hold onto the matching `Recorder` and read
+    /// it back after the run (and its `StatusGuard`) have dropped.
+    async fn run_up_with_cmux(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        cmux: &Cmux,
+    ) -> anyhow::Result<()> {
+        let dev_home_dir = TempDir::new().unwrap();
+        let providers = ProviderRegistry::with_builtins(workspace.path());
+        super::run_with_runtime_with_providers(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* secrets_file */ None,
+            /* no_base */ true,
+            /* secrets_override */ None,
+            &providers,
+            &DevHome::at(dev_home_dir.path()),
+            cmux,
+        )
+        .await
+    }
+
+    // ---- build phase pills (cmux `dev_build` status key) ----
+
+    /// The happy path sets both the creating and starting phases, in order,
+    /// and the guard's `Drop` clears the key on the tail `Ok(())` — no manual
+    /// clear call exists to fall back on.
+    #[tokio::test]
+    async fn up_sets_build_phases_and_clears_on_success() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","cmux":{"status":true}}"#,
+        );
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect("run should succeed");
+
+        let calls = recorder.calls();
+        let creating = calls.iter().position(|c| {
+            c.get(1).map(String::as_str) == Some(BUILD_KEY)
+                && c.get(2).map(String::as_str) == Some("up: creating container")
+        });
+        let starting = calls.iter().position(|c| {
+            c.get(1).map(String::as_str) == Some(BUILD_KEY)
+                && c.get(2).map(String::as_str) == Some("up: starting container")
+        });
+        assert!(
+            creating.is_some() && starting.is_some(),
+            "expected both creating and starting phases, got: {calls:?}"
+        );
+        assert!(
+            creating < starting,
+            "creating container must be reported before starting it: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&vec!["clear-status".to_string(), BUILD_KEY.to_string()]),
+            "last call must be the Drop-driven clear: {calls:?}"
+        );
+    }
+
+    /// `create_container` fails, unwinding through the `?` at the create
+    /// call site — there is no explicit clear on that path, so this only
+    /// passes if `Drop` runs the clear.
+    #[tokio::test]
+    async fn up_clears_build_pill_on_error() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","cmux":{"status":true}}"#,
+        );
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::failing(true, false);
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect_err("create_container failure must surface as an error");
+
+        let calls = recorder.calls();
+        assert_eq!(
+            calls.last(),
+            Some(&vec!["clear-status".to_string(), BUILD_KEY.to_string()]),
+            "the guard must still clear on the error exit: {calls:?}"
+        );
+    }
+
+    /// No `cmux` key at all means the gate reads false, not true.
+    #[tokio::test]
+    async fn up_without_cmux_key_makes_no_calls() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect("run should succeed");
+
+        assert!(
+            recorder.calls().is_empty(),
+            "no cmux call should be made without the config key: {:?}",
+            recorder.calls()
+        );
+    }
+
+    /// An explicit `"status": false` must gate off exactly like an absent key.
+    #[tokio::test]
+    async fn up_with_status_false_makes_no_calls() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","cmux":{"status":false}}"#,
+        );
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect("run should succeed");
+
+        assert!(
+            recorder.calls().is_empty(),
+            "the key's presence alone must not enable the pill: {:?}",
+            recorder.calls()
+        );
+    }
+
+    /// Apple's `pull_image` is a no-op, but the pull phase must still be
+    /// replaced by the next phase (and eventually cleared) rather than left
+    /// stuck on "pulling" forever.
+    #[tokio::test]
+    async fn noop_pull_does_not_leave_pull_pill() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","cmux":{"status":true}}"#,
+        );
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::apple_shaped();
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect("run should succeed");
+
+        let calls = recorder.calls();
+        let pulling = calls.iter().position(|c| {
+            c.get(1).map(String::as_str) == Some(BUILD_KEY)
+                && c.get(2).map(String::as_str) == Some("up: pulling image")
+        });
+        let creating = calls.iter().position(|c| {
+            c.get(1).map(String::as_str) == Some(BUILD_KEY)
+                && c.get(2).map(String::as_str) == Some("up: creating container")
+        });
+        assert!(
+            pulling.is_some() && creating.is_some(),
+            "expected both a pull and a create phase, got: {calls:?}"
+        );
+        assert!(
+            pulling < creating,
+            "pulling must be reported before creating: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&vec!["clear-status".to_string(), BUILD_KEY.to_string()]),
+            "the pill must still clear, not stay stuck on pulling: {calls:?}"
+        );
+    }
+
+    /// A reuse that ran long enough to notify must report what happened.
+    /// Without a recorded outcome the guard falls back to a body of "failed",
+    /// so a slow but successful `dev up` would tell the user it failed.
+    #[tokio::test]
+    async fn reusing_a_running_container_records_its_success() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        let container = rt.containers.lock().unwrap()[0].clone();
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let (cmux, recorder) = Cmux::recording();
+        let mut pill = cmux
+            .guard(BUILD_KEY, true)
+            .notify_after("dev up", std::time::Duration::ZERO);
+
+        super::reuse_running_container(&rt, workspace.path(), &config, &container, &mut pill)
+            .await
+            .expect("a running container that runs commands must be reused");
+        drop(pill);
+
+        assert_eq!(
+            recorder.calls().last(),
+            Some(&vec![
+                "notify".to_string(),
+                "--title".to_string(),
+                "dev up".to_string(),
+                "--body".to_string(),
+                "Container 'already-running' is already running".to_string(),
+            ])
+        );
+    }
+
+    /// A run that finishes well under `NOTIFY_AFTER` sends no notification.
+    #[tokio::test]
+    async fn up_does_not_notify_under_threshold() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","cmux":{"status":true}}"#,
+        );
+        let (cmux, recorder) = Cmux::recording();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_cmux(&rt, &workspace, &cmux)
+            .await
+            .expect("run should succeed");
+
+        let calls = recorder.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("notify")),
+            "a fast run must not notify: {calls:?}"
+        );
     }
 
     /// A failed `create_container` must propagate as an error from `dev up` —

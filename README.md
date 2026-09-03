@@ -51,7 +51,8 @@ byte for byte, and a path that does not exist on the machine running `dev` is le
 ssh, cmux uploads the file to the server first and pastes the server path, which `dev shell`
 running there then carries into the container. Shift+Enter is rewritten the same way, into a
 plain carriage return, since containers don't always understand the escape sequence terminals
-send for it.
+send for it. cmux also gets a sidebar integration of its own, described in
+[cmux status pills](#cmux-status-pills) below.
 
 To run a one-off command instead of an interactive shell:
 
@@ -193,7 +194,7 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
 | Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
-| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy` |
+| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy`, `cmux` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
@@ -563,6 +564,71 @@ container, so the image needs `nc`, `ncat`, or `netcat` installed.
 | --------------------------------- | --------------------------------------- |
 | `~/.dev/caddy/Caddyfile`          | Root config, imports all site fragments |
 | `~/.dev/caddy/sites/<name>.caddy` | Per-project fragment, managed by `dev`  |
+
+## cmux status pills
+
+When `dev` runs inside a [cmux](https://cmux.dev) terminal and the `cmux.status` key is on,
+`dev up`, `dev build`, and `dev down` show their current phase in the workspace sidebar, and
+`dev shell` shows which workspace a shell is attached to. Outside cmux, or with the key off,
+nothing changes.
+
+### Turning it on
+
+The key is off unless a layer turns it on. Both `status` and `agent` default to `false`.
+
+```jsonc
+// ~/.dev/base/devcontainer.json
+{
+  "cmux": {
+    "status": true
+  }
+}
+```
+
+This is the natural place to turn it on, since the base layer applies to every project (see
+[Base config](#base-config)); `cmux` isn't editable through `dev base config set`/`add`, so
+open the file with `dev base edit` and add the key by hand.
+
+A project can override just one sub-key:
+
+```jsonc
+// .devcontainer/devcontainer.json
+{
+  "cmux": {
+    "status": false
+  }
+}
+```
+
+`cmux` merges per sub-key across layers, the same way `caddy` and `remoteEnv` do, so a
+project that names only `status` keeps whatever the base layer set for `agent`. `dev config
+explain` reports the origin of each sub-key; look for a line shaped like
+`cmux.status = false  <- project`. Like `caddy`, `cmux` is a dev extension, not part of the
+devcontainer spec, and VS Code and the reference CLI ignore it.
+
+### What the pills show
+
+`dev up`, `dev build`, and `dev down` all set the same build pill and update it as the
+command moves through its phases: pulling or building the image, downloading and building
+features, creating and starting the container (or building and starting compose services),
+and, under `dev down`, stopping and removing it. The pill clears when the command exits, on
+every path including an error, so a failed run never leaves a stale phase on screen.
+
+`dev shell` sets a separate session pill naming the workspace folder and the runtime, and
+how many shells are open on it, for example `myapp · docker` for one session or `3 shells ·
+myapp · docker` once a second and third are opened. The count comes from the live session
+list, so it stays right as shells open and close; `dev exec` runs one-off commands and sets
+no pill.
+If a shell's process is killed before it can clear its own pill, the next `dev status` on
+that workspace recomputes the live count and repaints or clears the pill to match.
+
+A pill only appears when `CMUX_SURFACE_ID` is set, the way cmux marks its own terminals; a
+missing or unreachable cmux install never prints a warning, so turning the key on in a base
+config is safe even in CI and other terminals that never set it.
+
+`cmux.agent` is accepted and merged, but nothing reads it yet: setting it has no effect
+today. The cmux CLI in the app bundle can't run inside a Linux container, and the relay a
+container-side agent would need to reach cmux is still being worked out.
 
 ## Command reference
 

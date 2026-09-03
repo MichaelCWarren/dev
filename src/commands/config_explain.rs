@@ -310,6 +310,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explain_reports_cmux_sub_key_origins() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        write(&dev_home.base_config(), r#"{"cmux": {"status": true}}"#);
+        write(
+            &workspace.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:24.04", "cmux": {"agent": false}}"#,
+        );
+
+        let report = explain(&dev_home, workspace.path(), "docker", true).unwrap();
+
+        assert_eq!(report.origins["cmux.status"], LayerId::Base);
+        assert_eq!(report.origins["cmux.agent"], LayerId::Project);
+        assert_eq!(report.config["cmux"]["status"], true);
+    }
+
     /// A base-layer selector losing to the project's is reported as dropped,
     /// not silently absent.
     #[test]

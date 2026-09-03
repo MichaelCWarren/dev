@@ -75,6 +75,12 @@
   which is what lets cmux's ssh upload chain into it. A new runtime's interactive path goes
   through `relay_terminal` and implements `SessionPeer`; nothing hands the host's tty
   descriptors to a runtime any more.
+- cmux status is opt-in via the `cmux` config key (`cmux.status`, a `MAP_FIELDS` entry), also
+  gated on `CMUX_SURFACE_ID`; without both, output is unchanged. `src/cmux.rs` is the
+  module, `StatusGuard` clears the pill on drop. cmux's CLI is Mach-O, so no container-side
+  agent is tracked; `cmux.agent` does nothing yet. cmux ships `cmuxd-remote-linux-<arch>` as
+  a release asset, but it needs a relay token handshake `dev` doesn't own. See
+  `.workflow/cmux-integration/blueprint/agent-relay-findings.md`.
 
 ## Maintaining this file
 

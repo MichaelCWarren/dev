@@ -159,6 +159,7 @@ mod tests {
             caddy: None,
             update_remote_user_uid: update_uid,
             dotfiles: None,
+            cmux: None,
         }
     }
 
