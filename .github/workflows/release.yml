@@ -47,8 +47,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Commit messages are read with git rather than interpolated through
-          # ${{ }}, so a crafted subject cannot break out into this shell.
+          # Commit messages are read with git rather than through expression
+          # interpolation, so a crafted subject cannot break out into this
+          # shell. Note that Actions expands expressions inside run blocks,
+          # comments included, so an empty one here is a parse error.
           last_tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
           if [ -n "$last_tag" ]; then
             base=${last_tag#v}
