@@ -2,7 +2,14 @@
 pub mod apple;
 pub mod compose;
 pub mod docker;
+#[cfg(test)]
+pub(crate) mod fake_daemon;
+pub mod paste_bridge;
 pub mod podman;
+pub mod terminal_input;
+pub mod terminal_relay;
+#[cfg(test)]
+pub(crate) mod test_peer;
 
 use crate::error::DevError;
 use std::collections::HashMap;

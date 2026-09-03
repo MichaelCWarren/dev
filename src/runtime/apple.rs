@@ -12,9 +12,14 @@ use apple_container::models::{
 
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
+use crate::runtime::paste_bridge;
+use crate::runtime::terminal_relay::{
+    HostTerminal, Pty, RawModeGuard, SessionPeer, StdinReader, UnitFut, drain_remaining_output,
+    relay_terminal,
+};
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, WorkspaceMount, env_assignments, terminal_size,
+    ExecResult, ImageMetadata, WorkspaceMount, env_assignments,
 };
 
 /// What a container's own processes run with.
@@ -137,23 +142,14 @@ impl AppleRuntime {
         let defaults = self.container_process_defaults(id).await;
         let proc_config = exec_process_config(cmd, user, true, &defaults, workdir, env);
 
+        // Opened before raw mode too, so an `openpty` failure prints on a
+        // cooked terminal.
+        let mut pty = Pty::open()?;
         let _raw_guard = RawModeGuard::enter()?;
         let process_id = next_process_id("exec-interactive");
 
-        // Hand the real terminal descriptors to the daemon; it drives the pty.
-        // Apple's daemon rejects a separate stderr fd when `terminal=true`, so
-        // the interactive path omits stderr (stdin/stdout remain).
-        self.client
-            .create_process(
-                id,
-                &process_id,
-                &proc_config,
-                std::io::stdin().as_raw_fd(),
-                std::io::stdout().as_raw_fd(),
-                None,
-            )
-            .await
-            .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
+        self.create_terminal_process(id, &process_id, &proc_config, &mut pty)
+            .await?;
 
         // Registered before the start for the same reason a captured exec does
         // it: see `start_with_registered_exit_wait`.
@@ -176,26 +172,58 @@ impl AppleRuntime {
             return Err(e);
         }
 
-        self.resize_to_terminal(id, &process_id).await;
+        let mut stdin = StdinReader::spawn()?;
+        let mut host = HostTerminal::for_process(stdin.chunks())?;
+
         let exit_code = self
-            .attend_interactive_process(id, &process_id, exit_wait)
+            .attend_interactive_process(id, &process_id, exit_wait, &mut host, pty, user, &defaults)
             .await?;
 
         // _raw_guard is dropped here, restoring the terminal.
         Ok(exit_code)
     }
 
-    /// Forward window-size changes and signals until the process exits.
+    /// Hand the pty's slave to the daemon as both the terminal's stdin and
+    /// stdout descriptor, then drop this process's copy of it.
     ///
-    /// The daemon copies terminal bytes itself, so the only host-side work left
-    /// is keeping the guest pty's window size in sync and relaying signals
-    /// aimed at this CLI (the raw-mode terminal delivers Ctrl-C to the guest as
-    /// a byte, not as a host SIGINT).
+    /// The daemon's XPC call keeps its own copy of the slave open until the
+    /// process exits; holding ours too would mean the master never sees that
+    /// exit as EOF. Apple's daemon also rejects a separate stderr fd when
+    /// `terminal=true`, so stderr stays `None` and arrives on the pty instead.
+    async fn create_terminal_process(
+        &self,
+        id: &str,
+        process_id: &str,
+        proc_config: &ProcessConfiguration,
+        pty: &mut Pty,
+    ) -> Result<(), DevError> {
+        let slave = pty
+            .take_slave()
+            .expect("the pty's slave is still held immediately after open");
+        let slave_fd = slave.as_raw_fd();
+        self.client
+            .create_process(id, process_id, proc_config, slave_fd, slave_fd, None)
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
+        drop(slave);
+        Ok(())
+    }
+
+    /// Relay terminal bytes and forward signals until the process exits.
+    ///
+    /// `dev` owns the pty and copies bytes on it through `relay_terminal`, so
+    /// the only other host-side work is relaying signals aimed at this CLI
+    /// (the raw-mode terminal delivers Ctrl-C to the guest as a byte, not a
+    /// host SIGINT).
     async fn attend_interactive_process<W>(
         &self,
         id: &str,
         process_id: &str,
         mut wait: std::pin::Pin<&mut W>,
+        host: &mut HostTerminal<'_, tokio::io::Stdout>,
+        pty: Pty,
+        user: Option<&str>,
+        defaults: &ProcessDefaults,
     ) -> Result<i32, DevError>
     where
         W: std::future::Future<Output = Result<i32, AppleContainerError>>,
@@ -205,26 +233,63 @@ impl AppleRuntime {
         let watch = |kind: SignalKind, name: &str| {
             signal(kind).map_err(|e| DevError::Runtime(format!("watch {name}: {e}")))
         };
-        let mut window_change = watch(SignalKind::window_change(), "SIGWINCH")?;
         let mut interrupt = watch(SignalKind::interrupt(), "SIGINT")?;
         let mut terminate = watch(SignalKind::terminate(), "SIGTERM")?;
 
-        loop {
-            tokio::select! {
-                exited = &mut wait => {
-                    return exited.map_err(|e| {
-                        DevError::Runtime(format!("exec_interactive wait failed: {e}"))
-                    });
-                }
-                _ = window_change.recv() => self.resize_to_terminal(id, process_id).await,
-                _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
-                // A SIGTERM aimed at `dev` must also end `dev`.
-                _ = terminate.recv() => {
-                    self.forward_signal(id, process_id, libc::SIGTERM).await;
-                    return self.stop_attending(id, process_id, wait).await;
+        // `pty`, `peer` and `relay` live in this block so a relay-ends-first
+        // exit drops every local handle to the pty master — this struct's own
+        // handle plus the two `pty.master()` clones `relay` holds — before
+        // `stop_attending`'s grace period starts. The master fd is reference
+        // counted, so dropping only one holder would leave it open and give
+        // the guest process neither EOF nor a hangup on the pty it still
+        // thinks it owns.
+        {
+            let pty = pty;
+            let peer = AppleSessionPeer {
+                client: &self.client,
+                container: id,
+                process_id,
+                pty: &pty,
+                user,
+                defaults,
+            };
+            // `relay_terminal` sends the initial resize itself and owns the
+            // pty's input side, so no separate resize call is needed here.
+            let relay = relay_terminal(host, pty.master(), pty.master(), &peer);
+            tokio::pin!(relay);
+
+            loop {
+                tokio::select! {
+                    exited = &mut wait => {
+                        // The shell wrote its last line and exited in the same
+                        // poll the relay would have read it in; that output
+                        // must not be dropped along with the pty this block
+                        // is about to close out.
+                        drain_remaining_output(&mut pty.master()).await;
+                        return exited.map_err(|e| {
+                            DevError::Runtime(format!("exec_interactive wait failed: {e}"))
+                        });
+                    }
+                    relay_result = &mut relay => {
+                        // The process either already exited (the wait answers at
+                        // once) or has lost its terminal; either way `dev`'s exit
+                        // code comes from the wait, never from the relay result.
+                        if let Err(e) = relay_result {
+                            eprint!("\r\nWarning: terminal relay ended: {e}\r\n");
+                        }
+                        break;
+                    }
+                    _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
+                    // A SIGTERM aimed at `dev` must also end `dev`.
+                    _ = terminate.recv() => {
+                        self.forward_signal(id, process_id, libc::SIGTERM).await;
+                        return self.stop_attending(id, process_id, wait).await;
+                    }
                 }
             }
         }
+
+        self.stop_attending(id, process_id, wait).await
     }
 
     /// How long a signalled process has to exit before this stops waiting.
@@ -258,21 +323,6 @@ impl AppleRuntime {
         }
     }
 
-    /// Best-effort sync of the guest pty's window size with the host terminal.
-    async fn resize_to_terminal(&self, id: &str, process_id: &str) {
-        let Some((columns, rows)) = terminal_size() else {
-            return;
-        };
-        if let Err(e) = self
-            .client
-            .resize_process(id, process_id, columns, rows)
-            .await
-        {
-            // Written with CRLF: the terminal is in raw mode here.
-            eprint!("\r\nWarning: could not resize container terminal: {e}\r\n");
-        }
-    }
-
     /// Best-effort relay of a host signal to the process inside the container.
     async fn forward_signal(&self, id: &str, process_id: &str, signal: i32) {
         if let Err(e) = self.client.kill_process(id, process_id, signal).await {
@@ -298,6 +348,75 @@ impl AppleRuntime {
             }
         }
         None
+    }
+}
+
+/// The [`SessionPeer`] a `dev shell` exec binds `relay_terminal` to: resize
+/// keeps both the dev-owned pty and the guest's pty in sync, and `copy_in`
+/// streams a paste's bytes into the container through a one-off, non-terminal
+/// exec running as the session user.
+///
+/// Holds only borrows, because `AppleContainerClient` is not `Clone`.
+struct AppleSessionPeer<'a> {
+    client: &'a AppleContainerClient,
+    container: &'a str,
+    process_id: &'a str,
+    pty: &'a Pty,
+    user: Option<&'a str>,
+    defaults: &'a ProcessDefaults,
+}
+
+impl SessionPeer for AppleSessionPeer<'_> {
+    fn resize(&self, cols: u16, rows: u16) -> UnitFut<'_> {
+        Box::pin(resize_terminal(
+            self.client,
+            self.container,
+            self.process_id,
+            self.pty,
+            cols,
+            rows,
+        ))
+    }
+
+    fn copy_in<'a>(&'a self, bytes: Vec<u8>, target: &'a str) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let proc_config = exec_process_config(
+                &paste_bridge::receive_file_command(target),
+                self.user,
+                false,
+                self.defaults,
+                None,
+                &[],
+            );
+            let result =
+                run_captured_process_with_input(self.client, self.container, &proc_config, bytes)
+                    .await?;
+            match result.exit_code {
+                0 => Ok(()),
+                code => Err(DevError::Runtime(format!(
+                    "exit {code}: {}",
+                    result.stderr.trim()
+                ))),
+            }
+        })
+    }
+}
+
+/// Set the dev-owned pty's window size and ask the daemon to match it on the
+/// guest side. Both are best-effort: a resize failure does not end the
+/// session.
+async fn resize_terminal(
+    client: &AppleContainerClient,
+    id: &str,
+    process_id: &str,
+    pty: &Pty,
+    cols: u16,
+    rows: u16,
+) {
+    let _ = pty.resize(cols, rows);
+    if let Err(e) = client.resize_process(id, process_id, cols, rows).await {
+        // Written with CRLF: the terminal is in raw mode here.
+        eprint!("\r\nWarning: could not resize container terminal: {e}\r\n");
     }
 }
 
@@ -442,36 +561,6 @@ fn read_local_image_config(image: &ImageDescription) -> Option<CachedImageConfig
     let config_json =
         apple_container::content::read_image_config(&image.descriptor.digest, "linux", "arm64")?;
     Some(CachedImageConfig::from_oci_config(&config_json))
-}
-
-/// RAII guard that puts the terminal into raw mode and restores it on drop.
-struct RawModeGuard {
-    original: libc::termios,
-    fd: i32,
-}
-
-impl RawModeGuard {
-    fn enter() -> Result<Self, DevError> {
-        let fd = std::io::stdin().as_raw_fd();
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err(DevError::Runtime(
-                "Failed to get terminal attributes".into(),
-            ));
-        }
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return Err(DevError::Runtime("Failed to set raw mode".into()));
-        }
-        Ok(Self { original, fd })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
 }
 
 /// Serial number making every exec process identifier unique within this process.
@@ -886,11 +975,27 @@ fn is_missing_command_failure(message: &str) -> bool {
         .is_some_and(|(_, detail)| detail.contains(NO_SUCH_EXECUTABLE))
 }
 
-/// Create, start, and wait for one process, capturing its output.
+/// Create, start, and wait for one process, capturing its output. Stdin is
+/// closed immediately, giving the process EOF on it right away; see
+/// [`run_captured_process_with_input`] for the copy-in path that feeds it
+/// a payload instead.
 async fn run_captured_process(
     daemon: &dyn ExecDaemon,
     id: &str,
     proc_config: &ProcessConfiguration,
+) -> Result<ExecResult, DevError> {
+    run_captured_process_with_input(daemon, id, proc_config, Vec::new()).await
+}
+
+/// Create, start, and wait for one process, capturing its output and feeding
+/// `stdin_payload` to it. An empty payload behaves byte-for-byte like the
+/// unfed path: both stdin ends drop right after `create_process`, before the
+/// readers start and before the wait is registered.
+async fn run_captured_process_with_input(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    proc_config: &ProcessConfiguration,
+    stdin_payload: Vec<u8>,
 ) -> Result<ExecResult, DevError> {
     let (stdin_read, stdin_write) = exec_pipe()?;
     let (stdout_read, stdout_write) = exec_pipe()?;
@@ -911,17 +1016,16 @@ async fn run_captured_process(
         .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
 
     // The daemon holds its own copies of all three descriptors now. Closing
-    // ours gives the process EOF on stdin — nothing writes to it, so a
-    // command that reads stdin would otherwise block forever — and lets the
-    // readers below see EOF once the process exits.
-    drop(stdin_write);
-    drop(stdin_read);
+    // ours lets the readers below see EOF once the process exits.
     drop(stdout_write);
     drop(stderr_write);
-
-    // Drained from here on, so a process that fills a pipe buffer can still
-    // reach its exit.
-    let output = OutputReaders::draining(stdout_read, stderr_read)?;
+    let output = ready_output_readers(
+        stdin_read,
+        stdin_write,
+        stdout_read,
+        stderr_read,
+        stdin_payload,
+    )?;
 
     let (issued, on_the_wire) = tokio::sync::oneshot::channel();
     let exit_wait = daemon.wait_process(id, &process_id, issued);
@@ -956,6 +1060,29 @@ async fn run_captured_process(
     })
 }
 
+/// Decide what happens to the stdin pipe and start draining the output pipes.
+///
+/// Drained from here on either way, so a process that fills a pipe buffer can
+/// still reach its exit. An empty payload gives the process EOF on stdin
+/// right away — nothing writes to it, so a command that reads stdin would
+/// otherwise block forever. A non-empty payload keeps the write end alive in
+/// a task the caller can abort, so the start never races a truncated write.
+fn ready_output_readers(
+    stdin_read: os_pipe::PipeReader,
+    stdin_write: os_pipe::PipeWriter,
+    stdout_read: os_pipe::PipeReader,
+    stderr_read: os_pipe::PipeReader,
+    stdin_payload: Vec<u8>,
+) -> Result<OutputReaders, DevError> {
+    drop(stdin_read);
+    if stdin_payload.is_empty() {
+        drop(stdin_write);
+        OutputReaders::draining(stdout_read, stderr_read)
+    } else {
+        OutputReaders::feeding(stdout_read, stderr_read, stdin_write, stdin_payload)
+    }
+}
+
 /// Give up on a process whose exec failed, releasing what it still holds.
 ///
 /// Both halves matter. The exit wait is already registered with the daemon, so
@@ -974,10 +1101,12 @@ async fn abandon_process(
     output.released().await;
 }
 
-/// The pair of readers draining one captured exec's output.
+/// The readers (and, when a payload is being fed, the writer) of one captured
+/// exec's stdio.
 struct OutputReaders {
     stdout: tokio::task::JoinHandle<std::io::Result<String>>,
     stderr: tokio::task::JoinHandle<std::io::Result<String>>,
+    stdin: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
 impl OutputReaders {
@@ -988,11 +1117,36 @@ impl OutputReaders {
         Ok(Self {
             stdout: read_pipe(stdout, "stdout")?,
             stderr: read_pipe(stderr, "stderr")?,
+            stdin: None,
+        })
+    }
+
+    /// Like `draining`, but also feeds `payload` into `stdin_write` on a
+    /// task that can be aborted; see `write_pipe`.
+    fn feeding(
+        stdout: os_pipe::PipeReader,
+        stderr: os_pipe::PipeReader,
+        stdin_write: os_pipe::PipeWriter,
+        payload: Vec<u8>,
+    ) -> Result<Self, DevError> {
+        Ok(Self {
+            stdout: read_pipe(stdout, "stdout")?,
+            stderr: read_pipe(stderr, "stderr")?,
+            stdin: Some(write_pipe(stdin_write, payload)?),
         })
     }
 
     /// What both readers read, once each has reached EOF.
+    ///
+    /// The writer, if any, is aborted rather than awaited: once the exit
+    /// wait has resolved, the process has either drained the payload to EOF
+    /// (needed for it to exit 0) or failed before reading it all, and in the
+    /// latter case the writer may be parked on a pipe the daemon still holds.
     async fn collected(self) -> Result<(String, String), DevError> {
+        if let Some(stdin) = self.stdin {
+            stdin.abort();
+            let _ = stdin.await;
+        }
         let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
         Ok((
             finish_read(stdout, "stdout")?,
@@ -1000,11 +1154,17 @@ impl OutputReaders {
         ))
     }
 
-    /// Cancel both readers and wait for them to let go of the pipes.
+    /// Cancel every task and wait for them to let go of the pipes.
     async fn released(self) {
         self.stdout.abort();
         self.stderr.abort();
+        if let Some(stdin) = &self.stdin {
+            stdin.abort();
+        }
         let _ = tokio::join!(self.stdout, self.stderr);
+        if let Some(stdin) = self.stdin {
+            let _ = stdin.await;
+        }
     }
 }
 
@@ -1035,6 +1195,28 @@ fn read_pipe(
     }))
 }
 
+/// Feed `payload` into `writer` on a task that can be cancelled, dropping the
+/// sender once every byte is written.
+///
+/// Dropping is what closes the pipe's last write end and gives the reading
+/// process its EOF; a payload larger than the pipe buffer cannot be written
+/// until the process reads, so this has to run on the reactor rather than
+/// block a thread — the same argument `read_pipe` makes, in reverse: a
+/// blocking writer parked on a pipe a refused-start process never reads would
+/// outlive the command, and the tokio runtime waits for the blocking pool as
+/// it shuts down.
+fn write_pipe(
+    writer: os_pipe::PipeWriter,
+    payload: Vec<u8>,
+) -> Result<tokio::task::JoinHandle<std::io::Result<()>>, DevError> {
+    let mut writer = tokio::net::unix::pipe::Sender::from_owned_fd(writer.into())
+        .map_err(|e| DevError::Runtime(format!("watch stdin: {e}")))?;
+    Ok(tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        writer.write_all(&payload).await
+    }))
+}
+
 /// Unwrap the two error layers a [`read_pipe`] task can fail with.
 fn finish_read(
     joined: Result<std::io::Result<String>, tokio::task::JoinError>,
@@ -1043,33 +1225,6 @@ fn finish_read(
     joined
         .map_err(|e| DevError::Runtime(format!("{stream} reader join: {e}")))?
         .map_err(|e| DevError::Runtime(format!("read {stream}: {e}")))
-}
-
-/// Translate Shift+Enter escape sequences into a plain carriage return.
-#[allow(dead_code)]
-fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
-    const CSI_U: &[u8] = b"\x1b[13;2u";
-    const XTERM: &[u8] = b"\x1b[27;2;13~";
-
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == 0x1b {
-            if input[i..].starts_with(CSI_U) {
-                out.push(b'\r');
-                i += CSI_U.len();
-                continue;
-            }
-            if input[i..].starts_with(XTERM) {
-                out.push(b'\r');
-                i += XTERM.len();
-                continue;
-            }
-        }
-        out.push(input[i]);
-        i += 1;
-    }
-    out
 }
 
 /// Convert our generic ContainerConfig to the Apple Containers configuration.
@@ -1681,7 +1836,7 @@ mod tests {
     /// and the caller's closes are observable exactly as they are in
     /// production.
     struct HeldStdio {
-        stdin: OwnedFd,
+        stdin: Option<OwnedFd>,
         stdout: Option<OwnedFd>,
         stderr: Option<OwnedFd>,
     }
@@ -1715,6 +1870,13 @@ mod tests {
         started: AtomicBool,
         /// Set once `start_process` has run the process to completion.
         exited: AtomicBool,
+        /// When set, `start_process` reads the held stdin to EOF into
+        /// `stdin_received` instead of `wait_process` sampling it with
+        /// `pipe_is_at_eof` — a fed payload cannot go through that probe
+        /// without losing a byte of it. See `fed_through_stdin`.
+        consumes_stdin: bool,
+        /// What `start_process` read from stdin, when `consumes_stdin` is set.
+        stdin_received: Mutex<Vec<u8>>,
     }
 
     fn dup_fd(fd: RawFd) -> OwnedFd {
@@ -1838,6 +2000,59 @@ mod tests {
             }
         }
 
+        /// Reads its stdin to EOF in `start_process` and reports `exit_code`,
+        /// instead of dropping stdin the way an unfed exec does.
+        fn fed_through_stdin(exit_code: i32) -> Self {
+            Self {
+                consumes_stdin: true,
+                exit_code,
+                ..Self::default()
+            }
+        }
+
+        /// Like `fed_through_stdin`, but the start is refused: the writer task
+        /// is left holding a payload nothing will ever read.
+        fn refusing_the_start_while_fed(reason: &'static str) -> Self {
+            Self {
+                consumes_stdin: true,
+                start_refusal: Some(reason),
+                ..Self::default()
+            }
+        }
+
+        /// Whether the writer's end of the held stdin has been closed.
+        ///
+        /// For a process the daemon refused to start, nothing runs to
+        /// consume the payload; the only way this reports EOF is if the
+        /// writer's own end was aborted and dropped.
+        fn stdin_drained_to_eof(&self) -> bool {
+            let stdin_fd = {
+                let held = self.held.lock().unwrap();
+                held.as_ref()
+                    .and_then(|h| h.stdin.as_ref())
+                    .map(AsRawFd::as_raw_fd)
+            };
+            let Some(fd) = stdin_fd else {
+                return true;
+            };
+            let mut buf = [0u8; 4096];
+            loop {
+                let mut watch = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut watch, 1, 2_000) } <= 0 {
+                    return false;
+                }
+                match unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } {
+                    0 => return true,
+                    n if n < 0 => return false,
+                    _ => continue,
+                }
+            }
+        }
+
         fn record(&self, call: &'static str) {
             self.calls.lock().unwrap().push(call);
         }
@@ -1891,7 +2106,7 @@ mod tests {
             self.created_stderr
                 .store(stderr.is_some(), Ordering::SeqCst);
             *self.held.lock().unwrap() = Some(HeldStdio {
-                stdin: dup_fd(stdin),
+                stdin: Some(dup_fd(stdin)),
                 stdout: Some(dup_fd(stdout)),
                 stderr: stderr.map(dup_fd),
             });
@@ -1910,6 +2125,24 @@ mod tests {
                 self.record("start");
                 if let Some(reason) = self.start_refusal {
                     return Err(AppleContainerError::XpcError(reason.to_string()));
+                }
+                if self.consumes_stdin {
+                    let stdin_fd = {
+                        let mut held = self.held.lock().unwrap();
+                        held.as_mut().expect("start without create").stdin.take()
+                    };
+                    if let Some(stdin_fd) = stdin_fd {
+                        // Async, not a blocking loop: on the current-thread
+                        // test runtime a blocking read here would starve the
+                        // writer task it is waiting on.
+                        let mut reader = tokio::net::unix::pipe::Receiver::from_owned_fd(stdin_fd)
+                            .expect("fake daemon must be able to watch its held stdin");
+                        let mut received = Vec::new();
+                        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut received)
+                            .await
+                            .expect("fake daemon stdin read");
+                        *self.stdin_received.lock().unwrap() = received;
+                    }
                 }
                 {
                     let held = self.held.lock().unwrap();
@@ -1956,12 +2189,18 @@ mod tests {
                 // the caller is told the request is on its way.
                 self.record("wait");
                 let _ = issued.send(());
-                let at_eof = {
-                    let held = self.held.lock().unwrap();
-                    let held = held.as_ref().expect("wait without create");
-                    pipe_is_at_eof(held.stdin.as_raw_fd())
-                };
-                self.stdin_reached_eof.store(at_eof, Ordering::Relaxed);
+                // A fed payload takes this probe's one byte and reports
+                // "not at EOF" while it is still in flight; `start_process`
+                // reads the held stdin to completion for that case instead.
+                if !self.consumes_stdin {
+                    let at_eof = {
+                        let held = self.held.lock().unwrap();
+                        let held = held.as_ref().expect("wait without create");
+                        let stdin = held.stdin.as_ref().expect("stdin held for the unfed path");
+                        pipe_is_at_eof(stdin.as_raw_fd())
+                    };
+                    self.stdin_reached_eof.store(at_eof, Ordering::Relaxed);
+                }
                 if self.wait_fails {
                     return Err(AppleContainerError::XpcError("wait refused".to_string()));
                 }
@@ -2037,6 +2276,20 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             run_captured_process(daemon, "cid", &exec_config()),
+        )
+        .await
+        .expect("exec must report the process's exit instead of hanging")
+    }
+
+    /// Run one fed captured exec, turning a hang into a failure exactly like
+    /// `bounded_exec`.
+    async fn bounded_fed_exec(
+        daemon: &FakeExecDaemon,
+        payload: Vec<u8>,
+    ) -> Result<ExecResult, DevError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_captured_process_with_input(daemon, "cid", &exec_config(), payload),
         )
         .await
         .expect("exec must report the process's exit instead of hanging")
@@ -2232,6 +2485,149 @@ mod tests {
             readers_released(&daemon),
             "a failed wait must release its output readers, not leave them on \
              the pipes of a process nothing has closed"
+        );
+    }
+
+    // ---- Decision 8: captured exec with a fed stdin payload (paste-bridge
+    // copy-in) ----
+
+    /// A payload well above any pipe buffer, with a distinctive head and tail
+    /// so a truncation or a dropped byte shows up without dumping 256 KiB.
+    fn fed_stdin_payload() -> Vec<u8> {
+        let mut payload = vec![b'x'; 256 * 1024];
+        payload[..5].copy_from_slice(b"head-");
+        let tail_start = payload.len() - 5;
+        payload[tail_start..].copy_from_slice(b"-tail");
+        payload
+    }
+
+    /// The copy-in exec's `cat` must see every byte and then EOF, or it exits
+    /// 0 with a truncated file. Fails if the write end is dropped before the
+    /// start (received is empty), if the sender is never dropped
+    /// (`read_to_end` never returns and the 30 s bound trips), or if the
+    /// payload is written synchronously before the start (the pipe fills and
+    /// the bound trips).
+    #[tokio::test]
+    async fn a_fed_exec_delivers_the_whole_payload_before_stdin_reaches_eof() {
+        let payload = fed_stdin_payload();
+        let daemon = FakeExecDaemon::fed_through_stdin(0);
+
+        let result = bounded_fed_exec(&daemon, payload.clone())
+            .await
+            .expect("a cooperating daemon must produce a result");
+
+        assert_eq!(result.exit_code, 0, "the fed process must report success");
+        assert_eq!(
+            daemon.calls(),
+            vec!["create", "wait", "start"],
+            "the stdin writer must not disturb the create/wait/start ordering, got: {:?}",
+            daemon.calls()
+        );
+        let received = daemon.stdin_received.lock().unwrap();
+        assert!(
+            *received == payload,
+            "the daemon received {} bytes, expected {}",
+            received.len(),
+            payload.len()
+        );
+    }
+
+    /// Feeding stdin adds a task in front of the start, which must not let
+    /// the start overtake the wait (issue #4). Fails if the fed path
+    /// reorders the registration.
+    #[tokio::test]
+    async fn a_fed_exec_still_registers_its_wait_before_the_start() {
+        let daemon = FakeExecDaemon {
+            delay_wait_request: true,
+            ..FakeExecDaemon::fed_through_stdin(0)
+        };
+
+        let result = bounded_fed_exec(&daemon, fed_stdin_payload())
+            .await
+            .expect("a start must not overtake the wait it is registered behind");
+
+        assert_eq!(
+            daemon.calls(),
+            vec!["create", "wait", "start"],
+            "the daemon must see the wait before the start even while stdin is \
+             being fed, got: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(result.exit_code, 0);
+    }
+
+    /// The unfed `dev exec` path must keep its EOF-before-start guarantee
+    /// through the new fed variant. Fails if the empty payload takes the
+    /// feeding branch (the probe then never sees EOF).
+    #[tokio::test]
+    async fn an_empty_payload_still_closes_stdin_before_the_start() {
+        let daemon = FakeExecDaemon::producing("", "", 0);
+
+        bounded_fed_exec(&daemon, Vec::new()).await.expect("exec");
+
+        assert!(
+            daemon.stdin_reached_eof.load(Ordering::Relaxed),
+            "an empty payload must still close stdin before the start, so the \
+             process sees EOF on it"
+        );
+    }
+
+    /// A payload larger than the pipe buffer for a process the daemon never
+    /// starts leaves the writer parked on a full pipe; `abandon_process` must
+    /// unwind it, or the runtime waits on that task at shutdown and
+    /// `dev shell` cannot exit after a failed paste. Fails (or hangs, which
+    /// is why this is bounded) if the writer is a blocking thread or is not
+    /// aborted — the drain would then find data and time out, never EOF.
+    #[tokio::test]
+    async fn a_refused_start_aborts_the_stdin_writer_instead_of_wedging_it() {
+        let daemon = FakeExecDaemon::refusing_the_start_while_fed("start refused");
+
+        let err = bounded_fed_exec(&daemon, fed_stdin_payload())
+            .await
+            .expect_err("a refused start must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec start failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            daemon.calls().contains(&"kill"),
+            "a refused start must still be killed, got: {:?}",
+            daemon.calls()
+        );
+        assert!(
+            readers_released(&daemon),
+            "a refused start must release its output readers"
+        );
+        assert!(
+            daemon.stdin_drained_to_eof(),
+            "the writer's end of stdin must be closed after a refused start, \
+             or the pipe never reaches EOF"
+        );
+    }
+
+    /// The paste bridge turns a failed `mkdir`/`cat` into a message with the
+    /// exit code and stderr, so the fed variant must surface both. Fails if
+    /// the writer's outcome is allowed to mask the process's result.
+    #[tokio::test]
+    async fn a_fed_exec_reports_a_nonzero_exit_with_its_stderr() {
+        let daemon = FakeExecDaemon {
+            stderr: b"mkdir: permission denied\n".to_vec(),
+            exit_code: 1,
+            ..FakeExecDaemon::fed_through_stdin(1)
+        };
+
+        let result = bounded_fed_exec(&daemon, fed_stdin_payload())
+            .await
+            .expect("a cooperating daemon must still produce a result on failure");
+
+        assert_eq!(
+            result.exit_code, 1,
+            "the process's real exit code must survive the fed path"
+        );
+        assert_eq!(
+            result.stderr, "mkdir: permission denied\n",
+            "the process's real stderr must survive the fed path"
         );
     }
 
@@ -3528,6 +3924,40 @@ mod tests {
         assert!(
             !captured.terminal,
             "a captured exec reads its own stdout and stderr and must not ask for a pty"
+        );
+    }
+
+    /// The peer's copy-in exec configuration must not ask for a terminal (the
+    /// daemon would then reject the stderr fd) and must not interpolate the
+    /// target into the shell text.
+    #[test]
+    fn the_copy_in_exec_is_not_a_terminal_and_carries_stderr() {
+        let defaults = ProcessDefaults {
+            working_directory: "/tmp".to_string(),
+            environment: Vec::new(),
+        };
+
+        let config = exec_process_config(
+            &paste_bridge::receive_file_command("/tmp/dev-paste/x"),
+            Some("vscode"),
+            false,
+            &defaults,
+            None,
+            &[],
+        );
+
+        assert!(
+            !config.terminal,
+            "a copy-in exec must not ask for a terminal or the daemon rejects its stderr fd"
+        );
+        assert_eq!(
+            config.executable, "sh",
+            "the copy-in exec must run through sh"
+        );
+        assert_eq!(
+            config.arguments.last().map(String::as_str),
+            Some("/tmp/dev-paste/x"),
+            "the target must be passed verbatim as the last argument, not interpolated"
         );
     }
 

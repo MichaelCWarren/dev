@@ -66,6 +66,15 @@
   Pick by whether the container already existed — never re-run create-time hooks on reuse.
   Compose has no reuse branch of its own, so `run_compose` probes `compose ps -q` before
   `compose up` and feeds `compose_hooks_owed` in `src/commands/up.rs`.
+- `relay_terminal` (`src/runtime/terminal_relay.rs`) is the single place `dev shell` rewrites
+  keystrokes on the way into a container, on every runtime, calling `terminal_input.rs` (splits
+  bracketed pastes from keys, rewrites Shift+Enter) and `paste_bridge.rs` (copies a pasted host
+  file into `/tmp/dev-paste` over the session's `SessionPeer`). Docker relays a bollard exec
+  stream; Podman and Apple relay a dev-owned pty whose slave the runtime's own process gets.
+  Only a file that exists on the host running `dev`, under home or a temp dir, is touched,
+  which is what lets cmux's ssh upload chain into it. A new runtime's interactive path goes
+  through `relay_terminal` and implements `SessionPeer`; nothing hands the host's tty
+  descriptors to a runtime any more.
 
 ## Maintaining this file
 

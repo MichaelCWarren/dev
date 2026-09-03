@@ -11,84 +11,30 @@ use tokio::io::AsyncWriteExt;
 
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
+use crate::runtime::paste_bridge;
+use crate::runtime::terminal_relay::{
+    HostTerminal, RawModeGuard, SessionPeer, StdinReader, UnitFut, relay_terminal,
+};
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageInfo, ImageMetadata, env_assignments, terminal_size,
+    ExecResult, ImageInfo, ImageMetadata, env_assignments,
 };
 
-/// RAII guard that puts the terminal into raw mode and restores it on drop.
-struct RawModeGuard {
-    original: libc::termios,
-    fd: i32,
-}
+/// The raw stream half of a started exec, as bollard hands it back.
+type ExecOutput = std::pin::Pin<
+    Box<
+        dyn futures_util::Stream<
+                Item = Result<bollard::container::LogOutput, bollard::errors::Error>,
+            > + Send,
+    >,
+>;
 
-impl RawModeGuard {
-    fn enter(_stdin: std::io::Stdin) -> Result<Self, DevError> {
-        use std::os::fd::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err(DevError::Runtime(
-                "Failed to get terminal attributes".into(),
-            ));
-        }
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return Err(DevError::Runtime("Failed to set raw mode".into()));
-        }
-        Ok(Self { original, fd })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
-}
-
-/// Translate Shift+Enter escape sequences into a plain carriage return.
-///
-/// Terminals encode Shift+Enter in several ways:
-///   - CSI u (kitty/VS Code):  ESC [ 1 3 ; 2 u   (\x1b[13;2u)
-///   - xterm modifyOtherKeys:  ESC [ 2 7 ; 2 ; 1 3 ~  (\x1b[27;2;13~)
-///
-/// Shells inside containers often don't understand these, causing garbled
-/// output. We rewrite them to a plain \r which the shell treats as Enter.
-fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
-    const CSI_U: &[u8] = b"\x1b[13;2u";
-    const XTERM: &[u8] = b"\x1b[27;2;13~";
-
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == 0x1b {
-            if input[i..].starts_with(CSI_U) {
-                out.push(b'\r');
-                i += CSI_U.len();
-                continue;
-            }
-            if input[i..].starts_with(XTERM) {
-                out.push(b'\r');
-                i += XTERM.len();
-                continue;
-            }
-        }
-        out.push(input[i]);
-        i += 1;
-    }
-    out
-}
+/// The raw input half of a started exec, as bollard hands it back.
+type ExecInput = std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
 
 /// Adapts bollard's `LogOutput` stream into an `AsyncRead` byte stream.
 struct LogOutputStream {
-    inner: std::pin::Pin<
-        Box<
-            dyn futures_util::Stream<
-                    Item = Result<bollard::container::LogOutput, bollard::errors::Error>,
-                > + Send,
-        >,
-    >,
+    inner: ExecOutput,
     buffer: bytes::BytesMut,
 }
 
@@ -205,7 +151,7 @@ fn reports_missing_command(error: &DevError) -> bool {
 /// milliseconds in practice — the shell exits as soon as it sees the EOF that
 /// ended the session. A budget rather than an unbounded wait so a process that
 /// keeps running with no stdin cannot park `dev shell` forever.
-const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The exit code an `inspect_exec` reply carries, if it carries a final one.
 ///
@@ -253,6 +199,103 @@ fn dump_build_tail(tail: &VecDeque<String>) {
         eprint!("{chunk}");
     }
     eprintln!("--- end build output ---");
+}
+
+/// The [`SessionPeer`] an interactive exec binds `PasteBridge` to: resize forwards
+/// SIGWINCH onto the same exec, and `copy_in` streams a paste's bytes into the
+/// container through a one-off exec running as the session user.
+///
+/// Holds a borrow, not an owned `Docker` client, so `copy_in` shares
+/// `BollardRuntime::copy_into_container` with Podman's peer instead of building a
+/// fresh wrapper per call.
+pub(crate) struct DockerSessionPeer<'a> {
+    bollard: &'a BollardRuntime,
+    container: String,
+    exec_id: String,
+    user: Option<String>,
+}
+
+impl SessionPeer for DockerSessionPeer<'_> {
+    fn resize(&self, cols: u16, rows: u16) -> UnitFut<'_> {
+        Box::pin(async move {
+            let _ = self
+                .bollard
+                .client
+                .resize_exec(
+                    &self.exec_id,
+                    ResizeExecOptions {
+                        height: rows,
+                        width: cols,
+                    },
+                )
+                .await;
+        })
+    }
+
+    fn copy_in<'a>(&'a self, bytes: Vec<u8>, target: &'a str) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.bollard
+                .copy_into_container(&self.container, self.user.as_deref(), bytes, target)
+                .await
+        })
+    }
+}
+
+impl BollardRuntime {
+    /// Writes `bytes` to `target` inside `container` through a one-off, non-tty exec
+    /// running as `user`. Shared by the interactive session's paste bridge and,
+    /// through `self.0`, by Podman's.
+    pub(crate) async fn copy_into_container(
+        &self,
+        container: &str,
+        user: Option<&str>,
+        bytes: Vec<u8>,
+        target: &str,
+    ) -> Result<(), DevError> {
+        use futures_util::StreamExt;
+
+        let exec = self
+            .client
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(paste_bridge::receive_file_command(target)),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(false),
+                    user: user.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let start = self.client.start_exec(&exec.id, None).await?;
+        let (mut output, mut input) = Self::attached_streams(start)?;
+
+        input
+            .write_all(&bytes)
+            .await
+            .map_err(|e| DevError::Runtime(format!("write: {e}")))?;
+        input
+            .shutdown()
+            .await
+            .map_err(|e| DevError::Runtime(format!("close stdin: {e}")))?;
+        let mut stderr = String::new();
+        while let Some(msg) = output.next().await {
+            if let Ok(bollard::container::LogOutput::StdErr { message }) = msg {
+                stderr.push_str(&String::from_utf8_lossy(&message));
+            }
+        }
+        let info = self.client.inspect_exec(&exec.id).await?;
+        match info.exit_code {
+            Some(0) => Ok(()),
+            code => Err(DevError::Runtime(format!(
+                "exit {}: {}",
+                code.map_or("unknown".to_string(), |c| c.to_string()),
+                stderr.trim()
+            ))),
+        }
+    }
 }
 
 impl BollardRuntime {
@@ -599,6 +642,17 @@ impl BollardRuntime {
         }
     }
 
+    /// The two attached streams of a started exec, or the "detached
+    /// unexpectedly" error every attach site here reports the same way.
+    fn attached_streams(start: StartExecResults) -> Result<(ExecOutput, ExecInput), DevError> {
+        match start {
+            StartExecResults::Attached { output, input } => Ok((output, input)),
+            StartExecResults::Detached => Err(DevError::Runtime(
+                "exec session detached unexpectedly".into(),
+            )),
+        }
+    }
+
     async fn exec_impl(
         &self,
         id: &str,
@@ -665,8 +719,6 @@ impl BollardRuntime {
         workdir: Option<&str>,
         env: &[String],
     ) -> Result<i32, DevError> {
-        use futures_util::StreamExt;
-
         let exec = self
             .client
             .create_exec(
@@ -688,171 +740,37 @@ impl BollardRuntime {
 
         // Put the local terminal into raw mode so keystrokes (tab, arrows,
         // ctrl-sequences) are forwarded to the container unprocessed.
-        let stdin_fd = std::io::stdin();
-        let _raw_guard = RawModeGuard::enter(stdin_fd)?;
+        let _raw_guard = RawModeGuard::enter()?;
 
+        // A detached exec has no terminal to attach; `attached_streams`
+        // returning early here (rather than falling through to
+        // `recorded_exec_status`) drops the guard and restores the terminal
+        // instead of reporting a status for a session that never had one.
         let start = self.client.start_exec(&exec.id, None).await?;
-        if let StartExecResults::Attached {
-            mut output, input, ..
-        } = start
-        {
-            // Set the initial terminal size so TUI apps fill the real terminal.
-            if let Some((cols, rows)) = terminal_size() {
-                let _ = self
-                    .client
-                    .resize_exec(
-                        &exec.id,
-                        ResizeExecOptions {
-                            height: rows,
-                            width: cols,
-                        },
-                    )
-                    .await;
+        let (output, input) = Self::attached_streams(start)?;
+        let output = LogOutputStream {
+            inner: output,
+            buffer: bytes::BytesMut::new(),
+        };
+
+        let peer = DockerSessionPeer {
+            bollard: self,
+            container: id.to_string(),
+            exec_id: exec.id.clone(),
+            user: user.map(str::to_string),
+        };
+
+        let mut stdin = StdinReader::spawn()?;
+        let mut host = HostTerminal::for_process(stdin.chunks())?;
+
+        // `relay_terminal` sends the initial resize itself and owns `input`,
+        // so dropping its future on either arm of this `select!` is what
+        // gives the container's shell its own EOF.
+        tokio::select! {
+            result = relay_terminal(&mut host, input, output, &peer) => {
+                result?;
             }
-
-            // Forward SIGWINCH to the container exec so resizes propagate.
-            let resize_client = self.client.clone();
-            let resize_exec_id = exec.id.clone();
-            let sigwinch_handle = tokio::spawn(async move {
-                let mut sig = match tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::window_change(),
-                ) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                while sig.recv().await.is_some() {
-                    if let Some((cols, rows)) = terminal_size() {
-                        let _ = resize_client
-                            .resize_exec(
-                                &resize_exec_id,
-                                ResizeExecOptions {
-                                    height: rows,
-                                    width: cols,
-                                },
-                            )
-                            .await;
-                    }
-                }
-            });
-
-            // Create a self-pipe so we can cancel the blocking stdin reader.
-            // Writing to cancel_writer causes the poll() in the reader to
-            // wake up and exit cleanly, avoiding a stuck blocking thread that
-            // would prevent the tokio runtime from shutting down.
-            let (cancel_reader, cancel_writer) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-
-            // Channel to bridge blocking stdin reads → async container writes.
-            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-
-            // Blocking stdin reader using poll() so it can be cancelled.
-            let stdin_reader_handle = std::thread::spawn(move || {
-                use std::os::fd::AsRawFd;
-                let stdin_fd = std::io::stdin().as_raw_fd();
-                let cancel_fd = cancel_reader.as_raw_fd();
-                let mut buf = [0u8; 1024];
-                loop {
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: stdin_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: cancel_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                    ];
-                    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                    if ready < 0 {
-                        break;
-                    }
-                    if pfds[1].revents & libc::POLLIN != 0 {
-                        break;
-                    }
-                    if pfds[0].revents & libc::POLLIN != 0 {
-                        let n = unsafe {
-                            libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                        if n <= 0 {
-                            break;
-                        }
-                        let data = translate_shift_enter(&buf[..n as usize]);
-                        if stdin_tx.blocking_send(data).is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Async task that forwards channel data to the container stdin.
-            let mut stdin_writer = input;
-            let stdin_handle = tokio::spawn(async move {
-                while let Some(data) = stdin_rx.recv().await {
-                    if stdin_writer.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Forward container output to our stdout.
-            // With TTY mode, stdout and stderr are multiplexed on the same stream.
-            let output_handle = tokio::spawn(async move {
-                let mut local_stdout = tokio::io::stdout();
-                while let Some(msg) = output.next().await {
-                    match msg {
-                        Ok(bollard::container::LogOutput::StdOut { message }) => {
-                            let _ = local_stdout.write_all(&message).await;
-                            let _ = local_stdout.flush().await;
-                        }
-                        Ok(bollard::container::LogOutput::StdErr { message }) => {
-                            let _ = local_stdout.write_all(&message).await;
-                            let _ = local_stdout.flush().await;
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            // Poll the exec status so we detect when the shell exits even if
-            // the output stream stays open (Docker keeps the bidirectional
-            // connection alive while stdin is still attached).
-            let monitor_client = self.client.clone();
-            let monitor_exec_id = exec.id.clone();
-            let monitor_handle = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await
-                        && info.running == Some(false)
-                    {
-                        break;
-                    }
-                }
-            });
-
-            // Wait for any exit signal: output stream closing, exec process
-            // exiting, or stdin failing.
-            let stdin_abort = stdin_handle.abort_handle();
-            let output_abort = output_handle.abort_handle();
-            let monitor_abort = monitor_handle.abort_handle();
-            let sigwinch_abort = sigwinch_handle.abort_handle();
-
-            tokio::select! {
-                _ = output_handle => {}
-                _ = monitor_handle => {}
-                _ = stdin_handle => {}
-            }
-
-            // Signal the blocking stdin reader to exit, then clean up.
-            drop(cancel_writer);
-            let _ = stdin_reader_handle.join();
-
-            stdin_abort.abort();
-            output_abort.abort();
-            monitor_abort.abort();
-            sigwinch_abort.abort();
+            () = self.wait_until_exec_stops(&exec.id) => {}
         }
 
         let exit_code = self.recorded_exec_status(&exec.id).await?;
@@ -861,11 +779,26 @@ impl BollardRuntime {
         Ok(exit_code)
     }
 
+    /// The second `select!` arm in `exec_interactive_impl`: wakes the session
+    /// when the shell exits while docker keeps the stream open (stdin still
+    /// attached). Distinct from `recorded_exec_status`'s bounded wait below,
+    /// which is the final status read once the session is already over.
+    async fn wait_until_exec_stops(&self, exec_id: &str) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(info) = self.client.inspect_exec(exec_id).await
+                && info.running == Some(false)
+            {
+                return;
+            }
+        }
+    }
+
     /// The status the interactive exec finished with.
     ///
-    /// The stream loop can end while the process is still running: a piped or
-    /// redirected stdin reaches EOF, which ends the forwarding task and wins
-    /// the `select!` above, and only then does dropping the input half give the
+    /// The relay loop can end while the process is still running: a piped or
+    /// redirected stdin reaches EOF, which ends `relay_terminal` and wins the
+    /// `select!` above, and only then does dropping the input half give the
     /// container's shell its own EOF. Reading `inspect_exec` once at that
     /// moment answers `running: true` with no code recorded, so the status is
     /// polled until docker has one. `dev shell` turns this into its own exit
@@ -912,18 +845,14 @@ impl BollardRuntime {
             .await?;
 
         let start = self.client.start_exec(&exec.id, None).await?;
-        match start {
-            StartExecResults::Attached { output, input } => Ok(AttachedExec {
-                stdin: Box::pin(input),
-                stdout: Box::pin(LogOutputStream {
-                    inner: Box::pin(output),
-                    buffer: bytes::BytesMut::new(),
-                }),
+        let (output, input) = Self::attached_streams(start)?;
+        Ok(AttachedExec {
+            stdin: input,
+            stdout: Box::pin(LogOutputStream {
+                inner: output,
+                buffer: bytes::BytesMut::new(),
             }),
-            StartExecResults::Detached => Err(DevError::Runtime(
-                "exec session detached unexpectedly".into(),
-            )),
-        }
+        })
     }
 
     /// Stream a container's logs as bytes. The bollard stream is forwarded
@@ -1714,6 +1643,56 @@ mod tests {
         assert_eq!(
             options.env, None,
             "an exec with no extra env sends the same body as before"
+        );
+    }
+
+    /// `terminal_size()` and `SessionPeer::resize` are `(cols, rows)` while bollard's
+    /// `ResizeExecOptions` is `height`/`width`, and a daemon accepts a swapped pair
+    /// silently — every TUI would just wrap at the wrong column. Pins rows as height
+    /// and columns as width on the wire.
+    #[tokio::test]
+    async fn the_bollard_peer_sends_rows_as_height_and_columns_as_width() {
+        use crate::runtime::fake_daemon::read_http_request;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket_path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+
+        let runtime = BollardRuntime::connect_to_socket(&socket_path.to_string_lossy())
+            .expect("building a docker client must not need a daemon");
+        let peer = DockerSessionPeer {
+            bollard: &runtime,
+            container: "container-1".to_string(),
+            exec_id: "exec-1".to_string(),
+            user: None,
+        };
+
+        (&peer as &dyn SessionPeer).resize(80, 24).await;
+
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("POST /exec/exec-1/resize?"),
+            "resize must post to the named exec's resize endpoint, got: {request}"
+        );
+        assert!(
+            request.contains("h=24"),
+            "rows must travel as the query's height, got: {request}"
+        );
+        assert!(
+            request.contains("w=80"),
+            "columns must travel as the query's width, got: {request}"
         );
     }
 }

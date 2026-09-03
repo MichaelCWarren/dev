@@ -151,8 +151,9 @@ fn session_command(shell_cmd: &str, workdir: &str, host: &HostIdentity) -> Vec<S
 /// Dropping the interactive future restores the terminal, and the container
 /// side is then hung up explicitly.
 ///
-/// The Podman runtime replaces this process with `podman exec`, so none of this
-/// runs there; its orphans are collected by the sweep instead.
+/// The Podman runtime runs `podman exec` as a child on a pty `dev` owns, so this
+/// applies there too: dropping the future kills the podman client, and the
+/// container-side exec it leaves behind is what the release by marker hangs up.
 async fn attend_session(
     runtime: &dyn ContainerRuntime,
     container_id: &str,

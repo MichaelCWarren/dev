@@ -39,6 +39,20 @@ dev shell
 
 `dev shell` opens an interactive shell as the configured `remoteUser`, in the workspace folder, with `REMOTE_CONTAINERS=true` set — the same environment VS Code's devcontainer integration would give you. It probes for `zsh`, `bash`, then `sh`; pass `--shell /bin/bash` to force one.
 
+**Pasting files into the container.** Terminals such as cmux turn a clipboard image into a
+temp file and paste its path, which names nothing inside a container. `dev shell` watches for
+a bracketed paste naming a regular file on the host up to 32 MiB, copies it to
+`/tmp/dev-paste/<name>` in the container as the session user (the name reduced to a
+shell-safe subset), and pastes that path instead, so Claude Code attaches it — on every
+runtime, Docker, Podman, and Apple Containers alike. A pasted path is only swapped when it
+resolves, symlinks followed, under the home directory or a temp directory (`$TMPDIR`, `/tmp`),
+so a system path like `/etc/hosts` is pasted as typed. Anything else in a paste is forwarded
+byte for byte, and a path that does not exist on the machine running `dev` is left alone: over
+ssh, cmux uploads the file to the server first and pastes the server path, which `dev shell`
+running there then carries into the container. Shift+Enter is rewritten the same way, into a
+plain carriage return, since containers don't always understand the escape sequence terminals
+send for it.
+
 To run a one-off command instead of an interactive shell:
 
 ```sh
