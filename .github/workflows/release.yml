@@ -1,0 +1,229 @@
+name: Release
+
+# Every push to main cuts a release. The version comes from the commits
+# themselves, so the only thing a contributor has to get right is the commit
+# subject, which the repo already writes in conventional-commit form.
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Never two releases in flight. A second push while the first is still tagging
+# would compute its version from a tag that does not exist yet, so this queues
+# instead of cancelling: a cancelled run would skip that commit's release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Unlike the CI workflow, this one writes: the bump commit, the tag, and the
+# release. Actions are pinned to full commit SHAs for the same reason they are
+# there, with the readable version in a trailing comment.
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Compute version, bump, and tag
+    runs-on: ubuntu-latest
+    # The bump commit is pushed with GITHUB_TOKEN, and GitHub does not trigger
+    # workflows from those pushes, so this cannot loop. The check is belt and
+    # braces in case the token is ever swapped for a PAT, which does trigger.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags and full history: the bump reads the last tag to find its base
+          # version and the commits to classify.
+          fetch-depth: 0
+
+      - name: Compute the next version
+        id: compute
+        run: |
+          set -euo pipefail
+
+          # Commit messages are read with git rather than interpolated through
+          # ${{ }}, so a crafted subject cannot break out into this shell.
+          last_tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -n "$last_tag" ]; then
+            base=${last_tag#v}
+            range="$last_tag..HEAD"
+          else
+            # First release: the base is whatever Cargo.toml already says, and
+            # only this push's commits are classified. Reaching back through the
+            # whole pre-tag history would classify commits that shipped long ago.
+            base=$(sed -n '0,/^version = /s/^version = "\(.*\)"/\1/p' Cargo.toml)
+            before=${{ github.event.before }}
+            if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              range="HEAD~1..HEAD"
+            else
+              range="$before..HEAD"
+            fi
+          fi
+
+          messages=$(git log --format=%B "$range")
+
+          # A "!" before the colon, or a BREAKING CHANGE footer, is the
+          # conventional-commit break marker. feat is a minor, everything else
+          # is a patch, so docs and refactor still ship rather than stalling
+          # the version.
+          if printf '%s' "$messages" | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+            || printf '%s' "$messages" | grep -qE '^BREAKING CHANGE:'; then
+            bump=major
+          elif printf '%s' "$messages" | grep -qE '^feat(\([^)]*\))?:'; then
+            bump=minor
+          else
+            bump=patch
+          fi
+
+          IFS=. read -r major minor patch <<< "$base"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          version="$major.$minor.$patch"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+          echo "Releasing $base -> $version ($bump, from $range)"
+
+      - name: Bump the manifest and lockfile
+        env:
+          VERSION: ${{ steps.compute.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Both files spell the root package the same way: a name line, then
+          # its version on the next line. Anchoring to the name is what keeps
+          # this off crates/apple-container, which carries its own version.
+          # Anchoring by line number, or with sed's GNU-only `0,/re/` range,
+          # would break the moment the manifest is reordered or the script runs
+          # anywhere but a GNU userland.
+          bump() {
+            sed -i "/^name = \"devcontainer\"$/{n;s/^version = .*/version = \"$VERSION\"/;}" "$1"
+          }
+          bump Cargo.toml
+          bump Cargo.lock
+
+          # Prove it landed in both. A silent no-op here would tag a release
+          # whose binary reports the previous version.
+          grep -q "^version = \"$VERSION\"$" Cargo.toml
+          grep -A1 '^name = "devcontainer"$' Cargo.lock | grep -q "^version = \"$VERSION\"$"
+          echo "Cargo.toml and Cargo.lock now read $VERSION"
+
+      - name: Commit, tag, and push
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+          VERSION: ${{ steps.compute.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): $VERSION [skip ci]"
+          git tag -a "$TAG" -m "$VERSION"
+          git push origin HEAD:main
+          git push origin "$TAG"
+
+      - name: Open the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.compute.outputs.tag }}
+          RANGE: ${{ steps.compute.outputs.range }}
+        run: |
+          set -euo pipefail
+          # A draft until the binaries are attached, so nobody downloads a
+          # release that is still missing half its assets.
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes "$(git log --no-merges --format='- %s' "$RANGE")"
+
+  binaries:
+    name: Build ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not strand the other's upload; the draft
+      # stays unpublished either way, which is the real safety net.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            asset: dev-linux-x86_64
+            features: ""
+          - os: macos-latest
+            name: macos-arm64
+            asset: dev-macos-arm64
+            # The Apple Containers runtime is gated behind this feature and
+            # compiled on no other platform, so the macOS artifact is the only
+            # one that carries it.
+            features: "--features apple"
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tag, not the branch: main has already moved on to the bump
+          # commit, and the binary must match what the release says it is.
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Install Rust toolchain (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+          key: release-${{ matrix.name }}
+
+      # crates/apple-container's build script runs tonic-build, which shells out
+      # to protoc. macOS runners do not ship it and the Linux build never
+      # compiles that crate.
+      - name: Install protoc
+        if: matrix.os == 'macos-latest'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install protobuf
+
+      - name: Build the release binary
+        run: cargo build --release --locked ${{ matrix.features }}
+
+      - name: Check the binary runs
+        run: ./target/release/dev --version
+
+      - name: Attach it to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cp target/release/dev "$ASSET"
+          gh release upload "$TAG" "$ASSET" --clobber
+
+  publish:
+    name: Publish the release
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Take the release out of draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false
