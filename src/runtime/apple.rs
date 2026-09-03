@@ -176,7 +176,17 @@ impl AppleRuntime {
         let mut host = HostTerminal::for_process(stdin.chunks())?;
 
         let exit_code = self
-            .attend_interactive_process(id, &process_id, exit_wait, &mut host, pty, user, &defaults)
+            .attend_interactive_process(
+                InteractiveTarget {
+                    id,
+                    process_id: &process_id,
+                    user,
+                    defaults: &defaults,
+                },
+                exit_wait,
+                &mut host,
+                pty,
+            )
             .await?;
 
         // _raw_guard is dropped here, restoring the terminal.
@@ -217,13 +227,10 @@ impl AppleRuntime {
     /// host SIGINT).
     async fn attend_interactive_process<W>(
         &self,
-        id: &str,
-        process_id: &str,
+        target: InteractiveTarget<'_>,
         mut wait: std::pin::Pin<&mut W>,
         host: &mut HostTerminal<'_, tokio::io::Stdout>,
         pty: Pty,
-        user: Option<&str>,
-        defaults: &ProcessDefaults,
     ) -> Result<i32, DevError>
     where
         W: std::future::Future<Output = Result<i32, AppleContainerError>>,
@@ -247,11 +254,11 @@ impl AppleRuntime {
             let pty = pty;
             let peer = AppleSessionPeer {
                 client: &self.client,
-                container: id,
-                process_id,
+                container: target.id,
+                process_id: target.process_id,
                 pty: &pty,
-                user,
-                defaults,
+                user: target.user,
+                defaults: target.defaults,
             };
             // `relay_terminal` sends the initial resize itself and owns the
             // pty's input side, so no separate resize call is needed here.
@@ -279,17 +286,21 @@ impl AppleRuntime {
                         }
                         break;
                     }
-                    _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
+                    _ = interrupt.recv() => self.forward_signal(target.id, target.process_id, libc::SIGINT).await,
                     // A SIGTERM aimed at `dev` must also end `dev`.
                     _ = terminate.recv() => {
-                        self.forward_signal(id, process_id, libc::SIGTERM).await;
-                        return self.stop_attending(id, process_id, wait).await;
+                        self.forward_signal(target.id, target.process_id, libc::SIGTERM)
+                            .await;
+                        return self
+                            .stop_attending(target.id, target.process_id, wait)
+                            .await;
                     }
                 }
             }
         }
 
-        self.stop_attending(id, process_id, wait).await
+        self.stop_attending(target.id, target.process_id, wait)
+            .await
     }
 
     /// How long a signalled process has to exit before this stops waiting.
@@ -357,6 +368,16 @@ impl AppleRuntime {
 /// exec running as the session user.
 ///
 /// Holds only borrows, because `AppleContainerClient` is not `Clone`.
+/// Which process an interactive session is attending, and what its peer needs
+/// to reach it. Bundled because these four travel together into
+/// `AppleSessionPeer`, which cannot be built before the pty it borrows.
+struct InteractiveTarget<'a> {
+    id: &'a str,
+    process_id: &'a str,
+    user: Option<&'a str>,
+    defaults: &'a ProcessDefaults,
+}
+
 struct AppleSessionPeer<'a> {
     client: &'a AppleContainerClient,
     container: &'a str,
