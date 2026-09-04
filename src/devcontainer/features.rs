@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::error::DevError;
 use crate::oci::{download_artifact, extract_archive, sha256_hex};
+use crate::util::paths::DevHome;
 
 use super::config::{DevcontainerConfig, LifecycleCommand};
 use super::jsonc::parse_jsonc;
@@ -135,42 +136,69 @@ enum FeatureRefKind {
 
 /// Parse feature references from the config and resolve them into installable features.
 pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeature>, DevError> {
-    let features = match &config.features {
-        Some(f) if !f.is_empty() => f,
-        _ => return Ok(Vec::new()),
-    };
+    resolve_features_in(config, &DevHome::current())
+}
 
-    let mut resolved = Vec::new();
-    for (id, options) in features {
-        let (oci_ref, version) = match classify_feature_ref(id) {
-            FeatureRefKind::Local(_) | FeatureRefKind::Tarball(_) => {
-                // For local/tarball features, oci_ref stores the original id
-                // and version is unused. The actual path is resolved during download.
-                (id.clone(), String::new())
-            }
-            FeatureRefKind::Oci { oci_ref, version } => (oci_ref, version),
-        };
-        resolved.push(ResolvedFeature {
-            id: id.clone(),
-            oci_ref,
-            version,
-            options: options.clone(),
-            install_script_path: PathBuf::new(),
-            install_after: Vec::new(),
-            container_env: BTreeMap::new(),
-            option_defaults: BTreeMap::new(),
-            mounts: Vec::new(),
-            init: false,
-            privileged: false,
-            cap_add: Vec::new(),
-            security_opt: Vec::new(),
-            entrypoint: None,
-            lifecycle_hooks: FeatureLifecycleHooks::default(),
-            is_dependency: false,
-        });
+/// Every feature the config asks for, plus the one `dev` supplies itself.
+///
+/// `cmux.agent` is an opt-in for a capability, not a request for a particular
+/// image layer, so turning it on is what puts the `cmux-agent` feature in the
+/// build. That feature ships inside this binary (see
+/// [`crate::cmux::agent::stage_feature_in`]) rather than in a registry or the
+/// repository, so nothing has to be fetched or copied for the key to work.
+///
+/// This is the one choke point every build path calls, which is why the
+/// injection lives here rather than at each of `up` and `build`'s call sites.
+pub fn resolve_features_in(
+    config: &DevcontainerConfig,
+    home: &DevHome,
+) -> Result<Vec<ResolvedFeature>, DevError> {
+    let mut resolved: Vec<ResolvedFeature> = config
+        .features
+        .iter()
+        .flatten()
+        .map(|(id, options)| resolve_one(id, options.clone()))
+        .collect();
+
+    if config.cmux_agent_enabled() {
+        let staged = crate::cmux::agent::stage_feature_in(home)?;
+        resolved.push(resolve_one(
+            &staged.to_string_lossy(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        ));
     }
 
     Ok(resolved)
+}
+
+/// One entry of a `features` map, before anything has been downloaded.
+fn resolve_one(id: &str, options: serde_json::Value) -> ResolvedFeature {
+    let (oci_ref, version) = match classify_feature_ref(id) {
+        FeatureRefKind::Local(_) | FeatureRefKind::Tarball(_) => {
+            // For local/tarball features, oci_ref stores the original id
+            // and version is unused. The actual path is resolved during download.
+            (id.to_string(), String::new())
+        }
+        FeatureRefKind::Oci { oci_ref, version } => (oci_ref, version),
+    };
+    ResolvedFeature {
+        id: id.to_string(),
+        oci_ref,
+        version,
+        options,
+        install_script_path: PathBuf::new(),
+        install_after: Vec::new(),
+        container_env: BTreeMap::new(),
+        option_defaults: BTreeMap::new(),
+        mounts: Vec::new(),
+        init: false,
+        privileged: false,
+        cap_add: Vec::new(),
+        security_opt: Vec::new(),
+        entrypoint: None,
+        lifecycle_hooks: FeatureLifecycleHooks::default(),
+        is_dependency: false,
+    }
 }
 
 /// Ids of `roots` plus every feature they transitively require via `dependsOn`.
@@ -319,14 +347,20 @@ async fn download_single_feature(
 ) -> Result<(), DevError> {
     let extracted_dir = match classify_feature_ref(&feature.id) {
         FeatureRefKind::Local(rel_path) => {
-            // Resolve relative to .devcontainer/ directory.
-            let base = devcontainer_dir.ok_or_else(|| {
-                DevError::FeatureNotFound(format!(
-                    "Cannot resolve local feature '{}': no .devcontainer directory",
-                    feature.id
-                ))
-            })?;
-            let abs_path = base.join(&rel_path);
+            // An absolute path answers for itself; only a relative one needs a
+            // .devcontainer/ to resolve against. `dev`'s own staged feature is
+            // absolute and reaches here from configs that have no such directory.
+            let abs_path = if rel_path.is_absolute() {
+                rel_path
+            } else {
+                let base = devcontainer_dir.ok_or_else(|| {
+                    DevError::FeatureNotFound(format!(
+                        "Cannot resolve local feature '{}': no .devcontainer directory",
+                        feature.id
+                    ))
+                })?;
+                base.join(&rel_path)
+            };
             if !abs_path.exists() {
                 return Err(DevError::FeatureNotFound(format!(
                     "Local feature directory not found: {}",
@@ -1437,6 +1471,59 @@ mod tests {
         );
         let second = build_metadata_label(&order_features(&[b, a]), &config, Some("root"));
         assert_eq!(first, second);
+    }
+
+    fn config_with(json: &str) -> DevcontainerConfig {
+        super::super::jsonc::parse_jsonc(json).expect("config parses")
+    }
+
+    /// The whole point of `cmux.agent` being one key: turning it on is what
+    /// puts the feature in the build, with no second declaration and nothing
+    /// for the user to fetch or copy.
+    #[test]
+    fn cmux_agent_adds_the_feature_dev_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+
+        let resolved =
+            resolve_features_in(&config_with(r#"{"cmux": {"agent": true}}"#), &home).unwrap();
+
+        let staged = tmp.path().join("features/cmux-agent");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, staged.to_string_lossy());
+        assert!(staged.join("install.sh").is_file());
+    }
+
+    #[test]
+    fn the_feature_joins_the_ones_the_config_asked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolved = resolve_features_in(
+            &config_with(r#"{"features": {"ghcr.io/x/y:1": {}}, "cmux": {"agent": true}}"#),
+            &DevHome::at(tmp.path()),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = resolved.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"ghcr.io/x/y:1"));
+        assert!(ids.iter().any(|id| id.ends_with("features/cmux-agent")));
+    }
+
+    /// Off unless asked for, including with the sibling sub-key on: nothing is
+    /// staged and no layer is added.
+    #[test]
+    fn without_the_key_nothing_is_added_or_staged() {
+        for json in [
+            r#"{"image": "alpine"}"#,
+            r#"{"cmux": {"status": true}}"#,
+            r#"{"cmux": {"agent": false}}"#,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let resolved =
+                resolve_features_in(&config_with(json), &DevHome::at(tmp.path())).unwrap();
+            assert!(resolved.is_empty(), "{json} added a feature");
+            assert!(!tmp.path().join("features").exists(), "{json} staged one");
+        }
     }
 
     /// Reference form a local feature directory is named by in devcontainer.json.

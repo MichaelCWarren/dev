@@ -6,15 +6,14 @@ there, the same as one running on the host.
 
 ```json
 {
-  "features": {
-    "/path/to/dev/features/cmux-agent": {}
-  },
   "cmux": { "agent": true }
 }
 ```
 
-Both are needed. This feature installs the container's half; `cmux.agent` is what turns the
-host's half on.
+You do not reference this feature by path. `dev` carries these files in its own binary and
+adds the feature to the build itself when `cmux.agent` is on, staging it to
+`~/.dev/features/cmux-agent`. The directory here is the source of those bytes, not something
+a project points at. Editing it changes what the next `dev` build ships.
 
 ## What it installs
 

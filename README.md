@@ -632,22 +632,23 @@ config is safe even in CI and other terminals that never set it.
 started in a `dev shell` reports its session, its prompts, and its tool use to cmux exactly
 as one running on the host would.
 
-It needs two things in the same devcontainer.json, because they answer different questions.
-The feature installs the container's half; the key says you want it on:
+One key, and nothing to install or copy:
 
 ```json
 {
-  "features": {
-    "/path/to/dev/features/cmux-agent": {}
-  },
   "cmux": { "agent": true }
 }
 ```
 
-The feature lives in this repo at `features/cmux-agent`. Reference it by path, or copy the
-directory into your own project's `.devcontainer/` and reference it relatively. It installs a
-shim, puts its directory first on `PATH` for bash and zsh, and adds `uuid-runtime`, which
-cmux's wrapper needs for the agent's session id and no Ubuntu image ships.
+Turning it on is what adds the `cmux-agent` feature to the image build. `dev` carries that
+feature inside its own binary and stages it to `~/.dev/features/cmux-agent` when it builds,
+so there is nothing to fetch from a registry and nothing to vendor into a project. Upgrading
+`dev` upgrades the feature. The feature installs a shim, puts its directory first on `PATH`
+for bash and zsh, and adds `uuid-runtime`, which cmux's wrapper needs for the agent's session
+id and no Ubuntu image ships.
+
+Features are baked in at build time and `dev up` reuses a running container, so an existing
+container needs `dev up --rebuild` to pick this up the first time.
 
 Nothing runs until you open a `dev shell`. That session opens a loopback listener on the
 host, lands cmux's own claude wrapper next to the shim, and points the container at both.

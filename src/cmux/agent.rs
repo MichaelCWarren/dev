@@ -24,7 +24,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::devcontainer::secrets::SecretValue;
+use crate::error::DevError;
 use crate::runtime::ContainerRuntime;
+use crate::util::paths::DevHome;
 
 use super::Spawner;
 
@@ -310,6 +312,47 @@ async fn run_verb(spawner: &Spawner, args: &[String], body: Vec<u8>) -> Option<V
     );
     let output = output.ok()?.ok()?;
     output.status.success().then_some(output.stdout)
+}
+
+/// The feature's own files, carried in this binary.
+///
+/// `dev` installs as a single binary from a release, so a feature living only in
+/// the repository would be a feature nobody has. Three small text files ride
+/// along instead, which also means the shim and [`PROTOCOL`] ship as one
+/// artifact and cannot be fetched out of step with each other.
+const FEATURE_FILES: [(&str, &str); 3] = [
+    (
+        "devcontainer-feature.json",
+        include_str!("../../features/cmux-agent/devcontainer-feature.json"),
+    ),
+    (
+        "install.sh",
+        include_str!("../../features/cmux-agent/install.sh"),
+    ),
+    ("cmux", include_str!("../../features/cmux-agent/cmux")),
+];
+
+/// The directory name the feature is staged under, and the last segment of the
+/// id the build sees.
+const FEATURE_NAME: &str = "cmux-agent";
+
+/// Write the feature out and hand back the path a build can resolve it by.
+///
+/// Rewritten every run rather than written once, so an upgraded `dev` refreshes
+/// a shim staged by an older one. The content is identical between runs of the
+/// same build, which is what keeps the generated Dockerfile byte-identical and
+/// the layer cache warm.
+///
+/// Nothing here is made executable: `dev` chmods `install.sh` before running it,
+/// and `install.sh` lands the shim with `install -m 0755`.
+pub fn stage_feature_in(home: &DevHome) -> Result<PathBuf, DevError> {
+    let dir = home.staged_feature_dir(FEATURE_NAME);
+    let staged = |e: std::io::Error| DevError::Runtime(format!("staging {FEATURE_NAME}: {e}"));
+    std::fs::create_dir_all(&dir).map_err(staged)?;
+    for (name, contents) in FEATURE_FILES {
+        std::fs::write(dir.join(name), contents).map_err(staged)?;
+    }
+    Ok(dir)
 }
 
 /// One of cmux's wrappers, beside the CLI this process resolved.
@@ -651,15 +694,65 @@ mod tests {
         assert_eq!(env["CMUX_BUNDLED_CLI_PATH"], SHIM_PATH);
     }
 
-    /// The one thing that must not drift. The shim ships as a file in the
-    /// feature directory, which cargo would otherwise never look at, so its
-    /// half of the framing is pinned here at compile time.
+    fn embedded(name: &str) -> &'static str {
+        FEATURE_FILES
+            .iter()
+            .find(|(file, _)| *file == name)
+            .map(|(_, contents)| *contents)
+            .unwrap_or_else(|| panic!("{name} is not carried in the binary"))
+    }
+
+    /// The one thing that must not drift. Both halves of the framing now ship
+    /// in the same artifact, so this only has to hold them to the same value.
     #[test]
     fn the_shim_declares_the_same_protocol() {
-        let shim = include_str!("../../features/cmux-agent/cmux");
         assert!(
-            shim.contains(&format!("readonly PROTOCOL=\"{PROTOCOL}\"")),
-            "features/cmux-agent/cmux does not declare {PROTOCOL}"
+            embedded("cmux").contains(&format!("readonly PROTOCOL=\"{PROTOCOL}\"")),
+            "the embedded shim does not declare {PROTOCOL}"
+        );
+    }
+
+    /// What the binary carries has to be the feature as written, or the repo
+    /// and the shipped copy say different things.
+    #[test]
+    fn the_binary_carries_the_feature_as_written() {
+        for (name, contents) in FEATURE_FILES {
+            let on_disk = std::fs::read_to_string(format!("features/cmux-agent/{name}"))
+                .unwrap_or_else(|e| panic!("reading features/cmux-agent/{name}: {e}"));
+            assert_eq!(on_disk, contents, "features/cmux-agent/{name} drifted");
+        }
+    }
+
+    /// The point of embedding: a `dev` installed as a bare binary can still
+    /// produce the feature, with nothing fetched and nothing copied by hand.
+    #[test]
+    fn staging_writes_the_whole_feature_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+
+        let dir = stage_feature_in(&home).expect("staging writes the feature");
+
+        assert_eq!(dir, tmp.path().join("features/cmux-agent"));
+        for (name, contents) in FEATURE_FILES {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), contents);
+        }
+    }
+
+    /// Upgrading `dev` has to refresh a directory an older one already wrote,
+    /// or a stale shim would outlive the relay it was built against.
+    #[test]
+    fn staging_overwrites_what_an_older_run_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+        let dir = home.staged_feature_dir("cmux-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cmux"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        stage_feature_in(&home).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cmux")).unwrap(),
+            embedded("cmux")
         );
     }
 

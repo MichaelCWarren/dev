@@ -82,7 +82,12 @@
   loopback listener, per-session token, `verb_allowed` allowlist) plus the `cmux-agent`
   feature in `features/cmux-agent/` (the container's shim and its PATH entry). Three gates,
   all in `start_agent_relay` (`src/commands/shell.rs`): the key, `cmux.available()`, and the
-  shim probed in the container. Docker only. The relay is the only way in: cmux's socket
+  shim probed in the container. Docker only.
+- The feature is not referenced by path or registry. Its files are `include_str!`d into the
+  binary (`FEATURE_FILES`), staged to `~/.dev/features/cmux-agent` by `stage_feature_in`, and
+  injected by `resolve_features_in` when `cmux.agent` is on. `dev` installs as a bare binary,
+  so a feature living only in the repo would be a feature nobody has. Edit
+  `features/cmux-agent/`; a test asserts the embedded copy matches it byte for byte. The relay is the only way in: cmux's socket
   authorizes by process ancestry, so a container can never be its peer, however the socket
   is mounted or credentialed.
 - The shim is bash, not a binary, and that is deliberate. A stock Ubuntu image has no `nc`,

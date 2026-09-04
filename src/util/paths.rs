@@ -71,6 +71,13 @@ impl DevHome {
             .join(".devcontainer")
     }
 
+    /// Where `dev` stages a feature it carries in its own binary,
+    /// `~/.dev/features/<name>/`. Rewritten on every run, so upgrading `dev`
+    /// upgrades what the next image build installs.
+    pub fn staged_feature_dir(&self, name: &str) -> PathBuf {
+        self.root.join("features").join(name)
+    }
+
     /// The base config file, `~/.dev/base/devcontainer.json`.
     pub fn base_config(&self) -> PathBuf {
         self.root.join("base/devcontainer.json")
