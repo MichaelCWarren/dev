@@ -77,10 +77,39 @@
   descriptors to a runtime any more.
 - cmux status is opt-in via the `cmux` config key (`cmux.status`, a `MAP_FIELDS` entry), also
   gated on `CMUX_SURFACE_ID`; without both, output is unchanged. `src/cmux.rs` is the
-  module, `StatusGuard` clears the pill on drop. cmux's CLI is Mach-O, so no container-side
-  agent is tracked; `cmux.agent` does nothing yet. cmux ships `cmuxd-remote-linux-<arch>` as
-  a release asset, but it needs a relay token handshake `dev` doesn't own. See
-  `.workflow/cmux-integration/blueprint/agent-relay-findings.md`.
+  module, `StatusGuard` clears the pill on drop.
+- `cmux.agent` reports a container-side agent's hooks, through `src/cmux/agent.rs` (host
+  loopback listener, per-session token, `verb_allowed` allowlist) plus the `cmux-agent`
+  feature in `features/cmux-agent/` (the container's shim and its PATH entry). Three gates,
+  all in `start_agent_relay` (`src/commands/shell.rs`): the key, `cmux.available()`, and the
+  shim probed in the container. Docker only. The relay is the only way in: cmux's socket
+  authorizes by process ancestry, so a container can never be its peer, however the socket
+  is mounted or credentialed.
+- The shim is bash, not a binary, and that is deliberate. A stock Ubuntu image has no `nc`,
+  `socat`, `python3`, `curl`, or `wget`, but bash's own `/dev/tcp` redirection works and
+  `perl` (Essential on Debian) creates the socket inode the cmux wrapper's `-S` test wants.
+  Every binary-shaped delivery needs apt for a fetcher first, so it costs strictly more.
+  `.workflow/cmux-integration/blueprint/agent-relay-findings.md` argued for a musl binary
+  and a CI job to build it; that premise did not survive the probe.
+- Ubuntu's zsh reads none of `/etc/profile.d`, and `resolve_shell` prefers `/bin/zsh`, so a
+  feature that puts something on `PATH` must write `/etc/zsh/zshenv` as well or the common
+  case is unwired.
+- Bump `PROTOCOL` in `src/cmux/agent.rs` and the shim's own constant together. A shim baked
+  into an older image is refused rather than half-understood, and the wrapper reads the
+  refusal as "no cmux".
+- The relay reports and never writes, and `WRITE_VERBS` (`src/cmux/agent.rs`) enforces that
+  by name ahead of the shape check, because `install` is a valid-looking event name.
+  `cmux hooks <agent> install|uninstall|setup` and codex's `inject-args` all generate files
+  in the home of whichever machine runs the CLI, which here is the host. Verified: probing
+  `inject-args` through the relay created `~/.cmux/hooks/cmux-codex-hook-*.sh` on the host
+  and returned argv naming those host paths.
+- That is also why claude is the only agent supported, though cmux ships three wrappers.
+  claude's hooks travel inline in a `--settings` blob and resolve to the shim inside the
+  container; codex and grok are wired up through generated files instead, so neither can
+  work over a relay no matter how the allowlist is widened.
+- The shim reads stdin only for a non-`ping` verb with a non-tty stdin. cmux's codex wrapper
+  invokes the CLI with the caller's stdin still attached, and a blind `cat` there hangs the
+  agent's launch until the read times out.
 
 ## Maintaining this file
 

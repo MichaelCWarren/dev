@@ -21,6 +21,8 @@ use crate::devcontainer::secrets::PluginPath;
 use crate::devcontainer::secrets::provider::is_executable_file;
 use crate::util::process::wait_bounded;
 
+pub mod agent;
+
 /// Status key for `dev up`'s build phases pill.
 ///
 /// `cmux set-status` targets a workspace, not a surface, so a `dev up`
@@ -126,16 +128,25 @@ struct Spawner {
 }
 
 impl Spawner {
-    /// `--socket` must precede `args`, or cmux would read it as an argument
-    /// to the verb rather than a global flag. Stdout and stderr are nulled so
-    /// cmux's own error text never reaches the user's terminal — that is what
-    /// makes "prints nothing" hold.
-    fn command_for(&self, args: &[String]) -> Command {
+    /// The argv every caller shares. `--socket` must precede `args`, or cmux
+    /// would read it as an argument to the verb rather than a global flag.
+    ///
+    /// Stdio and the response timeout are left to the caller, because the two
+    /// callers want opposites: a status pill wants a fast give-up and no
+    /// output, while [`agent`]'s relay is forwarding a hook that may be
+    /// waiting on a person and whose answer it has to read back.
+    fn base_command(&self, args: &[String]) -> Command {
         let mut command = Command::new(&self.binary);
+        command.arg("--socket").arg(&self.socket).args(args);
         command
-            .arg("--socket")
-            .arg(&self.socket)
-            .args(args)
+    }
+
+    /// A status call: bounded by [`RESPONSE_TIMEOUT_ENV`], with stdout and
+    /// stderr nulled so cmux's own error text never reaches the user's
+    /// terminal — that is what makes "prints nothing" hold.
+    fn command_for(&self, args: &[String]) -> Command {
+        let mut command = self.base_command(args);
+        command
             .env(RESPONSE_TIMEOUT_ENV.0, RESPONSE_TIMEOUT_ENV.1)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

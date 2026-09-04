@@ -626,9 +626,49 @@ A pill only appears when `CMUX_SURFACE_ID` is set, the way cmux marks its own te
 missing or unreachable cmux install never prints a warning, so turning the key on in a base
 config is safe even in CI and other terminals that never set it.
 
-`cmux.agent` is accepted and merged, but nothing reads it yet: setting it has no effect
-today. The cmux CLI in the app bundle can't run inside a Linux container, and the relay a
-container-side agent would need to reach cmux is still being worked out.
+### Reporting a container's agent (`cmux.agent`)
+
+`cmux.agent` puts an agent running *inside* the container into the same sidebar. Claude Code
+started in a `dev shell` reports its session, its prompts, and its tool use to cmux exactly
+as one running on the host would.
+
+It needs two things in the same devcontainer.json, because they answer different questions.
+The feature installs the container's half; the key says you want it on:
+
+```json
+{
+  "features": {
+    "/path/to/dev/features/cmux-agent": {}
+  },
+  "cmux": { "agent": true }
+}
+```
+
+The feature lives in this repo at `features/cmux-agent`. Reference it by path, or copy the
+directory into your own project's `.devcontainer/` and reference it relatively. It installs a
+shim, puts its directory first on `PATH` for bash and zsh, and adds `uuid-runtime`, which
+cmux's wrapper needs for the agent's session id and no Ubuntu image ships.
+
+Nothing runs until you open a `dev shell`. That session opens a loopback listener on the
+host, lands cmux's own claude wrapper next to the shim, and points the container at both.
+The shim forwards each hook to the listener, which runs the real cmux CLI on the host, and
+that is the only way to reach cmux at all: its socket refuses any process that did not start
+inside one of its terminals, so a container can never be the one talking to it. The listener
+carries a per-session token and forwards agent hooks and nothing else — no status, no
+notifications — because anything that can reach the host's loopback can reach it.
+
+Requirements, all of which fail silently and leave claude running untouched: Docker (podman
+and Apple Containers are not wired up), a Debian or Ubuntu base image, and a `dev shell`
+rather than `dev exec`.
+
+**Claude Code only, and not for lack of trying.** cmux supports eighteen agents and ships
+wrappers for three, but claude is the only one this can carry. cmux wires claude up by
+injecting an inline settings blob whose hook commands travel in argv, so inside the
+container they resolve to the shim. Every other agent it supports is wired up by generating
+hook scripts on disk and pointing the agent at those paths. Asked for over this relay, that
+generation happens on the host, which is both the wrong machine and a change to a machine
+this feature deliberately never makes. codex and grok are refused for that reason, along
+with every `install`, `uninstall`, and `setup` verb.
 
 ## Command reference
 

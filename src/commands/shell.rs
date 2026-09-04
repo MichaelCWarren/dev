@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::cmux::agent;
 use crate::cmux::{Cmux, SESSION_PILL_STYLE, SHELL_KEY, StatusGuard};
 use crate::commands::exec::resolve_exec_secrets;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
@@ -55,7 +56,15 @@ pub(crate) async fn run_with_runtime(
     // without a recreate. A compose container is not re-checked: `dev up`
     // rejects a compose project that declares secrets, and refusing a shell too
     // would leave a running container with no way in.
-    let secrets = resolve_exec_secrets(config_path, workspace, config_user, registry).await?;
+    let mut secrets = resolve_exec_secrets(config_path, workspace, config_user, registry).await?;
+
+    // Held across the session: dropping it aborts the listener, and
+    // `attend_session` returns on both its own exit and a signal, so there is
+    // no path out of here that leaves a port open.
+    let relay = start_agent_relay(config, cmux, runtime, &container, user.as_deref()).await;
+    if let Some(relay) = &relay {
+        secrets.extend(relay.env());
+    }
 
     sweep_orphans(runtime, &container.id, user.as_deref()).await;
 
@@ -76,6 +85,35 @@ pub(crate) async fn run_with_runtime(
     .await;
     paint_session_pill(pill_enabled, &pill_ctx, false, &mut pill).await;
     exit_code
+}
+
+/// Open the container agent relay for this session, or `None` to leave the
+/// session exactly as it was before this feature existed.
+///
+/// Three things have to hold, and each rules out a different way of being
+/// wrong: the project asked for it, this terminal has a cmux to report to,
+/// and the container carries the `cmux-agent` feature's shim. Podman and
+/// Apple are excluded because neither host alias nor socket behavior has been
+/// proven there, and a relay the container cannot reach would point cmux's
+/// wrapper at a dead end rather than fail cleanly.
+async fn start_agent_relay(
+    config: Option<&DevcontainerConfig>,
+    cmux: &Cmux,
+    runtime: &dyn ContainerRuntime,
+    container: &ContainerInfo,
+    user: Option<&str>,
+) -> Option<agent::Relay> {
+    if !config.is_some_and(DevcontainerConfig::cmux_agent_enabled)
+        || !cmux.available()
+        || runtime.runtime_name() != "docker"
+    {
+        return None;
+    }
+    let agents = agent::installed_agents(runtime, &container.id, user).await?;
+    let relay = agent::start().await?;
+    agent::prepare_container(runtime, &container.id, user, &agents)
+        .await
+        .then_some(relay)
 }
 
 /// Where the shell starts: `workspaceFolder` resolved the same way `dev up`

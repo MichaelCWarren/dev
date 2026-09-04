@@ -245,6 +245,14 @@ impl DevcontainerConfig {
         self.cmux.as_ref().is_some_and(|c| c.status)
     }
 
+    /// Returns true only when cmux is Some and its agent is true; an absent
+    /// key returns false. Says the project asked for container agent
+    /// reporting, not that the container can do it: the `cmux-agent` feature
+    /// has to be installed too, which `crate::cmux::agent` probes for.
+    pub fn cmux_agent_enabled(&self) -> bool {
+        self.cmux.as_ref().is_some_and(|c| c.agent)
+    }
+
     /// Returns the effective workspace bind-mount target inside the container,
     /// per the devcontainer spec precedence:
     ///   1. `workspaceMount.target` (after variable substitution), if set
@@ -786,5 +794,23 @@ mod tests {
 
         let config3 = parse(r#"{"cmux": {"status": true}}"#);
         assert!(config3.cmux_status_enabled());
+    }
+
+    /// The two sub-keys gate different things, so turning one on must not
+    /// answer for the other.
+    #[test]
+    fn cmux_agent_enabled_requires_present_true() {
+        let config1 = parse(r#"{"image": "alpine:latest"}"#);
+        assert!(!config1.cmux_agent_enabled());
+
+        let config2 = parse(r#"{"cmux": {"agent": false}}"#);
+        assert!(!config2.cmux_agent_enabled());
+
+        let config3 = parse(r#"{"cmux": {"status": true}}"#);
+        assert!(!config3.cmux_agent_enabled());
+
+        let config4 = parse(r#"{"cmux": {"agent": true}}"#);
+        assert!(config4.cmux_agent_enabled());
+        assert!(!config4.cmux_status_enabled());
     }
 }

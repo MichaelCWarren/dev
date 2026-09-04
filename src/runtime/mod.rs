@@ -332,6 +332,27 @@ pub trait ContainerRuntime: Send + Sync {
         env: &[(String, SecretValue)],
     ) -> BoxFut<'_, i32>;
 
+    /// Write `bytes` to `target` inside the container, creating its parent
+    /// directory. The file lands non-executable; a caller that needs it to run
+    /// follows with a `chmod`.
+    ///
+    /// The default declines, so a runtime with no copy channel stays honest
+    /// rather than reporting a write that never happened.
+    fn copy_in<'a>(
+        &'a self,
+        _id: &'a str,
+        _user: Option<&'a str>,
+        _bytes: Vec<u8>,
+        _target: &'a str,
+    ) -> BoxFut<'a, ()> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "copying a file in is not supported by the {name} runtime"
+            )))
+        })
+    }
+
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 
     fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>>;

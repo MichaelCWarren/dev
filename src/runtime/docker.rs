@@ -1049,6 +1049,16 @@ impl ContainerRuntime for BollardRuntime {
         "docker"
     }
 
+    fn copy_in<'a>(
+        &'a self,
+        id: &'a str,
+        user: Option<&'a str>,
+        bytes: Vec<u8>,
+        target: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(self.copy_into_container(id, user, bytes, target))
+    }
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
         let image = image.to_string();
         Box::pin(async move { self.pull_image_impl(&image).await })
@@ -1199,6 +1209,16 @@ impl DockerRuntime {
 impl ContainerRuntime for DockerRuntime {
     fn runtime_name(&self) -> &'static str {
         "docker"
+    }
+
+    fn copy_in<'a>(
+        &'a self,
+        id: &'a str,
+        user: Option<&'a str>,
+        bytes: Vec<u8>,
+        target: &'a str,
+    ) -> BoxFut<'a, ()> {
+        self.0.copy_in(id, user, bytes, target)
     }
 
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {

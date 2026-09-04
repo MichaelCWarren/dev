@@ -1,0 +1,8 @@
+{
+  "id": "cmux-agent",
+  "version": "1.0.0",
+  "name": "cmux agent relay",
+  "description": "Lets an agent running in this container report its hooks to the host's cmux sidebar. Installs the shim `dev shell` points cmux's claude wrapper at; does nothing until a `dev shell` session opens the host relay.",
+  "documentationURL": "https://github.com/squirrelsoft-dev/dev/blob/main/features/cmux-agent/README.md",
+  "options": {}
+}

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Stands in for the cmux CLI inside a dev container.
+#
+# The real CLI is Mach-O, and cmux's socket refuses any process without cmux
+# ancestry, so nothing in here can talk to cmux directly. Verbs are forwarded
+# to the relay `dev shell` opens on the host, which runs the real CLI there.
+#
+# Every failure is silent and non-zero. That is the contract cmux's own claude
+# wrapper reads: a failing `ping` means "no cmux", and it runs claude untouched.
+set -u
+export LC_ALL=C
+
+# Bumped with the relay's own constant whenever the framing below changes.
+# A mismatch is refused on the host side rather than half-understood here.
+readonly PROTOCOL="dev-cmux/1"
+
+# How long to wait on the host. The wrapper bounds its liveness ping with the
+# same variable it passes the real CLI; a hook carrying a permission prompt
+# waits on a person, so it gets claude's own 125s ceiling instead.
+readonly PROMPT_TIMEOUT=125
+
+relay=${DEV_CMUX_RELAY:-}
+token=${DEV_CMUX_TOKEN:-}
+[ -n "$relay" ] && [ -n "$token" ] || exit 1
+host=${relay%:*}
+port=${relay##*:}
+[ -n "$host" ] && [ -n "$port" ] || exit 1
+
+# cmux's global flags are dropped: the socket is the host relay's to choose,
+# and the one in this container is an empty inode the wrapper only stats.
+args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --socket) shift 2 || exit 1 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ ${#args[@]} -gt 0 ] || exit 1
+
+if [ "${args[0]}" = "ping" ]; then
+  timeout=${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-2}
+else
+  timeout=$PROMPT_TIMEOUT
+fi
+
+# Only read a payload where one is actually being handed over. An agent runs a
+# hook by piping the event in and closing it; anything else leaves the caller's
+# own stdin attached, and a blind read there waits on the user's terminal for
+# good. Found the hard way: cmux's codex wrapper asks a question with no stdin,
+# and this hung its launch until the tty guard went in.
+body=""
+if [ "${args[0]}" != "ping" ] && [ ! -t 0 ]; then
+  # `$(cat)` alone would eat the payload's trailing newline and desync the byte
+  # count the header promises.
+  body=$(cat; printf x)
+  body=${body%x}
+fi
+
+# bash's own net redirection: no nc, socat, or python in a base image.
+exec 3<>"/dev/tcp/$host/$port" || exit 1
+
+{
+  printf '%s %s %s %s\n' "$PROTOCOL" "$token" "${#args[@]}" "${#body}"
+  printf '%s\n' "${args[@]}"
+  printf '%s' "$body"
+} >&3 || exit 1
+
+read -r -t "$timeout" status len <&3 || exit 1
+if [ "${len:-0}" -gt 0 ]; then
+  # Straight from the socket to stdout, never through a variable: bash drops
+  # NUL bytes on assignment, and codex's `inject-args` answers with a
+  # NUL-separated argv its wrapper splits on. Reading it into a variable would
+  # collapse the whole stream into one argument, which is the failure cmux's
+  # own wrapper carries a comment warning about.
+  head -c "$len" <&3 || exit 1
+fi
+[ "$status" = "ok" ]
