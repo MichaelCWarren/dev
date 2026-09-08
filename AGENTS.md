@@ -43,12 +43,22 @@
   whenever the generated Dockerfile or label encoding changes shape, so images cached under the
   old scheme stop being cache hits; prune then sweeps them as superseded. A pure reordering of
   content-equivalent output does not need a bump; a change to what install scripts receive does.
+  `build_input_fingerprint_is_stable` (a golden sha256 over the generated Dockerfile plus every
+  staged tar) fails whenever that output changes, which is the prompt to make the call.
 - The generated Dockerfile must be byte-identical between processes or Docker's layer cache
   misses and every feature reinstalls. Config's `features` map and `containerEnv` are `HashMap`s,
   so anything baked into the image goes through a sorted view: `order_features` sorts by feature
   id (the one choke point every build path calls), `ResolvedFeature.container_env` is a
   `BTreeMap`, and `build_metadata_label` routes config env maps through `sorted_env_value`.
   serde_json's `preserve_order` feature is on, so `to_value(&hashmap)` is NOT sorted any more.
+  The build context carries the same requirement: `create_tar` (src/devcontainer/features.rs)
+  builds tar headers by hand, zeroing mtime/uid/gid, sorting entries by name and masking modes
+  to `& 0o755`, because `ADD {i}.tar` is a cache key and cmux-agent, always feature 0, is
+  rewritten on every run. Don't go back to `append_path_with_name`/`append_dir_all`, and keep
+  following symlinks and emitting directory headers: a feature's own files are what install.sh
+  reads, so a dropped entry is a build that fails inside the container. Masked modes mean the
+  source mode has to be deliberate rather than the umask's, which is why `stage_feature_in`
+  chmods what it writes and the test trees set every mode by hand.
 - `resolve_depends_on` (src/devcontainer/features.rs) records `install_after` edges in a
   pass over the whole closure, after the discovery queue drains. Recording them during the
   drain loses any edge whose dependent is discovered after the dependency was popped, which

@@ -350,9 +350,24 @@ pub fn stage_feature_in(home: &DevHome) -> Result<PathBuf, DevError> {
     let staged = |e: std::io::Error| DevError::Runtime(format!("staging {FEATURE_NAME}: {e}"));
     std::fs::create_dir_all(&dir).map_err(staged)?;
     for (name, contents) in FEATURE_FILES {
-        std::fs::write(dir.join(name), contents).map_err(staged)?;
+        let path = dir.join(name);
+        std::fs::write(&path, contents).map_err(staged)?;
+        set_staged_mode(&path).map_err(staged)?;
     }
     Ok(dir)
+}
+
+/// These files are tarred into the build context, and that tar is a Docker cache
+/// key, so a mode the invoking shell's umask happened to pick cannot decide it.
+#[cfg(unix)]
+fn set_staged_mode(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(not(unix))]
+fn set_staged_mode(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// One of cmux's wrappers, beside the CLI this process resolved.
@@ -754,6 +769,26 @@ mod tests {
             std::fs::read_to_string(dir.join("cmux")).unwrap(),
             embedded("cmux")
         );
+    }
+
+    /// These files are tarred into the build context, and that tar is a Docker
+    /// cache key. A mode left to the umask makes the same `dev up` produce a
+    /// different context from one shell than from another.
+    #[cfg(unix)]
+    #[test]
+    fn staging_sets_modes_the_umask_cannot_move() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = stage_feature_in(&DevHome::at(tmp.path())).expect("staging writes the feature");
+
+        for (name, _) in FEATURE_FILES {
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "{name} took its mode from the umask");
+        }
     }
 
     #[test]

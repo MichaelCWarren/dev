@@ -290,7 +290,10 @@ pub fn feature_image_tag(
     // from the feature's own defaults, so install scripts see different input.
     // 4: dependsOn edges dropped by the old closure walk are recorded again, so
     // images cached with a feature installed before its dependency must rebuild.
-    const TAG_FORMAT: u32 = 4;
+    // 5: the build context carries symlinks and directories it used to drop, and
+    // file modes are no longer widened, so a feature whose install.sh tolerated a
+    // missing file built an image that is a cache hit but quietly incomplete.
+    const TAG_FORMAT: u32 = 5;
     let inputs = serde_json::json!({
         "tagFormat": TAG_FORMAT,
         "image": config.image,
@@ -646,29 +649,98 @@ pub fn stage_feature_context(features: &[ResolvedFeature]) -> Result<PathBuf, De
 }
 
 /// Create a tar archive of a directory's contents (without the directory itself).
+///
+/// Deterministic on purpose: these bytes are the Docker build context and
+/// `ADD {i}.tar` is a cache key, so identical content must produce identical
+/// bytes. Timestamps and ownership are dropped, and modes are masked; nothing
+/// else about the host reaches the archive.
+/// [`crate::cmux::agent::stage_feature_in`] rewrites its files on every run, and
+/// its absolute-path id always sorts to feature 0, so a fresh mtime there misses
+/// the first context instruction and reinstalls every feature above it.
 fn create_tar(src_dir: &std::path::Path, tar_path: &std::path::Path) -> Result<(), DevError> {
-    use std::fs::File;
-    let file = File::create(tar_path)?;
+    let file = std::fs::File::create(tar_path).map_err(|e| tar_error(tar_path, e))?;
     let mut builder = tar::Builder::new(file);
-    // Append contents of the directory, preserving relative paths.
-    for entry in std::fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let path = entry.path();
-        if path.is_dir() {
-            builder
-                .append_dir_all(&name, &path)
-                .map_err(|e| DevError::Runtime(format!("Failed to tar directory: {e}")))?;
-        } else {
-            builder
-                .append_path_with_name(&path, &name)
-                .map_err(|e| DevError::Runtime(format!("Failed to tar file: {e}")))?;
-        }
-    }
+    append_dir_deterministic(&mut builder, src_dir, std::path::Path::new(""))?;
     builder
         .finish()
         .map_err(|e| DevError::Runtime(format!("Failed to finalize tar: {e}")))?;
     Ok(())
+}
+
+fn tar_error(path: &std::path::Path, e: impl std::fmt::Display) -> DevError {
+    DevError::Runtime(format!("Failed to tar {}: {e}", path.display()))
+}
+
+/// Append a directory's entries under `prefix`, sorted by name, with headers
+/// built by hand so nothing about the host reaches the archive.
+fn append_dir_deterministic<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &std::path::Path,
+    prefix: &std::path::Path,
+) -> Result<(), DevError> {
+    let read = std::fs::read_dir(dir).map_err(|e| tar_error(dir, e))?;
+    let mut entries: Vec<_> = read
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| tar_error(dir, e))?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let name = prefix.join(entry.file_name());
+        // Symlinks are followed, which is what `tar::Builder` did before this
+        // walk replaced it: a link to a file is archived as its target's bytes,
+        // a link to a directory is walked. Both are deterministic, and skipping
+        // them instead leaves install.sh without files its feature shipped.
+        let meta = std::fs::metadata(&path).map_err(|e| tar_error(&path, e))?;
+
+        if meta.is_dir() {
+            append_entry(builder, &name, &path, &meta, tar::EntryType::Directory, &[])?;
+            append_dir_deterministic(builder, &path, &name)?;
+            continue;
+        }
+        // Sockets, fifos and devices mean nothing in a feature artifact.
+        if !meta.is_file() {
+            continue;
+        }
+
+        let data = std::fs::read(&path).map_err(|e| tar_error(&path, e))?;
+        append_entry(builder, &name, &path, &meta, tar::EntryType::Regular, &data)?;
+    }
+    Ok(())
+}
+
+fn append_entry<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    name: &std::path::Path,
+    path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    entry_type: tar::EntryType,
+    data: &[u8],
+) -> Result<(), DevError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_size(data.len() as u64);
+    header.set_mode(normalized_mode(meta));
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    builder
+        .append_data(&mut header, name, data)
+        .map_err(|e| tar_error(path, e))
+}
+
+/// Keep the read and execute bits the source carried and drop the rest, so a
+/// file shipped at 0600 is not republished to every user in the image and a
+/// 0777 one does not arrive group-writable.
+#[cfg(unix)]
+fn normalized_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o755
+}
+
+#[cfg(not(unix))]
+fn normalized_mode(meta: &std::fs::Metadata) -> u32 {
+    if meta.is_dir() { 0o755 } else { 0o644 }
 }
 
 /// Convert an option name to an environment variable name per the devcontainer spec:
@@ -1811,5 +1883,366 @@ mod tests {
             dockerfile.contains("export DESC=\"$(printf '%b' 'line1\\nline2')\""),
             "Special characters should be escaped via printf.\nDockerfile:\n{dockerfile}"
         );
+    }
+
+    /// [`write_feature_tree`] with an executable install.sh, landed in an odd
+    /// mode so a test can tell a preserved mode from a normalized one.
+    fn write_executable_feature_tree(dir: &std::path::Path) {
+        write_feature_tree(dir);
+        set_mode(&dir.join("install.sh"), 0o700);
+    }
+
+    /// Every mode in a test tree is set by hand. One the umask picked would make
+    /// the golden fingerprint below differ between machines.
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("mode should be settable");
+        }
+        #[cfg(not(unix))]
+        let _ = (path, mode);
+    }
+
+    /// Give every file a new mtime, the way `stage_feature_in` does by rewriting
+    /// the cmux-agent files on every run.
+    fn bump_mtimes(dir: &std::path::Path, to: std::time::SystemTime) {
+        for entry in std::fs::read_dir(dir).expect("tree should be readable") {
+            let path = entry.expect("entry should be readable").path();
+            if path.is_dir() {
+                bump_mtimes(&path, to);
+                continue;
+            }
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("file should be writable")
+                .set_modified(to)
+                .expect("mtime should be settable");
+        }
+    }
+
+    /// The tarball is the Docker build context and `ADD {i}.tar` is a cache key,
+    /// so a touched-but-unchanged feature must produce the same bytes.
+    #[test]
+    fn tar_bytes_survive_an_mtime_bump() {
+        let tmp = TempDir::new().expect("temp dir");
+        let src = tmp.path().join("feature");
+        write_executable_feature_tree(&src);
+
+        let first = tmp.path().join("first.tar");
+        create_tar(&src, &first).expect("first tar should be created");
+
+        bump_mtimes(
+            &src,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+        );
+
+        let second = tmp.path().join("second.tar");
+        create_tar(&src, &second).expect("second tar should be created");
+
+        assert_eq!(
+            std::fs::read(&first).expect("first tar reads"),
+            std::fs::read(&second).expect("second tar reads"),
+            "identical content must produce identical bytes"
+        );
+    }
+
+    /// One tar entry, flattened for assertions.
+    struct TarEntry {
+        name: String,
+        mode: u32,
+        mtime: u64,
+        uid: u64,
+        gid: u64,
+        is_dir: bool,
+        data: Vec<u8>,
+    }
+
+    fn read_tar(path: &std::path::Path) -> Vec<TarEntry> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).expect("tar reads");
+        let mut archive = tar::Archive::new(file);
+        archive
+            .entries()
+            .expect("entries should be listable")
+            .map(|entry| {
+                let mut entry = entry.expect("entry should be readable");
+                let header = entry.header().clone();
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).expect("body should read");
+                TarEntry {
+                    name: entry
+                        .path()
+                        .expect("path should decode")
+                        .display()
+                        .to_string(),
+                    mode: header.mode().expect("mode should decode"),
+                    mtime: header.mtime().expect("mtime should decode"),
+                    uid: header.uid().expect("uid should decode"),
+                    gid: header.gid().expect("gid should decode"),
+                    is_dir: header.entry_type().is_dir(),
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    fn tar_entry<'a>(entries: &'a [TarEntry], name: &str) -> &'a TarEntry {
+        entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} should be in the archive"))
+    }
+
+    /// Tar a tree written by [`write_feature_tree`], with `extra` run against it
+    /// first.
+    fn tar_of_feature_tree(tmp: &TempDir, extra: impl FnOnce(&std::path::Path)) -> Vec<TarEntry> {
+        let src = tmp.path().join("feature");
+        write_feature_tree(&src);
+        extra(&src);
+        let tar_path = tmp.path().join("feature.tar");
+        create_tar(&src, &tar_path).expect("tar should be created");
+        read_tar(&tar_path)
+    }
+
+    #[test]
+    fn tar_headers_carry_no_host_metadata() {
+        let tmp = TempDir::new().expect("temp dir");
+        let entries = tar_of_feature_tree(&tmp, |src| {
+            set_mode(&src.join("install.sh"), 0o700);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(src.join("install.sh"), src.join("link.sh"))
+                .expect("symlink should be creatable");
+        });
+
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        let mut expected = vec!["devcontainer-feature.json", "install.sh"];
+        if cfg!(unix) {
+            expected.push("link.sh");
+        }
+        expected.extend(["scripts", "scripts/helper.sh"]);
+        assert_eq!(
+            names, expected,
+            "entries must be name-sorted, with directories carried"
+        );
+
+        for entry in &entries {
+            assert_eq!(
+                (entry.mtime, entry.uid, entry.gid),
+                (0, 0, 0),
+                "{} kept host metadata",
+                entry.name
+            );
+        }
+
+        let mode = |name: &str| tar_entry(&entries, name).mode;
+        let executable = if cfg!(unix) { 0o700 } else { 0o644 };
+        assert_eq!(
+            mode("install.sh"),
+            executable,
+            "an odd exec mode is narrowed, never widened to 0755"
+        );
+        assert_eq!(mode("scripts/helper.sh"), 0o644);
+        assert_eq!(mode("devcontainer-feature.json"), 0o644);
+        assert_eq!(mode("scripts"), 0o755);
+        assert!(tar_entry(&entries, "scripts").is_dir);
+    }
+
+    /// Features ship links like `scripts/common -> ../shared/common.sh`. Leaving
+    /// one out of the context kills install.sh inside the container with a "No
+    /// such file or directory" that names nothing this code touched.
+    #[cfg(unix)]
+    #[test]
+    fn tar_follows_a_symlink_to_its_target() {
+        let tmp = TempDir::new().expect("temp dir");
+        let entries = tar_of_feature_tree(&tmp, |src| {
+            std::fs::create_dir_all(src.join("shared")).expect("shared dir should be creatable");
+            std::fs::write(src.join("shared/common.sh"), "common\n").expect("target writes");
+            set_mode(&src.join("shared"), 0o755);
+            set_mode(&src.join("shared/common.sh"), 0o644);
+            std::os::unix::fs::symlink("../shared/common.sh", src.join("scripts/common.sh"))
+                .expect("symlink should be creatable");
+        });
+
+        assert_eq!(
+            tar_entry(&entries, "scripts/common.sh").data,
+            b"common\n",
+            "a symlink must arrive as the bytes it points at"
+        );
+    }
+
+    /// Nested files survive without directory headers because Docker's unpacker
+    /// invents missing parents. An empty directory is the case that does not.
+    #[test]
+    fn tar_keeps_an_empty_directory() {
+        let tmp = TempDir::new().expect("temp dir");
+        let entries = tar_of_feature_tree(&tmp, |src| {
+            std::fs::create_dir_all(src.join("cache")).expect("cache dir should be creatable");
+            set_mode(&src.join("cache"), 0o755);
+        });
+
+        assert!(
+            tar_entry(&entries, "cache").is_dir,
+            "an empty directory a feature ships must reach the image"
+        );
+    }
+
+    /// A file a feature keeps to itself must not land in the image readable by
+    /// every user in the container.
+    #[cfg(unix)]
+    #[test]
+    fn tar_keeps_a_restrictive_mode() {
+        let tmp = TempDir::new().expect("temp dir");
+        let entries = tar_of_feature_tree(&tmp, |src| {
+            set_mode(&src.join("devcontainer-feature.json"), 0o600);
+        });
+
+        assert_eq!(tar_entry(&entries, "devcontainer-feature.json").mode, 0o600);
+    }
+
+    /// "Permission denied (os error 13)" on its own, in the middle of an image
+    /// build, points at nothing.
+    #[test]
+    fn tar_errors_name_the_path() {
+        let tmp = TempDir::new().expect("temp dir");
+        let err = create_tar(&tmp.path().join("gone"), &tmp.path().join("out.tar"))
+            .expect_err("a missing source directory should fail");
+        assert!(
+            err.to_string().contains("gone"),
+            "the error must name the path: {err}"
+        );
+    }
+
+    /// A feature set shaped like a real project's: a local feature whose
+    /// absolute-path id sorts ahead of every registry id, plus two registry
+    /// features where one installs after the other.
+    ///
+    /// Ids are fixed strings while the staged directories live under `root`,
+    /// because the Dockerfile embeds the id and never the staging path. That is
+    /// what lets the fingerprint below be a constant.
+    fn fingerprint_features(root: &std::path::Path) -> Vec<ResolvedFeature> {
+        let staged = |name: &str| {
+            let dir = root.join(name);
+            write_feature_tree(&dir);
+            dir
+        };
+
+        let mut local = feature("/staged/cmux-agent");
+        local.install_script_path = staged("cmux-agent");
+
+        let mut git = make_feature(
+            "ghcr.io/devcontainers/features/git:1",
+            serde_json::json!({"version": "latest"}),
+        );
+        git.install_script_path = staged("git");
+        git.version = "1".to_string();
+
+        let mut gh = make_feature(
+            "ghcr.io/devcontainers/features/github-cli:1",
+            serde_json::json!({}),
+        );
+        gh.install_script_path = staged("github-cli");
+        gh.version = "1".to_string();
+        gh.install_after = vec!["ghcr.io/devcontainers/features/git:1".to_string()];
+        gh.container_env
+            .insert("GH_NO_UPDATE_NOTIFIER".to_string(), "1".to_string());
+
+        vec![local, git, gh]
+    }
+
+    /// Write a feature directory shaped like the ones that ship a `scripts/`
+    /// subdirectory, so the recursive walk is covered. Nothing is executable,
+    /// which keeps the fingerprint below the same on every platform.
+    fn write_feature_tree(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("scripts")).expect("tree should be creatable");
+        std::fs::write(dir.join("install.sh"), "#!/bin/sh\nexit 0\n").expect("install.sh writes");
+        std::fs::write(dir.join("devcontainer-feature.json"), "{}").expect("metadata writes");
+        std::fs::write(dir.join("scripts/helper.sh"), "echo hi\n").expect("helper writes");
+        set_mode(&dir.join("scripts"), 0o755);
+        set_mode(&dir.join("install.sh"), 0o644);
+        set_mode(&dir.join("devcontainer-feature.json"), 0o644);
+        set_mode(&dir.join("scripts/helper.sh"), 0o644);
+    }
+
+    fn fingerprint_config(env_keys: &[&str]) -> DevcontainerConfig {
+        let pairs: Vec<String> = env_keys
+            .iter()
+            .map(|key| format!("\"{key}\": \"{key}-value\""))
+            .collect();
+        let pairs = pairs.join(", ");
+        config_with(&format!(
+            r#"{{"remoteUser": "vscode", "containerEnv": {{{pairs}}}, "remoteEnv": {{{pairs}}}}}"#
+        ))
+    }
+
+    /// One hash over everything a build hands Docker: the generated Dockerfile
+    /// and every staged tarball, in the order the Dockerfile adds them.
+    fn build_input_fingerprint(
+        features: &[ResolvedFeature],
+        config: &DevcontainerConfig,
+        staging: &std::path::Path,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+
+        std::fs::create_dir_all(staging).expect("staging dir should be creatable");
+        let ordered = order_features(features);
+        let mut hasher = Sha256::new();
+        hasher.update(generate_feature_dockerfile_with_opts(
+            "base:latest",
+            "vsc-test",
+            &ordered,
+            Some("vscode"),
+            config,
+        ));
+        for (i, feature) in ordered.iter().enumerate() {
+            let tar = staging.join(format!("{i}.tar"));
+            create_tar(&feature.install_script_path, &tar).expect("tar should be created");
+            hasher.update(std::fs::read(&tar).expect("tar reads"));
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Locks the bytes a build hands Docker. A `HashMap` that reaches the image
+    /// makes this flap between CI runs, since each process seeds its own hasher.
+    #[test]
+    fn build_input_fingerprint_is_stable() {
+        let tmp = TempDir::new().expect("temp dir");
+        let features = fingerprint_features(&tmp.path().join("features"));
+        let config = fingerprint_config(&["ALPHA", "BETA"]);
+
+        assert_eq!(
+            build_input_fingerprint(&features, &config, &tmp.path().join("staging")),
+            "bded8a0646cbb7f90e65b6bf9fccc998880f43d8a2b53a455bd6f70e7905d48b",
+            "the build input changed shape. If that was deliberate, update this \
+             hash and decide whether TAG_FORMAT needs a bump so images built \
+             under the old scheme stop being cache hits."
+        );
+    }
+
+    /// The same inputs in a different order must produce the same bytes. This is
+    /// the half the golden hash cannot cover: it stays true when the generated
+    /// shape changes on purpose.
+    #[test]
+    fn build_input_ignores_the_order_inputs_arrive_in() {
+        let tmp = TempDir::new().expect("temp dir");
+
+        let features = fingerprint_features(&tmp.path().join("features"));
+        let first = build_input_fingerprint(
+            &features,
+            &fingerprint_config(&["ALPHA", "BETA"]),
+            &tmp.path().join("first"),
+        );
+
+        let mut shuffled = fingerprint_features(&tmp.path().join("shuffled"));
+        shuffled.reverse();
+        let second = build_input_fingerprint(
+            &shuffled,
+            &fingerprint_config(&["BETA", "ALPHA"]),
+            &tmp.path().join("second"),
+        );
+
+        assert_eq!(first, second);
     }
 }
