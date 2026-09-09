@@ -342,11 +342,17 @@ struct ShellWord {
 /// Handles the escaping a terminal applies when it pastes a path: backslash
 /// before a special character, single quotes around a name with newlines, and
 /// double quotes. Whitespace outside quotes separates words.
+///
+/// Only ASCII whitespace separates, matching the shell's default `IFS`. Every
+/// other Unicode space is an ordinary filename character, and macOS puts one
+/// (U+202F, before the AM/PM) in every screenshot it saves; a terminal escapes
+/// the ASCII spaces in that name and leaves the narrow one bare, so splitting
+/// on `char::is_whitespace` tore the path in two and the bridge skipped it.
 fn shell_words(text: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut chars = text.char_indices().peekable();
     while let Some(&(start, c)) = chars.peek() {
-        if c.is_whitespace() {
+        if c.is_ascii_whitespace() {
             chars.next();
             continue;
         }
@@ -373,7 +379,7 @@ fn shell_words(text: &str) -> Vec<ShellWord> {
                     continue;
                 }
                 Some(_) => word.push(c),
-                None if c.is_whitespace() => break,
+                None if c.is_ascii_whitespace() => break,
                 None if c == '\'' || c == '"' => quote = Some(c),
                 None if c == '\\' => {
                     chars.next();
@@ -697,6 +703,26 @@ mod tests {
             &body[found[0].span.clone()],
             body,
             "the span must cover the whole escaped word, including its final escaped character"
+        );
+    }
+
+    /// Bug: every macOS screenshot's name carries U+202F before the AM/PM,
+    /// which `char::is_whitespace` calls a separator but no terminal escapes.
+    /// The path split in two, the second half did not start with `/`, and the
+    /// all-or-nothing rule dropped the whole paste.
+    #[test]
+    fn a_name_holding_a_narrow_no_break_space_stays_one_word() {
+        let dir = TempDir::new().unwrap();
+        let png = file_in(&dir, "Screenshot 2026-09-09 at 3.15.44\u{202f}PM.png");
+        let body = escaped(&png);
+        let found = pasted_files(body.as_bytes());
+        assert_eq!(
+            found,
+            vec![PastedFile {
+                span: 0..body.len(),
+                host_path: png,
+            }],
+            "only ASCII whitespace separates words; U+202F belongs to the name"
         );
     }
 
