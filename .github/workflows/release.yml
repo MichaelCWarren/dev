@@ -1,8 +1,9 @@
 name: Release
 
-# Every push to main cuts a release. The version comes from the commits
-# themselves, so the only thing a contributor has to get right is the commit
-# subject, which the repo already writes in conventional-commit form.
+# Every push to main whose tests pass cuts a release. The version comes from
+# the commits themselves, so the only thing a contributor has to get right is
+# the commit subject, which the repo already writes in conventional-commit
+# form.
 on:
   push:
     branches: [main]
@@ -24,9 +25,63 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    name: Wait for Rust CI
+    runs-on: ubuntu-latest
+    # The same guard the version job carries, because a job that is skipped
+    # skips everything that needs it, and the bump commit must not release.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    # A job-level block replaces the workflow's `contents: write` for this job
+    # alone, which is all that reading another workflow's status needs.
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require this commit's Rust CI to have passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Both workflows trigger on the same push and run in parallel, so
+          # this waits rather than reading a result that is not there yet. A
+          # release tags a commit and publishes binaries built from it, and
+          # doing that before its tests are known to pass is how 0.5.0 shipped
+          # off a red run.
+          deadline=$((SECONDS + 1800))
+          while :; do
+            state=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&event=push" \
+              --jq '.workflow_runs[] | select(.name == "Rust CI") | "\(.status):\(.conclusion)"' \
+              | head -n1 || true)
+            case "$state" in
+              completed:success)
+                echo "Rust CI passed for $SHA"
+                exit 0
+                ;;
+              completed:*)
+                echo "::error::Rust CI concluded ${state#completed:} for $SHA; not releasing"
+                exit 1
+                ;;
+              "")
+                echo "No Rust CI run for $SHA yet, waiting..."
+                ;;
+              *)
+                echo "Rust CI is ${state%%:*}, waiting..."
+                ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for Rust CI on $SHA"
+              exit 1
+            fi
+            sleep 15
+          done
+
   version:
     name: Compute version, bump, and tag
     runs-on: ubuntu-latest
+    needs: ci
     # The bump commit is pushed with GITHUB_TOKEN, and GitHub does not trigger
     # workflows from those pushes, so this cannot loop. The check is belt and
     # braces in case the token is ever swapped for a PAT, which does trigger.
