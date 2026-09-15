@@ -150,7 +150,16 @@ fn ensure_root_caddyfile() -> anyhow::Result<()> {
 }
 
 /// Signal Caddy to reload. Best-effort — prints hints if Caddy isn't available.
+///
+/// A missing Caddyfile is nothing to do rather than a failure, and the check
+/// comes before the install hint so neither speaks. `unregister_site` runs on
+/// every `dev down`, including in a home where no port was ever forwarded and
+/// `ensure_root_caddyfile` therefore never ran; reloading a file that is not
+/// there fails with a "no such file" that reads as a broken config.
 fn reload_caddy() {
+    if !caddyfile_path().exists() {
+        return;
+    }
     let which = Command::new("which").arg("caddy").output();
     if which.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!(
