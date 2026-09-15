@@ -543,6 +543,7 @@ fn remediation_host_alias(alias: &str) -> String {
 /// login shell's own banner cannot be mistaken for one.
 struct SshProbeFacts {
     upstream: String,
+    auth_sock: String,
     shim_executable: bool,
     socket_is_socket: bool,
     ssh_add: SshAddStatus,
@@ -562,6 +563,7 @@ enum SshAddStatus {
 fn ssh_probe_script() -> String {
     format!(
         "printf 'UPSTREAM:%s\\n' \"${{DEV_SSH_AGENT_UPSTREAM:-}}\"; \
+         printf 'AUTHSOCK:%s\\n' \"${{SSH_AUTH_SOCK:-}}\"; \
          printf 'SHIM:%s\\n' \"$([ -x {shim} ] && echo yes || echo no)\"; \
          printf 'SOCKET:%s\\n' \"$([ -S /dev/shm/ssh-agent.sock ] && echo yes || echo no)\"; \
          if command -v ssh-add >/dev/null 2>&1; then \
@@ -577,6 +579,7 @@ fn ssh_probe_script() -> String {
 fn parse_ssh_probe(stdout: &str) -> SshProbeFacts {
     let mut facts = SshProbeFacts {
         upstream: String::new(),
+        auth_sock: String::new(),
         shim_executable: false,
         socket_is_socket: false,
         ssh_add: SshAddStatus::Missing,
@@ -584,6 +587,8 @@ fn parse_ssh_probe(stdout: &str) -> SshProbeFacts {
     for line in stdout.lines() {
         if let Some(value) = line.strip_prefix("UPSTREAM:") {
             facts.upstream = value.to_string();
+        } else if let Some(value) = line.strip_prefix("AUTHSOCK:") {
+            facts.auth_sock = value.to_string();
         } else if let Some(value) = line.strip_prefix("SHIM:") {
             facts.shim_executable = value == "yes";
         } else if let Some(value) = line.strip_prefix("SOCKET:") {
@@ -647,6 +652,17 @@ fn ssh_add_refused_detail(mechanism: &str, exit_code: i32, socket_is_socket: boo
     format!("{mechanism}, ssh-add could not contact the agent (exit {exit_code}){socket_note}")
 }
 
+/// Whether this container was ever given an agent to reach. The upstream
+/// alone cannot say: the base layer's mounted socket leaves it empty and
+/// still expects a working agent, so a relay of its that died must stay a
+/// failure. Every sign of an agent therefore has to be absent — no upstream,
+/// no `SSH_AUTH_SOCK`, and nothing bound where the base layer puts its
+/// socket. Only then has the container nothing to answer for, and reporting
+/// that as a failure sends the reader after a relay nobody asked for.
+fn nothing_configured(facts: &SshProbeFacts) -> bool {
+    facts.upstream.is_empty() && facts.auth_sock.is_empty() && !facts.socket_is_socket
+}
+
 /// The pure half of the ssh agent check: everything decidable from one
 /// probe's facts. `NeedsLivenessProbe` is the one case that costs a second
 /// exec.
@@ -657,6 +673,12 @@ enum SshVerdict {
 
 fn interpret_ssh_probe(facts: &SshProbeFacts) -> SshVerdict {
     let mechanism = ssh_mechanism_label(&facts.upstream);
+    if nothing_configured(facts) {
+        return SshVerdict::Row(
+            CheckStatus::Skipped,
+            "no ssh agent configured for this container".to_string(),
+        );
+    }
     if facts.upstream.starts_with("tcp:") && !facts.shim_executable {
         return SshVerdict::Row(
             CheckStatus::Failed,
@@ -1185,6 +1207,7 @@ mod tests {
         for (exit_code, expected) in cases {
             let facts = SshProbeFacts {
                 upstream: String::new(),
+                auth_sock: "/dev/shm/ssh-agent.sock".to_string(),
                 shim_executable: false,
                 socket_is_socket: false,
                 ssh_add: SshAddStatus::Answered {
@@ -1197,6 +1220,49 @@ mod tests {
             };
             assert_eq!(status, expected, "exit_code={exit_code}");
         }
+    }
+
+    /// A container told about no agent at all has nothing to answer for, so
+    /// the row skips the way `dind` and `cmux relay` already do rather than
+    /// sending the reader after a relay nobody asked for. The second row is
+    /// the one that keeps this honest: the base layer's mounted socket also
+    /// leaves the upstream empty, and a relay of its that died must stay a
+    /// failure.
+    #[test]
+    fn a_container_given_no_agent_skips_while_a_configured_one_that_died_fails() {
+        let cases = [
+            ("", CheckStatus::Skipped),
+            ("/dev/shm/ssh-agent.sock", CheckStatus::Failed),
+        ];
+        for (auth_sock, expected) in cases {
+            let facts = SshProbeFacts {
+                upstream: String::new(),
+                auth_sock: auth_sock.to_string(),
+                shim_executable: false,
+                socket_is_socket: false,
+                ssh_add: SshAddStatus::Answered {
+                    exit_code: 2,
+                    identity_count: 0,
+                },
+            };
+            let SshVerdict::Row(status, _) = interpret_ssh_probe(&facts) else {
+                panic!("auth_sock={auth_sock:?}: expected a decided row");
+            };
+            assert_eq!(status, expected, "auth_sock={auth_sock:?}");
+        }
+    }
+
+    /// The probe has to report `SSH_AUTH_SOCK` for the skip above to be able
+    /// to tell those two apart at all.
+    #[test]
+    fn the_ssh_probe_reports_the_auth_sock_it_found() {
+        let facts = parse_ssh_probe("UPSTREAM:\nAUTHSOCK:/dev/shm/ssh-agent.sock\nSHIM:no\n");
+        assert_eq!(facts.auth_sock, "/dev/shm/ssh-agent.sock");
+        assert!(
+            ssh_probe_script().contains("SSH_AUTH_SOCK"),
+            "the probe script must read SSH_AUTH_SOCK, got: {}",
+            ssh_probe_script()
+        );
     }
 
     #[test]
@@ -1216,6 +1282,7 @@ mod tests {
     fn a_bound_socket_alone_is_not_reported_as_a_working_agent() {
         let facts = SshProbeFacts {
             upstream: "unix:/ssh-agent/host-agent.sock".to_string(),
+            auth_sock: "/dev/shm/ssh-agent.sock".to_string(),
             shim_executable: true,
             socket_is_socket: true,
             ssh_add: SshAddStatus::Answered {
@@ -1297,6 +1364,7 @@ mod tests {
     fn a_tcp_upstream_with_no_shim_installed_is_a_failure() {
         let facts = SshProbeFacts {
             upstream: "tcp:host.docker.internal:51482".to_string(),
+            auth_sock: String::new(),
             shim_executable: false,
             socket_is_socket: false,
             ssh_add: SshAddStatus::Missing,
