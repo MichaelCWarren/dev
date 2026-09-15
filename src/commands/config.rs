@@ -9,7 +9,8 @@ use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::devcontainer::compose::compose_recipe_config;
 use crate::devcontainer::recipe::Recipe;
 use crate::runtime::{
-    ACCEPTED_RUNTIME_VALUES, DEFAULT_RUNTIME_PROPERTY, RuntimeName, detect_runtime,
+    ACCEPTED_RUNTIME_VALUES, ALLOW_RELAY_PROPERTY, DEFAULT_RUNTIME_PROPERTY,
+    DOCKER_SOCKET_PROPERTY, RuntimeName, detect_runtime,
 };
 use crate::tui::prompts;
 use crate::util::workspace::{ConfigSource, find_config_source};
@@ -200,6 +201,43 @@ fn write_target_config(target: &ConfigTarget<'_>, json: &Value) -> anyhow::Resul
 
 // --- Pure mutation functions (operate on a JSON object in memory) ---
 
+/// The map a dotted property's last segment lives in, and that segment.
+///
+/// `sshAgent.allowRelay` is a sub-key of an object, so a flat insert would
+/// write a top-level key with a dot in its name that nothing ever reads.
+/// Properties without a dot take the same path and land where they always
+/// did. `create` says whether a missing intermediate object is made on the
+/// way: a write makes it, a read or a removal does not.
+fn nested_entry<'a>(
+    obj: &'a mut serde_json::Map<String, Value>,
+    property: &'a str,
+    create: bool,
+) -> Option<(&'a mut serde_json::Map<String, Value>, &'a str)> {
+    let mut current = obj;
+    let mut segments = property.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            return Some((current, segment));
+        }
+        if create {
+            current
+                .entry(segment)
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        }
+        current = current.get_mut(segment)?.as_object_mut()?;
+    }
+    None
+}
+
+/// The value at a dotted property, for the readers that only look.
+fn nested_value<'a>(json: &'a Value, property: &str) -> Option<&'a Value> {
+    let mut current = json;
+    for segment in property.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 fn apply_set(obj: &mut serde_json::Map<String, Value>, property: &str, value: &str) -> String {
     let json_value = if let Ok(n) = value.parse::<u64>() {
         Value::Number(n.into())
@@ -208,12 +246,21 @@ fn apply_set(obj: &mut serde_json::Map<String, Value>, property: &str, value: &s
     } else {
         Value::String(value.to_string())
     };
-    obj.insert(property.to_string(), json_value);
-    format!("Set {property} = {value}")
+    match nested_entry(obj, property, /* create */ true) {
+        Some((map, key)) => {
+            map.insert(key.to_string(), json_value);
+            format!("Set {property} = {value}")
+        }
+        None => format!("{property} is not an object in this file, so it was left alone"),
+    }
 }
 
 fn apply_unset(obj: &mut serde_json::Map<String, Value>, property: &str) -> String {
-    if obj.remove(property).is_some() {
+    let removed = match nested_entry(obj, property, /* create */ false) {
+        Some((map, key)) => map.remove(key).is_some(),
+        None => false,
+    };
+    if removed {
         format!("Removed {property}")
     } else {
         format!("Property {property} not found")
@@ -419,18 +466,46 @@ fn persist_to_recipe(
 
 // --- Action handlers (read file, apply mutation, write file, optionally persist to recipe) ---
 
+/// Base-scope-only scalar keys, shared by `config_list` and
+/// `interactive_other` so the two lists can't drift apart the way
+/// `defaultRuntime`-shaped keys otherwise tend to.
+const BASE_ONLY_SCALAR_KEYS: [&str; 3] = [
+    DEFAULT_RUNTIME_PROPERTY,
+    DOCKER_SOCKET_PROPERTY,
+    ALLOW_RELAY_PROPERTY,
+];
+
+/// Every base-only key refuses a project or global target the same way; only
+/// the example it points the user at differs. Binding the key list by length
+/// makes a third entry in `BASE_ONLY_SCALAR_KEYS` a compile error here rather
+/// than a key handed `defaultRuntime`'s example.
+fn base_only_scope_error(property: &str) -> anyhow::Error {
+    let [default_runtime, docker_socket, allow_relay] = BASE_ONLY_SCALAR_KEYS;
+    let example = if property == docker_socket {
+        "<path>"
+    } else if property == default_runtime {
+        "<docker|podman|apple>"
+    } else if property == allow_relay {
+        "<true|false>"
+    } else {
+        "<value>"
+    };
+    anyhow::anyhow!(
+        "{property} is a user-wide dev preference. Use `dev base config set {property} {example}`."
+    )
+}
+
 fn config_set(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow::Result<()> {
-    if property == DEFAULT_RUNTIME_PROPERTY {
-        if target.kind != ConfigTargetKind::Base {
-            anyhow::bail!(
-                "{DEFAULT_RUNTIME_PROPERTY} is a user-wide dev preference. Use `dev base config set {DEFAULT_RUNTIME_PROPERTY} <docker|podman|apple>`."
-            );
-        }
-        if RuntimeName::parse(value).is_none() {
-            anyhow::bail!(
-                "Invalid {DEFAULT_RUNTIME_PROPERTY} value '{value}'. Accepted values: {ACCEPTED_RUNTIME_VALUES}."
-            );
-        }
+    if BASE_ONLY_SCALAR_KEYS.contains(&property) && target.kind != ConfigTargetKind::Base {
+        return Err(base_only_scope_error(property));
+    }
+    if property == DEFAULT_RUNTIME_PROPERTY && RuntimeName::parse(value).is_none() {
+        anyhow::bail!(
+            "Invalid {DEFAULT_RUNTIME_PROPERTY} value '{value}'. Accepted values: {ACCEPTED_RUNTIME_VALUES}."
+        );
+    }
+    if property == DOCKER_SOCKET_PROPERTY && !value.starts_with('/') {
+        anyhow::bail!("{DOCKER_SOCKET_PROPERTY} must be an absolute path: '{value}'.");
     }
 
     let mut json = read_target_config(target)?;
@@ -511,20 +586,16 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
 
     let scalar_keys: Vec<&str> = if target.kind == ConfigTargetKind::Base {
-        vec![
-            "name",
-            "image",
-            "remoteUser",
-            "shutdownAction",
-            "waitFor",
-            DEFAULT_RUNTIME_PROPERTY,
-        ]
+        ["name", "image", "remoteUser", "shutdownAction", "waitFor"]
+            .into_iter()
+            .chain(BASE_ONLY_SCALAR_KEYS)
+            .collect()
     } else {
         vec!["name", "image", "remoteUser", "shutdownAction", "waitFor"]
     };
     // Scalars
     for key in &scalar_keys {
-        if let Some(val) = obj.get(*key) {
+        if let Some(val) = nested_value(&json, key) {
             println!("{key}: {}", format_value(val));
         }
     }
@@ -966,12 +1037,10 @@ fn interactive_lifecycle(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
 fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     let properties: Vec<&str> = if target.kind == ConfigTargetKind::Base {
-        vec![
-            "remoteUser",
-            "shutdownAction",
-            "waitFor",
-            DEFAULT_RUNTIME_PROPERTY,
-        ]
+        ["remoteUser", "shutdownAction", "waitFor"]
+            .into_iter()
+            .chain(BASE_ONLY_SCALAR_KEYS)
+            .collect()
     } else {
         vec!["remoteUser", "shutdownAction", "waitFor"]
     };
@@ -986,7 +1055,9 @@ fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     let key = properties[sel];
 
     let json = read_target_config(target)?;
-    let current = json.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let current = nested_value(&json, key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let prompt = if current.is_empty() {
         key.to_string()
@@ -1116,6 +1187,130 @@ mod tests {
         );
         let json = read_config(&path).unwrap();
         assert!(json.get("defaultRuntime").is_none());
+    }
+
+    #[test]
+    fn docker_socket_is_only_written_to_base_config() {
+        let (_dir, path) = setup_config(r#"{}"#);
+
+        let err =
+            config_set(&target_for(&path), "dockerSocket", "/var/run/docker.sock").unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("user-wide dev preference"), "{message}");
+        assert!(
+            message.contains("dev base config set dockerSocket"),
+            "{message}"
+        );
+        let json = read_config(&path).unwrap();
+        assert!(json.get("dockerSocket").is_none());
+    }
+
+    #[test]
+    fn setting_a_relative_or_tilde_docker_socket_is_rejected_without_writing_stale_state() {
+        for value in ["var/run/docker.sock", "~/.docker/run/docker.sock"] {
+            let (_dir, path) = setup_config(r#"{"dockerSocket":"/var/run/docker.sock"}"#);
+
+            let err = config_set(&base_target_for(&path), "dockerSocket", value).unwrap_err();
+            let message = err.to_string();
+
+            assert!(message.contains(value), "{value}: {message}");
+            let json = read_config(&path).unwrap();
+            assert_eq!(json["dockerSocket"], "/var/run/docker.sock", "{value}");
+        }
+    }
+
+    #[test]
+    fn a_docker_socket_round_trips_through_base_config() {
+        let (_dir, path) = setup_config(r#"{"features":{}}"#);
+
+        config_set(
+            &base_target_for(&path),
+            "dockerSocket",
+            "/var/run/docker.sock",
+        )
+        .unwrap();
+        let json = read_config(&path).unwrap();
+        assert_eq!(json["dockerSocket"], "/var/run/docker.sock");
+
+        config_unset(&base_target_for(&path), "dockerSocket").unwrap();
+        let json = read_config(&path).unwrap();
+        assert!(json.get("dockerSocket").is_none());
+    }
+
+    #[test]
+    fn each_base_only_key_points_at_an_example_of_its_own_value() {
+        let default_runtime = base_only_scope_error(DEFAULT_RUNTIME_PROPERTY).to_string();
+        let docker_socket = base_only_scope_error(DOCKER_SOCKET_PROPERTY).to_string();
+
+        assert!(
+            default_runtime.contains("dev base config set defaultRuntime <docker|podman|apple>"),
+            "{default_runtime}"
+        );
+        assert!(
+            docker_socket.contains("dev base config set dockerSocket <path>"),
+            "{docker_socket}"
+        );
+        assert!(
+            !docker_socket.contains("<docker|podman|apple>"),
+            "a path key must not be offered a runtime name: {docker_socket}"
+        );
+    }
+
+    /// The scope guard for the relay grant. It is not the fix — a
+    /// hand-written devcontainer.json never passes through `dev config set`
+    /// — but a project must not be able to write the key through the CLI
+    /// either, and the base write has to land where the base config reader
+    /// looks rather than as a top-level key with a dot in its name.
+    #[test]
+    fn the_relay_grant_is_base_scope_only_and_lands_where_the_reader_looks() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("base/devcontainer.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"features":{}}"#).unwrap();
+
+        let refused = config_set(&target_for(&path), "sshAgent.allowRelay", "true")
+            .expect_err("a project must not be able to grant itself the SSH agent")
+            .to_string();
+        assert!(
+            refused.contains("dev base config set sshAgent.allowRelay <true|false>"),
+            "{refused}"
+        );
+        assert!(
+            read_config(&path).unwrap().get("sshAgent").is_none(),
+            "a refused set must write nothing"
+        );
+
+        config_set(&base_target_for(&path), "sshAgent.allowRelay", "true").unwrap();
+        let json = read_config(&path).unwrap();
+        assert_eq!(json["sshAgent"]["allowRelay"], true, "{json}");
+        assert!(
+            crate::runtime::ssh_agent_relay_allowed_in(&crate::util::paths::DevHome::at(
+                home.path()
+            )),
+            "what the CLI wrote must be what the permission reader reads: {json}"
+        );
+
+        config_unset(&base_target_for(&path), "sshAgent.allowRelay").unwrap();
+        assert!(
+            !crate::runtime::ssh_agent_relay_allowed_in(&crate::util::paths::DevHome::at(
+                home.path()
+            )),
+            "unsetting the grant must withdraw it"
+        );
+    }
+
+    #[test]
+    fn both_base_key_lists_offer_docker_socket() {
+        assert!(BASE_ONLY_SCALAR_KEYS.contains(&DEFAULT_RUNTIME_PROPERTY));
+        assert!(BASE_ONLY_SCALAR_KEYS.contains(&DOCKER_SOCKET_PROPERTY));
+
+        // `config_list` and `interactive_other` only ever append
+        // `BASE_ONLY_SCALAR_KEYS` onto the base arm; the non-base arm is this
+        // fixed list with no chain at all, so it can never pick either key up.
+        let non_base_scalar_keys = ["name", "image", "remoteUser", "shutdownAction", "waitFor"];
+        assert!(!non_base_scalar_keys.contains(&DEFAULT_RUNTIME_PROPERTY));
+        assert!(!non_base_scalar_keys.contains(&DOCKER_SOCKET_PROPERTY));
     }
 
     #[test]

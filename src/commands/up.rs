@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
@@ -19,7 +19,7 @@ use crate::devcontainer::secrets::validate::validate_secrets_at;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue, ValidatedSecrets};
 use crate::devcontainer::uid;
 use crate::devcontainer::{
-    DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features,
+    DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features_in,
     run_create_hooks, run_start_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
@@ -238,6 +238,12 @@ pub(crate) async fn run_with_runtime_with_providers(
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
+    // Two files decide the relay and only one of them is the project's, so
+    // resolve it once here: the image layer, the listener, and a reused
+    // container's daemon all read this decision and never the key alone.
+    let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, dev_home);
+    relay.report();
+
     let mut pill = cmux
         .guard(BUILD_KEY, config.cmux_status_enabled())
         .notify_after("dev up", NOTIFY_AFTER);
@@ -269,6 +275,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             update_remote_user_uid_default,
             &lockfile,
             dev_home,
+            relay.decision(),
             &mut pill,
         )
         .await;
@@ -343,8 +350,10 @@ pub(crate) async fn run_with_runtime_with_providers(
     if let Some(container) = existing.first() {
         match container.state {
             ContainerState::Running if !rebuild && !has_port_overrides => {
-                return reuse_running_container(runtime, workspace, &config, container, &mut pill)
-                    .await;
+                return reuse_running_container(
+                    runtime, workspace, &config, &relay, container, dev_home, &mut pill,
+                )
+                .await;
             }
             ContainerState::Stopped if !rebuild && !has_port_overrides => {
                 pill.phase("up: starting container", BUILD_STYLE);
@@ -364,10 +373,21 @@ pub(crate) async fn run_with_runtime_with_providers(
                     Some(&workspace_folder),
                 )
                 .await?;
+                crate::ssh_agent::reconcile_relay(
+                    &relay,
+                    runtime,
+                    &container.id,
+                    user.as_deref(),
+                    dev_home,
+                    workspace,
+                )
+                .await;
                 // Only the start-time hooks: the create-time ones ran when this
                 // container was created, and `postCreateCommand` is where
                 // toolchains get installed and databases get seeded.
-                let features = restart_feature_hooks(&config, &config_path).await?;
+                let features =
+                    restart_feature_hooks(&config, &config_path, dev_home, relay.decision())
+                        .await?;
                 let hook_log = begin_hook_log(dev_home, workspace, "start");
                 pill.phase("up: running hooks", BUILD_STYLE);
                 run_start_hooks(
@@ -408,7 +428,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     }
 
     // Use the same image tag that `dev build` produces so we can reuse it.
-    let initial_features = resolve_features(&config)?;
+    let initial_features = resolve_features_in(&config, dev_home, relay.decision())?;
     let has_features = !initial_features.is_empty();
     let needs_build = config.build.is_some() || has_features;
     let folder_image = container_name(workspace);
@@ -598,6 +618,24 @@ pub(crate) async fn run_with_runtime_with_providers(
         secrets_file_env.iter().map(|(k, v)| (k.as_str(), v)),
     );
 
+    // Minted before the container exists, so the endpoint baked into its
+    // environment stays valid for the container's whole life: the self-heal
+    // hook that dials it runs at an arbitrary later moment `dev` is not
+    // present for, with the environment baked in at create. The listener
+    // stays bound in this local until the daemon is handed it below, so no
+    // other local process can hold the port the container now names.
+    let host_access = runtime.host_access();
+    let ssh_agent_relay = crate::ssh_agent::wanted_endpoint(relay.decision(), host_access).await;
+    if let Some((alias, pending)) = &ssh_agent_relay {
+        let endpoint = &pending.endpoint;
+        for (k, v) in crate::ssh_agent::upstream_env(alias, endpoint.port, &endpoint.token) {
+            env.insert(k, v);
+        }
+    }
+    // The alias was only needed to bake the env above.
+    let ssh_agent_relay = ssh_agent_relay.map(|(_, pending)| pending);
+    let ssh_agent_relay_port = ssh_agent_relay.as_ref().map(|p| p.endpoint.port);
+
     let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports = caddy_ports_from_config(&config);
 
@@ -607,8 +645,12 @@ pub(crate) async fn run_with_runtime_with_providers(
     let remote_user = effective_user.as_deref();
 
     // Optionally build a UID-remapping layer to match host UID/GID.
-    let final_image = if uid::should_remap_uid(&config, remote_user, update_remote_user_uid_default)
-    {
+    let final_image = if uid::should_remap_uid(
+        &config,
+        remote_user,
+        update_remote_user_uid_default,
+        host_access,
+    ) {
         pill.phase("up: remapping uid", BUILD_STYLE);
         let image_meta = runtime.inspect_image_metadata(&final_image).await?;
         let image_user = image_meta.container_user.as_deref().unwrap_or("root");
@@ -694,6 +736,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         cap_add: caps.cap_add,
         security_opt: caps.security_opt,
         userns_mode: resolved_run_args.userns_mode.clone(),
+        extra_hosts: host_access.host_gateway_entry().into_iter().collect(),
     };
 
     if !container_config.mounts.is_empty() {
@@ -718,6 +761,16 @@ pub(crate) async fn run_with_runtime_with_providers(
         Some(&workspace_folder),
     )
     .await?;
+    let relay_serving = crate::ssh_agent::start_relay(
+        dev_home,
+        workspace,
+        ssh_agent_relay,
+        &crate::ssh_agent::TokenSink::new(runtime, &container_id, remote_user),
+    )
+    .await;
+    if let Some(port) = ssh_agent_relay_port.filter(|_| relay_serving) {
+        relay.announce(port);
+    }
 
     // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
@@ -768,7 +821,9 @@ async fn reuse_running_container(
     runtime: &dyn ContainerRuntime,
     workspace: &Path,
     config: &DevcontainerConfig,
+    relay: &crate::ssh_agent::RelayConsent,
     container: &ContainerInfo,
+    dev_home: &DevHome,
     pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let user =
@@ -782,6 +837,15 @@ async fn reuse_running_container(
         Some(&workspace_folder),
     )
     .await?;
+    crate::ssh_agent::reconcile_relay(
+        relay,
+        runtime,
+        &container.id,
+        user.as_deref(),
+        dev_home,
+        workspace,
+    )
+    .await;
     // Same self-healing as the restart path: a route set edited in config
     // (renamed host, added port) has no other moment to reach Caddy, since a
     // running container never takes that path.
@@ -829,8 +893,10 @@ fn compose_hooks_owed(running_before: bool, existed_before: bool, rebuild: bool)
 async fn restart_feature_hooks(
     config: &DevcontainerConfig,
     config_path: &Path,
+    dev_home: &DevHome,
+    relay: crate::ssh_agent::RelayDecision,
 ) -> anyhow::Result<Vec<ResolvedFeature>> {
-    let mut features = resolve_features(config)?;
+    let mut features = resolve_features_in(config, dev_home, relay)?;
     if features.is_empty() {
         return Ok(features);
     }
@@ -1615,6 +1681,7 @@ async fn run_compose(
     update_remote_user_uid_default: &str,
     lockfile: &LockfilePolicy,
     dev_home: &DevHome,
+    relay: crate::ssh_agent::RelayDecision,
     pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
@@ -1692,7 +1759,7 @@ async fn run_compose(
     }
 
     // 4. Feature pipeline.
-    let initial_features = resolve_features(config)?;
+    let initial_features = resolve_features_in(config, dev_home, relay)?;
     let has_features = !initial_features.is_empty();
     let mut ordered_features = Vec::new();
 
@@ -1772,8 +1839,12 @@ async fn run_compose(
     let remote_user = effective_user.as_deref();
 
     // 6. UID remapping.
-    let final_image = if uid::should_remap_uid(config, remote_user, update_remote_user_uid_default)
-    {
+    let final_image = if uid::should_remap_uid(
+        config,
+        remote_user,
+        update_remote_user_uid_default,
+        runtime.host_access(),
+    ) {
         pill.phase("up: remapping uid", BUILD_STYLE);
         let image_meta = runtime
             .inspect_image_metadata(&featured_image)
@@ -2264,6 +2335,57 @@ fn parse_single_mount(s: &str) -> anyhow::Result<Option<ParsedMount>> {
     }
 }
 
+/// The host paths a container binds: the workspace itself, then the
+/// project's own `mounts` entries after variable substitution. `dev status`'s
+/// Colima mount-scope warning reuses this rather than a second parse that
+/// could drift from the one `dev up` runs. Feature-contributed mounts are out
+/// of scope: resolving features costs a registry round trip `dev status` has
+/// no other reason to pay.
+pub(crate) fn configured_bind_sources(
+    config: &DevcontainerConfig,
+    workspace: &Path,
+    remote_user: Option<&str>,
+) -> Vec<PathBuf> {
+    let mount_strings = substitute_mounts(
+        config.mounts.as_deref().unwrap_or(&[]),
+        workspace,
+        remote_user,
+    );
+    // The workspace is bound whether or not the project declares a
+    // `workspaceMount`: the container config above takes only the target
+    // from that entry and the source from the workspace path.
+    let mut sources = vec![normalize_bind_source(workspace, workspace)];
+    sources.extend(
+        parse_mounts(&mount_strings)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|mount| match mount {
+                ParsedMount::Bind(bind) => Some(normalize_bind_source(&bind.source, workspace)),
+                _ => None,
+            }),
+    );
+    sources
+}
+
+/// A bind source as the daemon will see it: a relative entry resolved
+/// against the workspace, and `.`/`..` folded away. Nothing here touches the
+/// filesystem, since a source that does not exist yet still gets mounted.
+/// Without this, `~/../elsewhere/keys` passes a component-wise `starts_with`
+/// against the home directory and `./certs` fails it.
+fn normalize_bind_source(source: &Path, workspace: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in workspace.join(source).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
 /// Keep the last entry declared for each target, in declaration order of the
 /// survivors. Callers assemble entries feature-first (feature mounts, config
 /// `mounts`, config `volumes`), so a project mount overrides a feature's on
@@ -2407,9 +2529,10 @@ mod tests {
     use crate::devcontainer::secrets::validate::validate_secrets_for_config;
     use crate::devcontainer::secrets::{SecretValue, ValidatedSecrets};
     use crate::error::DevError;
+    use crate::runtime::docker::DockerFlavor;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-        ExecResult, ImageMetadata,
+        ExecResult, HostAccess, ImageMetadata,
     };
     use crate::runtime::{BindMount, VolumeMount};
     use std::collections::{BTreeMap, HashMap};
@@ -3129,6 +3252,10 @@ mod tests {
         /// `exec` answers, but with a non-zero status for a command that
         /// cannot fail on its own.
         exec_exit_code: i32,
+        /// `exec`'s stdout for every call, standing in for a container's
+        /// `printenv` reply — empty by default, since only the ssh-agent
+        /// relay read-back cares what stdout says.
+        exec_stdout: String,
         /// Commands `exec` was asked to run, with the user each ran as, so the
         /// gate's probe is observable.
         execs: Arc<Mutex<Vec<ExecCall>>>,
@@ -3139,6 +3266,10 @@ mod tests {
         /// What `inspect_image_metadata` reports, so cache-path tests can seed
         /// `devcontainer.metadata` entries to recover feature contributions from.
         image_metadata: Arc<Mutex<ImageMetadata>>,
+        /// Every tag the runtime was asked to build, so the UID-remapping
+        /// layer is observable without a daemon.
+        built_tags: Arc<Mutex<Vec<String>>>,
+        host_access: HostAccess,
     }
 
     impl UpFakeRuntime {
@@ -3162,12 +3293,15 @@ mod tests {
                 exec_never_returns: false,
                 exec_refusals_before_silence: None,
                 exec_exit_code: 0,
+                exec_stdout: String::new(),
                 execs: Arc::new(Mutex::new(Vec::new())),
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
                 containers: Arc::new(Mutex::new(Vec::new())),
                 image_metadata: Arc::new(Mutex::new(ImageMetadata::default())),
+                built_tags: Arc::new(Mutex::new(Vec::new())),
+                host_access: HostAccess::unknown(),
             }
         }
 
@@ -3179,6 +3313,22 @@ mod tests {
 
         fn named_runtime(mut self, runtime_name: &'static str) -> Self {
             self.runtime_name = runtime_name;
+            self
+        }
+
+        /// Seed the descriptor `host_access()` reports, so a test can drive
+        /// `host_gateway_entry` through `run_with_runtime` instead of calling
+        /// it directly.
+        fn with_host_access(mut self, host_access: HostAccess) -> Self {
+            self.host_access = host_access;
+            self
+        }
+
+        /// Seed what every `exec` reports on stdout, so a test can make the
+        /// ssh-agent relay's `printenv` read-back answer with a chosen
+        /// container environment.
+        fn with_exec_stdout(mut self, stdout: impl Into<String>) -> Self {
+            self.exec_stdout = stdout.into();
             self
         }
 
@@ -3391,12 +3541,13 @@ mod tests {
             &self,
             _dockerfile: &str,
             _context: &Path,
-            _tag: &str,
+            tag: &str,
             _build_args: &HashMap<String, String>,
             _no_cache: bool,
             _verbose: bool,
         ) -> BoxFut<'_, ()> {
-            unused()
+            self.built_tags.lock().unwrap().push(tag.to_string());
+            Box::pin(async { Ok(()) })
         }
 
         fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -3472,6 +3623,7 @@ mod tests {
             let settling = self.exec_errors_before_success.clone();
             let never_returns = self.exec_never_returns;
             let refusals_left = self.exec_refusals_before_silence.clone();
+            let stdout = self.exec_stdout.clone();
             let execs = self.execs.clone();
             Box::pin(async move {
                 // Session bookkeeping is `dev`'s own traffic. Recording it here
@@ -3513,7 +3665,7 @@ mod tests {
                 }
                 Ok(ExecResult {
                     exit_code,
-                    stdout: String::new(),
+                    stdout,
                     stderr: if exit_code == 0 {
                         String::new()
                     } else {
@@ -3639,6 +3791,10 @@ mod tests {
         ) -> BoxFut<'_, AttachedExec> {
             unused()
         }
+
+        fn host_access(&self) -> HostAccess {
+            self.host_access
+        }
     }
 
     /// Drive `run_with_runtime` over a minimal image-based workspace.
@@ -3743,6 +3899,44 @@ mod tests {
             &Cmux::recording().0,
         )
         .await
+    }
+
+    /// [`run_up_with_fake`] against a `~/.dev/` the test owns. Anything that
+    /// depends on a base preference has to run through this: the plain
+    /// helpers resolve `DevHome::current()`, so they would read whatever the
+    /// developer's own `~/.dev/base/devcontainer.json` says.
+    async fn run_up_in_dev_home(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        dev_home: &DevHome,
+    ) -> anyhow::Result<()> {
+        let providers = ProviderRegistry::with_builtins(workspace.path());
+        super::run_with_runtime_with_providers(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* secrets_file */ None,
+            /* no_base */ true,
+            /* secrets_override */ None,
+            &providers,
+            dev_home,
+            &Cmux::recording().0,
+        )
+        .await
+    }
+
+    /// A `~/.dev/` whose base config grants the SSH agent relay, which is the
+    /// only thing that lets a project's request take effect.
+    fn dev_home_allowing_the_relay(dir: &TempDir) -> DevHome {
+        let path = dir.path().join("base/devcontainer.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"sshAgent": {"allowRelay": true}}"#).unwrap();
+        DevHome::at(dir.path())
     }
 
     /// [`run_up_with_providers_and_flags`] with a caller-supplied `Cmux`
@@ -3934,10 +4128,21 @@ mod tests {
         let mut pill = cmux
             .guard(BUILD_KEY, true)
             .notify_after("dev up", std::time::Duration::ZERO);
+        let dev_home_dir = TempDir::new().unwrap();
+        let dev_home = DevHome::at(dev_home_dir.path());
+        let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, &dev_home);
 
-        super::reuse_running_container(&rt, workspace.path(), &config, &container, &mut pill)
-            .await
-            .expect("a running container that runs commands must be reused");
+        super::reuse_running_container(
+            &rt,
+            workspace.path(),
+            &config,
+            &relay,
+            &container,
+            &dev_home,
+            &mut pill,
+        )
+        .await
+        .expect("a running container that runs commands must be reused");
         drop(pill);
 
         assert_eq!(
@@ -4046,6 +4251,45 @@ mod tests {
             &abs_workspace.to_string_lossy().to_string(),
             "local_folder label must be the absolute workspace path"
         );
+    }
+
+    /// Fails if the implementation ignores `injects_alias` and always sets
+    /// the header, which is exactly the regression that would break Docker
+    /// Desktop by flipping its resolved address to IPv6.
+    #[tokio::test]
+    async fn the_alias_is_injected_only_when_the_daemon_does_not_inject_it_itself() {
+        fn access(gateway_alias: Option<&'static str>, injects_alias: bool) -> HostAccess {
+            HostAccess {
+                gateway_alias,
+                injects_alias,
+                ..HostAccess::all_off()
+            }
+        }
+
+        let cases: [(&str, HostAccess, Vec<String>); 3] = [
+            (
+                "Desktop injects its own alias",
+                access(Some("host.docker.internal"), true),
+                vec![],
+            ),
+            (
+                "Engine names an alias but does not inject it",
+                access(Some("host.docker.internal"), false),
+                vec!["host.docker.internal:host-gateway".to_string()],
+            ),
+            ("no alias at all", access(None, false), vec![]),
+        ];
+
+        for (label, host_access, expected) in cases {
+            let workspace = TempDir::new().unwrap();
+            write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+            let rt = UpFakeRuntime::ok().with_host_access(host_access);
+            run_up_with_fake(&rt, &workspace)
+                .await
+                .expect("up should succeed with a cooperating fake runtime");
+
+            assert_eq!(rt.created_config().extra_hosts, expected, "{label}");
+        }
     }
 
     /// The reported issue #4 failure: create and start both succeed, but the
@@ -4422,6 +4666,96 @@ mod tests {
         );
     }
 
+    /// `dev status`'s Colima warning asks whether each of these falls under
+    /// the home directory, with a component-wise `starts_with` that `..`
+    /// walks straight past and that a relative path fails outright. The
+    /// workspace itself belongs here too: it is bound on every run, it is
+    /// never declared in `mounts`, and a repo checked out outside home is
+    /// the case the warning exists for.
+    #[test]
+    fn configured_bind_sources_are_normalized_and_lead_with_the_workspace() {
+        let workspace = Path::new("/Users/someone/code/project");
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"image":"ubuntu:24.04","mounts":[
+                "source=/Users/someone/../elsewhere/keys,target=/keys,type=bind",
+                "source=./certs,target=/certs,type=bind",
+                "source=cache-vol,target=/cache,type=volume"
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::configured_bind_sources(&config, workspace, None),
+            vec![
+                std::path::PathBuf::from("/Users/someone/code/project"),
+                std::path::PathBuf::from("/Users/elsewhere/keys"),
+                std::path::PathBuf::from("/Users/someone/code/project/certs"),
+            ]
+        );
+    }
+
+    /// [`run_up_with_fake`] with `--update-remote-user-uid` set, the flag
+    /// every other test pins to "never" so the remapping layer stays out of
+    /// the way.
+    async fn run_up_with_uid_default(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        update_remote_user_uid_default: &str,
+    ) -> anyhow::Result<()> {
+        super::run_with_runtime(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            update_remote_user_uid_default,
+            /* port_overrides */ &[],
+            /* secrets_file */ None,
+            /* no_base */ true,
+            /* secrets_override */ None,
+            &Cmux::recording().0,
+        )
+        .await
+    }
+
+    /// UID remapping now follows `HostAccess::squashes_ownership` rather than
+    /// the host platform, and the two disagree only on a flavor: on a Mac the
+    /// old blanket skip and Docker Desktop's descriptor give the same answer,
+    /// so a regression here is invisible until someone runs OrbStack. The
+    /// same config twice, one flavor each, is what makes the field bite.
+    #[tokio::test(start_paused = true)]
+    async fn uid_remapping_follows_the_descriptor_and_not_the_host_platform() {
+        let cases = [
+            // Docker Desktop's file sharing already squashes bind mount
+            // ownership to the container user; remapping would fight it.
+            (DockerFlavor::DockerDesktop, false),
+            (DockerFlavor::OrbStack, true),
+        ];
+
+        for (flavor, expect_remap) in cases {
+            let workspace = TempDir::new().unwrap();
+            write_project_config(&workspace, r#"{"image":"ubuntu:24.04","remoteUser":"dev"}"#);
+            let rt = UpFakeRuntime::ok().with_host_access(HostAccess::for_flavor(flavor));
+
+            run_up_with_uid_default(&rt, &workspace, "on")
+                .await
+                .expect("the container must come up either way");
+
+            let image = rt.created_config.lock().unwrap().clone().unwrap().image;
+            assert_eq!(
+                image.ends_with("-uid"),
+                expect_remap,
+                "{flavor:?}: created from {image}"
+            );
+            assert_eq!(
+                rt.built_tags.lock().unwrap().len(),
+                usize::from(expect_remap),
+                "{flavor:?}: only a remapping run builds an image at all"
+            );
+        }
+    }
+
     /// The same arm must still be the fast path for a healthy container: the
     /// gate proves it, nothing is recreated, and `dev up` reports it as
     /// already running.
@@ -4436,12 +4770,82 @@ mod tests {
         assert_eq!(
             rt.execs().len(),
             1,
-            "the reused container must be probed exactly once"
+            "a project that did not ask for the ssh agent relay pays only the readiness probe"
         );
         assert!(
             rt.created_config.lock().unwrap().is_none(),
             "a usable running container must not be recreated"
         );
+    }
+
+    /// The gate the previous test proves off: with the relay asked for and
+    /// the base allowing it, reuse of a running container must still pay the
+    /// endpoint read-back exec, so a self-healing relay in the container's
+    /// ssh config keeps working across `dev up` runs and not just the one
+    /// that created it.
+    #[tokio::test(start_paused = true)]
+    async fn up_reads_the_ssh_agent_endpoint_back_when_reusing_a_running_container_with_relay_on() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","sshAgent":{"relay":true}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_in_dev_home(&rt, &workspace, &dev_home_allowing_the_relay(&home))
+            .await
+            .expect("a running container that runs commands must be reused");
+
+        let execs = rt.execs();
+        assert_eq!(
+            execs.len(),
+            2,
+            "relay on must add the endpoint read-back exec to the readiness probe, got: {execs:?}"
+        );
+        assert_reads_the_endpoint_back(&execs[1].0);
+    }
+
+    /// The same project against a base that has not granted the relay. This
+    /// is the hole the permission closes, at the level a cloned repository
+    /// would exploit it: the request is identical and everything downstream
+    /// of the decision must behave as though the key were absent, down to
+    /// not reading an endpoint back out of the container.
+    #[tokio::test(start_paused = true)]
+    async fn up_starts_no_relay_for_a_project_the_base_has_not_allowed() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","sshAgent":{"relay":true}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_in_dev_home(&rt, &workspace, &DevHome::at(home.path()))
+            .await
+            .expect("a refused relay must not fail the run, only stay off");
+
+        assert_eq!(
+            rt.execs().len(),
+            1,
+            "a project the base has not allowed pays only the readiness probe, got: {:?}",
+            rt.execs()
+        );
+    }
+
+    /// The read-back exec, identified by shape rather than by its exact
+    /// argv: what it must print is pinned where it can be run for real, in
+    /// `ssh_agent::tests::the_read_back_command_produces_what_the_parser_reads`.
+    fn assert_reads_the_endpoint_back(cmd: &[String]) {
+        assert_eq!(
+            cmd[..2],
+            ["sh".to_string(), "-c".to_string()],
+            "the read-back must not depend on a login shell, got: {cmd:?}"
+        );
+        for var in ["DEV_SSH_AGENT_UPSTREAM", "DEV_SSH_AGENT_TOKEN"] {
+            assert!(
+                cmd[2].contains(var),
+                "the read-back must name {var}, got: {cmd:?}"
+            );
+        }
     }
 
     /// Reusing a running Docker/Podman container is the trigger; the masking
@@ -4532,6 +4936,59 @@ mod tests {
             rt.created_config.lock().unwrap().is_none(),
             "a stopped reusable container must not be recreated"
         );
+    }
+
+    /// The other reuse arm's gate, mirroring
+    /// `up_reads_the_ssh_agent_endpoint_back_when_reusing_a_running_container_with_relay_on`:
+    /// restarting a stopped container must also pay the endpoint read-back
+    /// exec, before `postStartCommand` runs.
+    #[tokio::test(start_paused = true)]
+    async fn up_reads_the_ssh_agent_endpoint_back_when_restarting_a_stopped_container_with_relay_on()
+     {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "sshAgent": {"relay": true},
+                "postStartCommand": "touch started"
+            }"#,
+        );
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_in_dev_home(&rt, &workspace, &dev_home_allowing_the_relay(&home))
+            .await
+            .expect("a stopped reusable container should be started in place");
+
+        let execs = rt.execs();
+        assert_eq!(
+            execs.len(),
+            3,
+            "relay on must add the endpoint read-back exec to the probe and \
+             postStartCommand, got: {execs:?}"
+        );
+        assert_reads_the_endpoint_back(&execs[1].0);
+    }
+
+    /// Both reuse arms reach `ensure_relay` through `reconcile_relay`, which
+    /// hands it `read_endpoint`'s return with no transformation in between,
+    /// so proving what `read_endpoint` returns from a reused container's real
+    /// environment proves what `ensure_relay` would receive. Driving this
+    /// through `ensure_relay` itself would spawn a real daemon process,
+    /// which is not a side effect a unit test should trigger; the value it
+    /// is handed is what matters here, not that process.
+    #[tokio::test]
+    async fn the_endpoint_read_back_from_a_reused_container_is_what_ensure_relay_would_receive() {
+        let rt = UpFakeRuntime::ok().with_exec_stdout(
+            "DEV_SSH_AGENT_UPSTREAM=tcp:host.docker.internal:51482\nDEV_SSH_AGENT_TOKEN=a-real-token\n",
+        );
+
+        let endpoint = crate::ssh_agent::read_endpoint(&rt, "already-running-id", None)
+            .await
+            .expect("a well-formed container environment must parse into an endpoint");
+
+        assert_eq!(endpoint.port, 51482);
+        assert_eq!(endpoint.token, "a-real-token");
     }
 
     /// Collect the hook bodies from recorded execs. `hook_args` wraps each hook
@@ -5849,7 +6306,7 @@ mod tests {
         assert_eq!(
             rt.execs().len(),
             1,
-            "the reuse arm must run through the readiness probe"
+            "the reuse arm must still run through the readiness probe"
         );
     }
 

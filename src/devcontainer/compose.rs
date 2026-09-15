@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::effective::{
-    absolutize_config_paths, config_definition, prune_reporting_dropped,
+    absolutize_config_paths, config_definition, prune_reporting_dropped, reject_base_relay_key,
 };
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{LayerId, Provenance, merge_layer_tracked, merge_layers_tracked};
@@ -287,6 +287,7 @@ fn compose_config_details_tracked_in(
         let base_config_path = dev_home.base_config();
         let mut base = read_json_file(&base_config_path)?;
         if let Some(ref mut b) = base {
+            reject_base_relay_key(b, &base_config_path)?;
             if let Some(base_dir) = base_config_path.parent() {
                 absolutize_config_paths(b, base_dir);
             }
@@ -661,6 +662,52 @@ mod tests {
         fn recipe_dir(&self) -> PathBuf {
             self.workspace.join(".devcontainer")
         }
+    }
+
+    /// The recipe half of the base-layer refusal: a recipe project reads the
+    /// base config through its own assembly, so the key has to be refused
+    /// there too rather than only on the direct-config path.
+    #[test]
+    fn a_relay_key_in_the_base_layer_is_refused_for_a_recipe_project() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest"}"#,
+            Some(r#"{"sshAgent": {"relay": true}}"#),
+            None,
+            "docker",
+        );
+
+        let error = compose_config_in(&env.dev_home, &env.recipe(), "docker", true)
+            .expect_err("a base layer that turns the relay on for every project must not compose")
+            .to_string();
+
+        assert!(error.contains("sshAgent.allowRelay"), "{error}");
+    }
+
+    /// The trap this guards: a recipe workspace has no project layer at all,
+    /// so sourcing the request from `LayerId::Project` would leave every
+    /// recipe user without a relay while every plain-project test still
+    /// passed. The request is read from the merged config, which is where a
+    /// recipe's own ask lands.
+    #[test]
+    fn a_recipe_customization_can_ask_for_a_relay_the_base_grants() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest"}"#,
+            Some(r#"{"sshAgent": {"allowRelay": true}}"#),
+            None,
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe.customizations = serde_json::json!({"sshAgent": {"relay": true}});
+
+        let composed = env.compose(&recipe, "docker", true);
+        let config: DevcontainerConfig =
+            serde_json::from_value(composed).expect("composed config should deserialize");
+
+        assert!(config.ssh_agent_relay_requested());
+        assert_eq!(
+            crate::ssh_agent::relay_decision_in(&config, &env.dev_home),
+            crate::ssh_agent::RelayDecision::On
+        );
     }
 
     #[test]

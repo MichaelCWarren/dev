@@ -1,6 +1,32 @@
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
+/// How long a daemon gets to honor SIGTERM before [`kill_and_wait`] stops
+/// asking.
+const SHUTDOWN_POLLS: u32 = 20;
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// Whether `pid` still names a live process, asked of the kernel rather than
+/// of a pid file that may outlive it.
+pub(crate) fn is_process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// SIGTERM, then SIGKILL if the process is still around two seconds later.
+/// The shutdown every daemon `dev` spawns and tracks by pid file gets.
+pub(crate) fn kill_and_wait(pid: u32) {
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    for _ in 0..SHUTDOWN_POLLS {
+        if !is_process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(SHUTDOWN_POLL);
+    }
+    if is_process_alive(pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+}
+
 /// Wait for `child` to exit, giving up after `timeout`. `None` means it was
 /// still running (or could not be polled) when the deadline passed.
 pub(crate) fn wait_bounded(

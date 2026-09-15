@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::devcontainer::DevcontainerConfig;
-use crate::runtime::ContainerRuntime;
+use crate::runtime::{ContainerRuntime, HostAccess};
 
 /// Dockerfile used to remap a container user's UID/GID to match the host.
 /// Sourced from the official devcontainer CLI's `scripts/updateUID.Dockerfile`.
@@ -45,6 +45,7 @@ pub fn should_remap_uid(
     config: &DevcontainerConfig,
     remote_user: Option<&str>,
     update_default: &str,
+    host_access: HostAccess,
 ) -> bool {
     // "never" disables UID remapping entirely.
     if update_default == "never" {
@@ -59,8 +60,9 @@ pub fn should_remap_uid(
         return false;
     }
 
-    // Skip on macOS — the official CLI defaults updateRemoteUserUIDOnMacOS to false.
-    if cfg!(target_os = "macos") {
+    // Skip where the file sharing layer already squashes bind mount ownership
+    // to the container user — remapping would fight it, not fix it.
+    if host_access.squashes_ownership {
         return false;
     }
 
@@ -132,6 +134,16 @@ pub async fn build_uid_image(
 mod tests {
     use super::*;
 
+    /// Built from `all_off` rather than `HostAccess::for_flavor(...)`, so a
+    /// later edit to the flavor table cannot silently change what these tests
+    /// prove.
+    fn access(squashes_ownership: bool) -> HostAccess {
+        HostAccess {
+            squashes_ownership,
+            ..HostAccess::all_off()
+        }
+    }
+
     fn test_config(update_uid: Option<bool>) -> DevcontainerConfig {
         DevcontainerConfig {
             name: None,
@@ -160,54 +172,86 @@ mod tests {
             update_remote_user_uid: update_uid,
             dotfiles: None,
             cmux: None,
+            ssh_agent: None,
         }
     }
 
     #[test]
     fn test_never_mode_disables_remap() {
         let config = test_config(Some(true));
-        assert!(!should_remap_uid(&config, Some("vscode"), "never"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("vscode"),
+            "never",
+            access(false)
+        ));
     }
 
     #[test]
     fn test_root_user_skips_remap() {
         let config = test_config(None);
-        assert!(!should_remap_uid(&config, Some("root"), "on"));
-        assert!(!should_remap_uid(&config, None, "on"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("root"),
+            "on",
+            access(false)
+        ));
+        assert!(!should_remap_uid(&config, None, "on", access(false)));
     }
 
     #[test]
     fn test_numeric_user_skips_remap() {
         let config = test_config(None);
-        assert!(!should_remap_uid(&config, Some("1000"), "on"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("1000"),
+            "on",
+            access(false)
+        ));
     }
 
     #[test]
     fn test_config_override_off() {
         let config = test_config(Some(false));
         // Config says false, even though default is "on"
-        assert!(!should_remap_uid(&config, Some("vscode"), "on"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("vscode"),
+            "on",
+            access(false)
+        ));
     }
 
     #[test]
     fn test_default_off_no_config() {
         let config = test_config(None);
         // Default is "off" and config doesn't override
-        assert!(!should_remap_uid(&config, Some("vscode"), "off"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("vscode"),
+            "off",
+            access(false)
+        ));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// The same assertion on every host: remapping now follows the daemon's
+    /// own ownership behavior, not which OS `dev` runs on. Fails on macOS if
+    /// a platform-keyed skip survives anywhere in the function.
     #[test]
-    fn test_remap_on_linux() {
+    fn remapping_follows_whether_the_daemon_squashes_ownership() {
         let config = test_config(None);
-        assert!(should_remap_uid(&config, Some("vscode"), "on"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_remap_skipped_on_macos() {
-        let config = test_config(None);
-        assert!(!should_remap_uid(&config, Some("vscode"), "on"));
+        assert!(!should_remap_uid(
+            &config,
+            Some("vscode"),
+            "on",
+            access(true)
+        ));
+        assert!(should_remap_uid(
+            &config,
+            Some("vscode"),
+            "on",
+            access(false)
+        ));
     }
 
     /// Prune's keep set derives `-uid` tags through this same function; the

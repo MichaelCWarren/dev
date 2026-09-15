@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::devcontainer::effective::effective_config_in;
 use crate::devcontainer::features::{WORKSPACE_IMAGE_LABEL, feature_image_tag};
-use crate::devcontainer::resolve_features;
+use crate::devcontainer::resolve_features_in;
 use crate::devcontainer::uid::uid_image_tag;
 use crate::runtime::{ContainerRuntime, ImageInfo, detect_runtime};
 use crate::util::paths::DevHome;
@@ -179,7 +179,15 @@ async fn keep_set(
                          To clean up manually: docker image ls --filter 'reference={folder_image}-features-*'"
                     )
                 })?;
-        let features = resolve_features(&config)?;
+        // Both halves of the tag come from the `dev_home` the caller passed:
+        // re-deriving the relay decision from `DevHome::current()` would make
+        // the image family depend on the machine rather than on the home the
+        // config was read from.
+        let features = resolve_features_in(
+            &config,
+            dev_home,
+            crate::ssh_agent::relay_decision_in(&config, dev_home),
+        )?;
         if !features.is_empty() {
             let tag = feature_image_tag(folder_image, &config, &features);
             current.insert(uid_image_tag(&tag, folder_image));
@@ -226,6 +234,23 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    /// The features a `dev up` against `dev_home` would build with, which is
+    /// what the keep set has to agree with. Nothing here may reach for
+    /// `DevHome::current()`: an expectation read off the developer's own
+    /// `~/.dev` agrees with a keep set read off the same place, and the two
+    /// then agree about the wrong thing.
+    fn features_for(
+        config: &DevcontainerConfig,
+        dev_home: &DevHome,
+    ) -> Vec<crate::devcontainer::features::ResolvedFeature> {
+        resolve_features_in(
+            config,
+            dev_home,
+            crate::ssh_agent::relay_decision_in(config, dev_home),
+        )
+        .unwrap()
+    }
 
     fn unused<T>() -> BoxFut<'static, T> {
         Box::pin(async { Err(DevError::Runtime("not used by this test".into())) })
@@ -390,7 +415,7 @@ mod tests {
         let folder_image = container_name(workspace.path());
         let config: DevcontainerConfig =
             crate::devcontainer::jsonc::parse_jsonc(config_json).expect("test config parses");
-        let features = resolve_features(&config).unwrap();
+        let features = features_for(&config, &DevHome::at(home.path()));
         let current = feature_image_tag(&folder_image, &config, &features);
         (home, workspace, folder_image, current)
     }
@@ -490,6 +515,65 @@ mod tests {
         assert!(format!("{err}").contains(&stale_a));
     }
 
+    /// The keep set has to be the image family `dev up` would build for the
+    /// home it was handed, and the relay's shim is part of that family: the
+    /// grant lives in the base config, so a keep set that read the grant
+    /// anywhere else would compute a tag for a different image and prune the
+    /// live one.
+    ///
+    /// Both directions in one test on purpose. A keep set that resolved the
+    /// grant from `DevHome::current()` would agree with whichever of these
+    /// two the developer's own `~/.dev` happens to match and disagree with
+    /// the other, so exactly one of them fails on any machine — which is what
+    /// makes this deterministic where a single case would not be.
+    #[tokio::test]
+    async fn prune_resolves_the_relay_grant_from_the_home_it_was_given() {
+        for granted in [true, false] {
+            let home = TempDir::new().unwrap();
+            let workspace = TempDir::new().unwrap();
+            let dev_home = DevHome::at(home.path());
+            std::fs::create_dir_all(dev_home.base_config().parent().unwrap()).unwrap();
+            let base = if granted {
+                r#"{"sshAgent": {"allowRelay": true}}"#
+            } else {
+                r#"{"remoteUser": "vscode"}"#
+            };
+            std::fs::write(dev_home.base_config(), base).unwrap();
+
+            let config_dir = workspace.path().join(".devcontainer");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            let config_json = r#"{
+                "image": "ubuntu:24.04",
+                "features": {"ghcr.io/devcontainers/features/node:1": {}},
+                "sshAgent": {"relay": true}
+            }"#;
+            std::fs::write(config_dir.join("devcontainer.json"), config_json).unwrap();
+
+            let folder_image = container_name(workspace.path());
+            let config = effective_config_in(&dev_home, workspace.path(), "fake", true).unwrap();
+            let features = features_for(&config, &dev_home);
+            assert_eq!(
+                features
+                    .iter()
+                    .any(|f| f.id.ends_with("features/ssh-agent-relay")),
+                granted,
+                "granted={granted}: the shim is in the image only when the base allowed it"
+            );
+            let current = feature_image_tag(&folder_image, &config, &features);
+
+            let rt = PruneFakeRuntime::with_images(&[&folder_image, &current]);
+            run_with_runtime(workspace.path(), &rt, &dev_home, false)
+                .await
+                .unwrap();
+
+            assert!(
+                rt.removed().is_empty(),
+                "granted={granted}: the tag `dev up` would build must survive, removed {:?}",
+                rt.removed()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn prune_keeps_the_no_base_variant_of_the_current_tag() {
         let home = TempDir::new().unwrap();
@@ -515,12 +599,12 @@ mod tests {
         let tag_with = feature_image_tag(
             &folder_image,
             &with_base,
-            &resolve_features(&with_base).unwrap(),
+            &features_for(&with_base, &dev_home),
         );
         let tag_without = feature_image_tag(
             &folder_image,
             &without_base,
-            &resolve_features(&without_base).unwrap(),
+            &features_for(&without_base, &dev_home),
         );
         assert_ne!(tag_with, tag_without, "the base layer changes the digest");
 

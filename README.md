@@ -104,6 +104,8 @@ dev status              # container state (add --json for machine-readable)
 dev down                # stop (add --remove to delete the container)
 ```
 
+`dev status` also reports the runtime section: the socket and daemon behind it, what a container on it can reach on the host, and four live checks against the running container (host alias, SSH agent, docker-in-docker, cmux relay). `--json` returns `{"containers": [...], "runtime": {...}}` — a breaking change from the bare array `dev status --json` used to return.
+
 ## Attaching VS Code to the running container
 
 `dev open` launches VS Code attached to the container that `dev up` already started — it does not start a second one. The terminal-first flow and the IDE flow share a single container.
@@ -153,6 +155,7 @@ dev base edit                                       # open in $EDITOR
 dev base new                                        # interactive, with feature selection
 dev base config set remoteUser vscode
 dev base config set defaultRuntime apple            # docker, podman, or apple
+dev base config set dockerSocket /var/run/docker.sock
 dev base config add features ghcr.io/devcontainers/features/common-utils:2
 dev base config add remoteEnv EDITOR=vim
 dev base config unset defaultRuntime                # return runtime selection to auto-detect
@@ -161,6 +164,10 @@ dev base config unset defaultRuntime                # return runtime selection t
 If no base config exists, the layer is skipped. Pass `--no-base` to `dev up`/`dev build` to skip the devcontainer settings in this layer for one run. The base layer is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`.
 
 `defaultRuntime` is a `dev` preference stored in this same base config file, not a separate runtime config. It accepts `docker`, `podman`, or `apple` and applies to every command that selects a container runtime (`up`, `build`, `shell`, `exec`, `status`, `down`, `forward`, `open`, and recipe-project `config`). Removing it leaves no stale state and restores the same automatic runtime selection used by a fresh install. `--no-base` skips base devcontainer settings for `up` and `build`; it does not disable `defaultRuntime`, because runtime selection happens before the effective devcontainer config is loaded.
+
+`sshAgent.allowRelay` is a third base-scope-only preference: it permits a project to ask for the SSH agent relay, and nothing else grants that. See [SSH agent relay](#ssh-agent-relay-sshagentallowrelay--sshagentrelay). Like `defaultRuntime`, it is a `dev` preference rather than devcontainer content, so `--no-base` does not withdraw it.
+
+`dockerSocket` is the same kind of base-scope-only preference: it pins the exact docker-API socket `dev` connects to (Docker Desktop, OrbStack, Colima and plain Engine all connect as `docker`; see [Container runtimes](#container-runtimes)), skipping the candidate walk entirely. It must be an absolute path — no `~` expansion — and a pin that does not exist is reported as a failure rather than falling back to the defaults, so a stale pin never silently resolves to the wrong daemon. `dev config set dockerSocket` in a project (rather than `dev base config set`) is refused the same way a non-base `defaultRuntime` is.
 
 ### Global templates
 
@@ -250,7 +257,7 @@ The keep set is resolved the same way `dev up` resolves the current image — bo
 
 ## Container runtimes
 
-`dev` auto-detects a running runtime on startup. **Docker** and **Podman** are the supported, auto-detected runtimes today. If both are running, Podman is preferred; if neither is, `dev` prints a targeted hint (start Docker Desktop, or `podman machine start`).
+`dev` auto-detects a running runtime on startup. **Docker** and **Podman** are the supported, auto-detected runtimes today; Docker Desktop, OrbStack, Colima and plain Engine all connect as `docker`. If both are running, Podman is preferred; if neither is, `dev` prints a targeted hint (start your Docker daemon, or `podman machine start`).
 
 ```sh
 dev up                       # auto-detect
@@ -265,6 +272,18 @@ Runtime selection precedence is:
 3. Automatic Docker/Podman detection.
 
 The global `--runtime` flag can be placed before or after the subcommand, and it always overrides the configured default for that one invocation.
+
+Connecting to `docker` walks an ordered list of candidate sockets and pings each, stopping at the first that answers:
+
+1. `dockerSocket` in `~/.dev/base/devcontainer.json`, when set — exclusive of every other candidate below.
+2. The unix socket named by `DOCKER_HOST`, when it starts with `unix://`.
+3. `/var/run/docker.sock`.
+4. `~/.docker/run/docker.sock` (Docker Desktop).
+5. `~/.orbstack/run/docker.sock` (OrbStack).
+6. `~/.colima/default/docker.sock` (Colima).
+7. `$XDG_RUNTIME_DIR/docker.sock`.
+
+Only paths that exist are tried. A `dockerSocket` pin that does not exist fails outright rather than falling through to the rest of the list.
 
 ```sh
 dev base config set defaultRuntime apple
@@ -460,6 +479,34 @@ also what Docker Compose projects use: Compose creates containers through
 `docker compose up`, so it takes exec-time secrets and refuses create-time ones.
 
 See [docs/secrets.md](docs/secrets.md) for the full reference.
+
+## SSH agent relay (`sshAgent.allowRelay` + `sshAgent.relay`)
+
+Off unless two different files agree. The base layer bind-mounts the host's SSH agent socket into the container, which is all Docker Desktop needs. Where that mount does not arrive as a usable socket, `git push` inside the container fails with no key loaded and nothing about the mount says why. OrbStack is the case this was written for; see [Container runtimes](#container-runtimes).
+
+The relay hands whatever runs in the container the ability to sign with the keys in your host agent, so a project cannot turn it on by itself. A project asks:
+
+```json
+{
+  "sshAgent": { "relay": true }
+}
+```
+
+and only your own base config, `~/.dev/base/devcontainer.json`, grants it:
+
+```sh
+dev base config set sshAgent.allowRelay true
+```
+
+A project that asks without the grant gets no relay, and `dev up` says so, naming the file that asked. `dev config set sshAgent.allowRelay` in a project is refused, the way a project-scope `defaultRuntime` is; that refusal guards the CLI only, which is why the permission is read from the base file itself and never from the merged config a project contributes to. `sshAgent.relay` in the base config is a hard error rather than a global on-switch: it would relay for every project on the machine, including ones you have only cloned. `dev config explain` prints the pair as its own block (allowed by, requested by, effective), outside the merged-key table, because the permission never passes through the merge.
+
+With both keys on, `dev up` starts a loopback listener on the host in front of the `$SSH_AUTH_SOCK` of the shell you ran it from, and hands the new container that address plus a token minted for it. Inside the container `/dev/shm/ssh-agent.sock` is still the socket everything signs through, so nothing you run has to know which path it got; the container's relay script connects that socket to the listener instead of to the mounted one. The listener outlives `dev up`, because the container re-dials it on every `git push` and every `ssh`, and `dev down` stops it.
+
+Both keys on is also what adds the `ssh-agent-relay` feature to the image build: a project the base has not allowed does not get the shim baked into its image at all. `dev` carries that feature inside its own binary the way it carries `cmux-agent`, so there is nothing to fetch from a registry and nothing to vendor into a project. Features are baked in at build time, so an existing container needs `dev up --rebuild` to pick this up the first time.
+
+Five gates, and any one of them failing leaves the container on the mount exactly as it is today: the base's `allowRelay`, the project's `relay`, a runtime whose containers can reach the host's loopback at all (Colima's cannot), an `SSH_AUTH_SOCK` in the shell that ran `dev up`, and an agent that answers on it. The `ssh agent` row of `dev status` says which path a running container actually got.
+
+A unix agent socket is protected by file permissions and a TCP port is not, so the listener binds `127.0.0.1` only, and every connection presents its token before a byte reaches the agent.
 
 ## Local `.test` domains
 
@@ -686,7 +733,8 @@ dev down  [--remove]
 dev shell [--shell /bin/bash]
 dev exec  [-u <user>] -- <cmd>…
 
-dev status [--json]
+dev status [--json]     # containers, sessions, and the runtime section
+                        # --json returns {"containers": …, "runtime": …}, not a bare array
 dev open   [--insiders]
 
 dev list templates [-q <query>] [--json] [--refresh]

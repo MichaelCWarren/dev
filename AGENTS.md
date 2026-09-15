@@ -125,6 +125,35 @@
 - The shim reads stdin only for a non-`ping` verb with a non-tty stdin. cmux's codex wrapper
   invokes the CLI with the caller's stdin still attached, and a blind `cat` there hangs the
   agent's launch until the read times out.
+- A function is threaded only if nothing it calls reaches for ambient state itself. Taking a
+  `&DevHome` is not enough: `down::run_with_runtime` took one and still called
+  `DevHome::current()` inside the test seam, so four tests read live `~/.dev/ssh-relay` state
+  and could signal a real pid; `prune::keep_set` took one for the config while
+  `resolve_features` re-derived a relay permission from `current()`, making a computed image
+  tag depend on the developer's own base config. Production was right in both, only the tests
+  read the real home, so neither surfaced as a failure. The rule generalizes past `DevHome` —
+  `wanted_endpoint_from` exists as a seam beside `wanted_endpoint` because `SSH_AUTH_SOCK` had
+  the same shape. Check the call tree, not the signature.
+- Fail-proof a test by DELETING the mechanism it covers and re-running, not by inverting its
+  assertion. Inverting proves the assertion is wired to something; deleting proves it is wired
+  to the right thing. Four ways a test here passed while proving nothing, all caught this way:
+  the assertion holds with the mechanism gone (a timeout test whose expected values are the
+  same whether the timeout fires or the call errors); it reads a `Copy` value nothing above it
+  mutated; the fixture is derived from the constant it constrains (`with_delay(BUDGET / 2)`),
+  so moving the constant cannot fail it; and a whole commit's worth of mechanisms verified once
+  by hand with throwaway probes that were never committed. For that last one the check is
+  `git checkout <parent> -- <file>` keeping the tests, then run the suite: if it passes, the
+  change is untested however carefully it was verified. Where a test has two assertions, no-op
+  each in turn — one that can never fire is half a test wearing a disguise.
+- Exhaustiveness is not a guard. Deleting a match arm fails to compile, but *replacing* it with
+  the wrong behavior compiles clean and stays green. The compiler guards that a decision is
+  made, not which one.
+- `#[tokio::test(start_paused = true)]` auto-advance does not wait for pending IO. A test
+  driving two sequential timeouts sees the clock jump to the second deadline before the first
+  exchange completes, so a live fake times out too. Where the test controls the delay, register
+  the timer before the runtime first idles (take the delay before `accept`). Where it does not,
+  split into one test per fact. Any test whose subject is a timeout must pin elapsed VIRTUAL
+  time; asserting only the outcome passes with the timeout deleted.
 
 ## Maintaining this file
 

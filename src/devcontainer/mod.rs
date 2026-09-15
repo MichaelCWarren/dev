@@ -15,8 +15,10 @@ pub mod uid;
 pub mod variables;
 
 pub use config::DevcontainerConfig;
+#[cfg(test)]
+pub use features::resolve_features;
 pub use features::{
-    download_features, merge_feature_capabilities, resolve_features, stage_feature_context,
+    download_features, merge_feature_capabilities, resolve_features_in, stage_feature_context,
 };
 #[allow(unused_imports)]
 pub use lifecycle::run_post_attach_hooks;

@@ -8,6 +8,7 @@ use tokio::process::{Child, Command};
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::docker::{BollardRuntime, EXEC_STATUS_BUDGET};
+use crate::runtime::host_access::HostAccess;
 use crate::runtime::terminal_relay::{
     HostTerminal, Pty, PtyMaster, RawModeGuard, SessionPeer, StdinReader, UnitFut,
     drain_remaining_output, relay_terminal,
@@ -285,6 +286,10 @@ impl ContainerRuntime for PodmanRuntime {
         "podman"
     }
 
+    fn socket_path(&self) -> Option<&str> {
+        Some(self.0.socket_path())
+    }
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
         self.0.pull_image(image)
     }
@@ -398,6 +403,21 @@ impl ContainerRuntime for PodmanRuntime {
     ) -> BoxFut<'_, AttachedExec> {
         self.0.exec_attached(id, cmd, user)
     }
+
+    // The podman socket is not a Docker daemon, so its row is the constant
+    // `HostAccess::podman()` rather than the flavor-detected one `self.0`
+    // would answer with.
+    fn host_access(&self) -> HostAccess {
+        HostAccess::podman()
+    }
+
+    fn detect_host_access(&self) -> UnitFut<'_> {
+        self.0.detect_host_access()
+    }
+
+    fn daemon_version(&self) -> Option<&str> {
+        self.0.daemon_version()
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +477,7 @@ mod tests {
             cap_add: vec!["SYS_PTRACE".to_string()],
             security_opt: vec!["seccomp=unconfined".to_string()],
             userns_mode: Some("keep-id".to_string()),
+            extra_hosts: vec![],
         };
         config.labels.insert(
             "devcontainer.local_folder".to_string(),

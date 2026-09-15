@@ -1,16 +1,18 @@
 use bollard::Docker;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
-use bollard::models::ContainerCreateBody;
+use bollard::models::{ContainerCreateBody, SystemInfo};
 use bollard::query_parameters::{
     BuildImageOptions, BuilderVersion, CreateContainerOptions, CreateImageOptions,
     ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;
 
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
+use crate::runtime::host_access::{DetectedDaemon, HostAccess};
 use crate::runtime::paste_bridge;
 use crate::runtime::terminal_relay::{
     HostTerminal, RawModeGuard, SessionPeer, StdinReader, UnitFut, relay_terminal,
@@ -107,6 +109,109 @@ async fn forward_log_stream(
 /// Shared bollard-backed runtime used by both Docker and Podman.
 pub struct BollardRuntime {
     client: Docker,
+    socket: String,
+    /// Filled once, at connect time, by `detect_host_access_impl`. Empty
+    /// means detection has not run yet; `host_access()` and `daemon_version()`
+    /// read it and never block waiting for it to fill.
+    detected: OnceLock<DetectedDaemon>,
+}
+
+/// Which Docker distribution answered, or is named by the socket that
+/// answered — the flavor is what decides everything in `HostAccess::for_flavor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerFlavor {
+    DockerDesktop,
+    OrbStack,
+    Colima,
+    Engine,
+}
+
+impl DockerFlavor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DockerDesktop => "docker-desktop",
+            Self::OrbStack => "orbstack",
+            Self::Colima => "colima",
+            Self::Engine => "engine",
+        }
+    }
+}
+
+impl std::fmt::Display for DockerFlavor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Tell one Docker flavor from another using whatever is available: the
+/// daemon's own description of itself, and otherwise the socket path that
+/// reached it. Both are passed in rather than read, so this is testable
+/// without a daemon.
+pub fn detect_flavor(info: Option<&SystemInfo>, socket_path: &str) -> Option<DockerFlavor> {
+    info.and_then(detect_flavor_from_info)
+        .or_else(|| detect_flavor_from_socket_path(socket_path))
+}
+
+/// What the daemon said about itself, when that is enough to name a flavor.
+/// `Engine` is the catch-all and its table row asserts same-kernel
+/// semantics: `:host-gateway` reaches the host, bind mounts keep their
+/// ownership. Nothing runs a Docker daemon on the Darwin kernel, so on macOS
+/// a daemon that named nothing recognizable is inside some VM (Rancher
+/// Desktop, Docker Machine, minikube, a forwarded socket) and calling it
+/// `Engine` would hand a container an alias resolving to the VM rather than
+/// the Mac. There, "nothing I recognize" is not a conclusion.
+fn detect_flavor_from_info(info: &SystemInfo) -> Option<DockerFlavor> {
+    let os = info.operating_system.as_deref().unwrap_or_default();
+    if contains_ascii_case_insensitive(os, "Docker Desktop") {
+        Some(DockerFlavor::DockerDesktop)
+    } else if contains_ascii_case_insensitive(os, "OrbStack") {
+        Some(DockerFlavor::OrbStack)
+    } else if is_colima_guest_name(info.name.as_deref()) {
+        Some(DockerFlavor::Colima)
+    } else if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(DockerFlavor::Engine)
+    }
+}
+
+/// Colima names the Lima guest after the profile, so `operating_system` (the
+/// guest distro) cannot discriminate it — only `name` can.
+fn is_colima_guest_name(name: Option<&str>) -> bool {
+    matches!(name, Some(name) if name == "colima" || name.starts_with("colima-"))
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+/// The daemon did not answer in time, so only the socket path is left, and it
+/// decides only when it is flavor-specific. `/var/run/docker.sock` and
+/// friends are any flavor at all, and guessing `Engine` there would put
+/// `--add-host host.docker.internal:host-gateway` on a symlinked Docker
+/// Desktop.
+fn detect_flavor_from_socket_path(socket_path: &str) -> Option<DockerFlavor> {
+    let path = Path::new(socket_path);
+    // `.orbstack` and `.colima` are tested first because OrbStack also
+    // populates `~/.docker/run/docker.sock`, and matching that one first
+    // would read an OrbStack socket as Docker Desktop. Matching the
+    // directory component rather than a full suffix keeps a non-default
+    // Colima profile landing.
+    if has_dir_component(path, ".orbstack") {
+        Some(DockerFlavor::OrbStack)
+    } else if has_dir_component(path, ".colima") {
+        Some(DockerFlavor::Colima)
+    } else if path.ends_with(".docker/run/docker.sock") {
+        Some(DockerFlavor::DockerDesktop)
+    } else {
+        None
+    }
+}
+
+fn has_dir_component(path: &Path, component: &str) -> bool {
+    path.components().any(|part| part.as_os_str() == component)
 }
 
 /// Whether the daemon refused this exec because the image has no such
@@ -303,14 +408,18 @@ impl BollardRuntime {
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
         let client = Docker::connect_with_socket(socket, 120, bollard::API_DEFAULT_VERSION)
             .map_err(|e| DevError::Runtime(format!("Failed to connect to {socket}: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            socket: socket.to_string(),
+            detected: OnceLock::new(),
+        })
     }
 
-    /// Connect using the default Docker socket.
-    pub fn connect_default() -> Result<Self, DevError> {
-        let client = Docker::connect_with_socket_defaults()
-            .map_err(|e| DevError::Runtime(format!("Failed to connect to Docker: {e}")))?;
-        Ok(Self { client })
+    /// The socket this client was built against, exactly as given to
+    /// `connect_to_socket` — no canonicalization, so flavor detection can
+    /// match on the path's shape (`.colima/default/docker.sock` and friends).
+    pub fn socket_path(&self) -> &str {
+        &self.socket
     }
 
     /// Ping the daemon to confirm connectivity.
@@ -320,6 +429,24 @@ impl BollardRuntime {
             .await
             .map_err(|e| DevError::Runtime(format!("Ping failed: {e}")))?;
         Ok(())
+    }
+
+    /// Ask the daemon for its own description of itself. A thin passthrough
+    /// so `host_access.rs` can reach it without the client field leaving this
+    /// module.
+    pub(crate) async fn info(&self) -> Result<SystemInfo, bollard::errors::Error> {
+        self.client.info().await
+    }
+
+    /// Probe the daemon once and cache the row. A second call is a no-op, so
+    /// a repeat can never overwrite the cache with a different daemon's
+    /// answer.
+    async fn detect_host_access_impl(&self) {
+        if self.detected.get().is_some() {
+            return;
+        }
+        let detected = DetectedDaemon::probe(self).await;
+        let _ = self.detected.set(detected);
     }
 
     async fn pull_image_impl(&self, image: &str) -> Result<(), DevError> {
@@ -487,8 +614,9 @@ impl BollardRuntime {
         Ok(response.id)
     }
 
-    /// Build the daemon-facing create body from our generic container config.
-    fn to_create_body(config: &ContainerConfig) -> ContainerCreateBody {
+    /// Bind-mount strings in `source:target[:ro]` form, in mount order:
+    /// feature/config binds, then named volumes, then the workspace mount.
+    fn build_binds(config: &ContainerConfig) -> Vec<String> {
         let mut binds = Vec::new();
         for m in &config.mounts {
             let ro = if m.readonly { ":ro" } else { "" };
@@ -501,8 +629,13 @@ impl BollardRuntime {
         if let Some(ws) = &config.workspace_mount {
             binds.push(format!("{}:{}", ws.source.display(), ws.target));
         }
+        binds
+    }
 
-        let tmpfs: HashMap<String, String> = config
+    /// Tmpfs mounts as a target → `size=…,mode=…` options map, the shape
+    /// `HostConfig.tmpfs` expects.
+    fn build_tmpfs(config: &ContainerConfig) -> HashMap<String, String> {
+        config
             .tmpfs
             .iter()
             .map(|t| {
@@ -514,17 +647,13 @@ impl BollardRuntime {
                     .collect();
                 (t.target.clone(), opts.join(","))
             })
-            .collect();
+            .collect()
+    }
 
-        let env: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-
-        let exposed_ports: Vec<String> = config
-            .ports
-            .iter()
-            .map(|p| format!("{}/tcp", p.container))
-            .collect();
-
-        let port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> = config
+    fn build_port_bindings(
+        config: &ContainerConfig,
+    ) -> HashMap<String, Option<Vec<bollard::models::PortBinding>>> {
+        config
             .ports
             .iter()
             .map(|p| {
@@ -536,12 +665,18 @@ impl BollardRuntime {
                     }]),
                 )
             })
-            .collect();
+            .collect()
+    }
 
-        let host_config = bollard::models::HostConfig {
-            binds: Some(binds),
+    /// Build the `HostConfig` portion of the create body: mounts, ports and
+    /// the container-visible flags that live under it.
+    fn build_host_config(config: &ContainerConfig) -> bollard::models::HostConfig {
+        let tmpfs = Self::build_tmpfs(config);
+
+        bollard::models::HostConfig {
+            binds: Some(Self::build_binds(config)),
             tmpfs: (!tmpfs.is_empty()).then_some(tmpfs),
-            port_bindings: Some(port_bindings),
+            port_bindings: Some(Self::build_port_bindings(config)),
             init: if config.init { Some(true) } else { None },
             privileged: if config.privileged { Some(true) } else { None },
             cap_add: if config.cap_add.is_empty() {
@@ -555,8 +690,26 @@ impl BollardRuntime {
                 Some(config.security_opt.clone())
             },
             userns_mode: config.userns_mode.clone(),
+            extra_hosts: if config.extra_hosts.is_empty() {
+                None
+            } else {
+                Some(config.extra_hosts.clone())
+            },
             ..Default::default()
-        };
+        }
+    }
+
+    /// Build the daemon-facing create body from our generic container config.
+    fn to_create_body(config: &ContainerConfig) -> ContainerCreateBody {
+        let env: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+        let exposed_ports: Vec<String> = config
+            .ports
+            .iter()
+            .map(|p| format!("{}/tcp", p.container))
+            .collect();
+
+        let host_config = Self::build_host_config(config);
 
         let labels: HashMap<&str, &str> = config
             .labels
@@ -1176,39 +1329,53 @@ impl ContainerRuntime for BollardRuntime {
         let user = user.map(|u| u.to_string());
         Box::pin(async move { self.exec_attached_impl(&id, &cmd, user.as_deref()).await })
     }
+
+    fn host_access(&self) -> HostAccess {
+        self.detected
+            .get()
+            .map_or(HostAccess::unknown(), |detected| detected.access)
+    }
+
+    fn detect_host_access(&self) -> UnitFut<'_> {
+        Box::pin(self.detect_host_access_impl())
+    }
+
+    fn daemon_version(&self) -> Option<&str> {
+        self.detected.get()?.version.as_deref()
+    }
 }
 
 /// Docker-specific runtime (uses default Docker socket).
 pub struct DockerRuntime(pub(crate) BollardRuntime);
 
 impl DockerRuntime {
-    pub fn connect() -> Result<Self, DevError> {
-        Ok(Self(BollardRuntime::connect_default()?))
-    }
-
-    /// Try additional Docker Desktop socket paths (macOS puts the real socket
-    /// at ~/.docker/run/docker.sock while /var/run/docker.sock may be a
-    /// symlink to a different runtime).
-    pub fn connect_fallback() -> Option<Self> {
-        if cfg!(target_os = "macos")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            let path = format!("{home}/.docker/run/docker.sock");
-            if std::path::Path::new(&path).exists() {
-                return BollardRuntime::connect_to_socket(&path).ok().map(Self);
-            }
-        }
-        None
+    /// Connect to a specific docker-API socket path. Socket discovery
+    /// (`connect_docker_runtime` in `src/runtime/mod.rs`) is what picks the
+    /// path in production; tests build directly against a stand-in socket.
+    pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
+        Ok(Self(BollardRuntime::connect_to_socket(socket)?))
     }
 
     pub async fn ping(&self) -> Result<(), DevError> {
         self.0.ping().await
+    }
+
+    /// Production reaches the socket through
+    /// [`ContainerRuntime::socket_path`]; this is the concrete-type route a
+    /// test uses before the runtime is boxed.
+    #[cfg(test)]
+    pub fn socket_path(&self) -> &str {
+        self.0.socket_path()
     }
 }
 
 impl ContainerRuntime for DockerRuntime {
     fn runtime_name(&self) -> &'static str {
         "docker"
+    }
+
+    fn socket_path(&self) -> Option<&str> {
+        Some(self.0.socket_path())
     }
 
     fn copy_in<'a>(
@@ -1321,6 +1488,18 @@ impl ContainerRuntime for DockerRuntime {
     ) -> BoxFut<'_, AttachedExec> {
         self.0.exec_attached(id, cmd, user)
     }
+
+    fn host_access(&self) -> HostAccess {
+        self.0.host_access()
+    }
+
+    fn detect_host_access(&self) -> UnitFut<'_> {
+        self.0.detect_host_access()
+    }
+
+    fn daemon_version(&self) -> Option<&str> {
+        self.0.daemon_version()
+    }
 }
 
 #[cfg(test)]
@@ -1350,6 +1529,7 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            extra_hosts: vec![],
         }
     }
 
@@ -1509,6 +1689,26 @@ mod tests {
         assert_eq!(host.privileged, Some(true));
         assert_eq!(host.init, Some(true));
         assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
+    }
+
+    /// A `Vec` field is `None` when empty, never `Some(vec![])` — Docker
+    /// treats a present-but-empty `ExtraHosts` key differently from an
+    /// absent one, the same convention `cap_add` and `security_opt` follow.
+    #[test]
+    fn extra_hosts_reach_the_create_body_only_when_set() {
+        let mut cfg = container_config(None);
+        cfg.extra_hosts = vec!["host.docker.internal:host-gateway".to_string()];
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let host = body.host_config.expect("host config should be set");
+        assert_eq!(
+            host.extra_hosts,
+            Some(vec!["host.docker.internal:host-gateway".to_string()])
+        );
+
+        let body = BollardRuntime::to_create_body(&container_config(None));
+        let host = body.host_config.expect("host config should be set");
+        assert_eq!(host.extra_hosts, None);
     }
 
     /// Reused containers can carry an older or image-provided `WorkingDir`.
@@ -1714,5 +1914,158 @@ mod tests {
             request.contains("w=80"),
             "columns must travel as the query's width, got: {request}"
         );
+    }
+
+    /// `(operating_system, name, socket_path, expected)`. Covers Desktop and
+    /// OrbStack matching case-insensitively, both shapes Colima names its
+    /// guest (`"colima"` and a profile suffix) against an `operating_system`
+    /// that reads as plain Ubuntu on its own — proving the `name` rule
+    /// outranks the Ubuntu guest text rather than falling through to Engine —
+    /// and a daemon that names nothing recognizable, which is `Engine` only
+    /// where the daemon can share the host kernel. The last row proves an
+    /// unrecognized daemon still falls through to the socket path rather than
+    /// stopping at `None`.
+    #[test]
+    fn the_daemon_names_its_own_flavor() {
+        let mut cases = vec![
+            // (operating_system, name, socket_path, expected)
+            (
+                "Docker Desktop 4.31.0 (144996)",
+                "docker-desktop",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::DockerDesktop),
+            ),
+            (
+                "docker desktop",
+                "some-host",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::DockerDesktop),
+            ),
+            (
+                "OrbStack",
+                "orbstack",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::OrbStack),
+            ),
+            (
+                "Ubuntu 22.04.4 LTS",
+                "colima",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::Colima),
+            ),
+            (
+                "Ubuntu 22.04.4 LTS",
+                "colima-work",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::Colima),
+            ),
+            (
+                "Ubuntu 24.04.1 LTS",
+                "some-box",
+                "/Users/mo/.colima/work/docker.sock",
+                Some(DockerFlavor::Colima),
+            ),
+        ];
+        #[cfg(target_os = "macos")]
+        cases.push((
+            "Ubuntu 24.04.1 LTS",
+            "some-linux-box",
+            "/var/run/docker.sock",
+            None,
+        ));
+        #[cfg(not(target_os = "macos"))]
+        cases.push((
+            "Ubuntu 24.04.1 LTS",
+            "some-linux-box",
+            "/var/run/docker.sock",
+            Some(DockerFlavor::Engine),
+        ));
+
+        for (operating_system, name, socket_path, expected) in cases {
+            let info = SystemInfo {
+                operating_system: Some(operating_system.to_string()),
+                name: Some(name.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                detect_flavor(Some(&info), socket_path),
+                expected,
+                "operating_system={operating_system:?} name={name:?} socket_path={socket_path}"
+            );
+        }
+    }
+
+    /// With no answer from the daemon, only the socket path is left, and it
+    /// decides only when it names a flavor. `/var/run/docker.sock` and
+    /// friends are any flavor at all, and guessing `Engine` there would put
+    /// `--add-host host.docker.internal:host-gateway` on a symlinked Docker
+    /// Desktop.
+    #[test]
+    fn a_silent_daemon_is_identified_only_by_a_flavor_specific_socket() {
+        let cases = [
+            // (socket_path, expected)
+            (
+                "/Users/mo/.docker/run/docker.sock",
+                Some(DockerFlavor::DockerDesktop),
+            ),
+            (
+                "/Users/mo/.orbstack/run/docker.sock",
+                Some(DockerFlavor::OrbStack),
+            ),
+            (
+                "/Users/mo/.colima/default/docker.sock",
+                Some(DockerFlavor::Colima),
+            ),
+            ("/var/run/docker.sock", None),
+            ("/run/user/501/docker.sock", None),
+            ("/tmp/pinned.sock", None),
+        ];
+        for (socket_path, expected) in cases {
+            assert_eq!(
+                detect_flavor(None, socket_path),
+                expected,
+                "socket_path={socket_path}"
+            );
+        }
+    }
+
+    /// `detect_runtime` only ever hands the caller a `DockerRuntime`, so its
+    /// `host_access()` forward is what every Docker flavor actually reaches
+    /// through. `runtime_name()` must stay "docker" even once a flavor is
+    /// known — a flavor leaking into it would move
+    /// `~/.dev/docker/devcontainer.json` and `compose_cmd` under every user.
+    #[test]
+    fn every_docker_flavor_keeps_the_docker_runtime_name() {
+        let flavors = [
+            DockerFlavor::DockerDesktop,
+            DockerFlavor::OrbStack,
+            DockerFlavor::Colima,
+            DockerFlavor::Engine,
+        ];
+        for flavor in flavors {
+            // A path rather than a live daemon: bollard only checks that the
+            // socket is there, and nothing here sends a request over it.
+            let socket = tempfile::NamedTempFile::new().expect("stand-in socket");
+            let runtime = DockerRuntime(
+                BollardRuntime::connect_to_socket(&socket.path().to_string_lossy())
+                    .expect("building a docker client must not need a daemon"),
+            );
+            runtime
+                .0
+                .detected
+                .set(DetectedDaemon {
+                    access: HostAccess::for_flavor(flavor),
+                    version: None,
+                })
+                .expect("the cache is empty right after connect");
+            let runtime: &dyn ContainerRuntime = &runtime;
+
+            assert_eq!(runtime.runtime_name(), "docker", "flavor={flavor}");
+            assert_eq!(
+                runtime.host_access().flavor,
+                Some(flavor),
+                "flavor={flavor}"
+            );
+        }
     }
 }

@@ -193,6 +193,8 @@ pub struct DevcontainerConfig {
     pub dotfiles: Option<DotfilesConfig>,
     /// Cmux status reporting configuration.
     pub cmux: Option<CmuxSettings>,
+    /// SSH agent relay configuration.
+    pub ssh_agent: Option<SshAgentSettings>,
 }
 
 /// Configuration for cloning a dotfiles repository into the container.
@@ -223,6 +225,24 @@ pub struct CmuxSettings {
     pub agent: bool,
 }
 
+/// Configuration for the host-side SSH agent relay.
+///
+/// A dev-only extension, not part of the devcontainer spec — other tooling
+/// ignores it. `relay` is the project's request, read through
+/// `ssh_agent_relay_requested`.
+///
+/// The base config's matching grant, `sshAgent.allowRelay`, is deliberately
+/// not a field here. It would arrive on this struct through the merge, where
+/// a project layer can set it, and reading the grant off a value a project
+/// can write is the hole the two key names exist to close. It is read from
+/// the base file alone, by [`crate::runtime::ssh_agent_relay_allowed_in`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SshAgentSettings {
+    /// Whether this project asks for the host-side SSH agent relay.
+    pub relay: bool,
+}
+
 impl DevcontainerConfig {
     /// Read and parse a devcontainer.json file (supports JSONC with comments).
     pub fn from_path(path: &Path) -> Result<Self, DevError> {
@@ -251,6 +271,17 @@ impl DevcontainerConfig {
     /// has to be installed too, which `crate::cmux::agent` probes for.
     pub fn cmux_agent_enabled(&self) -> bool {
         self.cmux.as_ref().is_some_and(|c| c.agent)
+    }
+
+    /// Returns true only when ssh_agent is Some and its relay is true; an
+    /// absent key returns false. Says the project asked for the relay, and
+    /// nothing more: the user's base config has to permit it
+    /// ([`crate::ssh_agent::RelayConsent`]), and whether the container has a
+    /// name for the host, can reach a loopback listener, and the host agent
+    /// answers are further questions, decided by `crate::ssh_agent`'s own
+    /// gate. Never treat this alone as "the relay is on".
+    pub fn ssh_agent_relay_requested(&self) -> bool {
+        self.ssh_agent.as_ref().is_some_and(|s| s.relay)
     }
 
     /// Returns the effective workspace bind-mount target inside the container,
@@ -383,6 +414,7 @@ mod workspace_mount_tests {
             update_remote_user_uid: None,
             dotfiles: None,
             cmux: None,
+            ssh_agent: None,
         }
     }
 
@@ -812,5 +844,26 @@ mod tests {
         let config4 = parse(r#"{"cmux": {"agent": true}}"#);
         assert!(config4.cmux_agent_enabled());
         assert!(!config4.cmux_status_enabled());
+    }
+
+    #[test]
+    fn ssh_agent_parses_the_relay_flag() {
+        let config = parse(r#"{"sshAgent": {"relay": true}}"#);
+        assert!(config.ssh_agent.is_some());
+        assert!(config.ssh_agent.unwrap().relay);
+    }
+
+    /// The key is a request, not capability: an absent key and an explicit
+    /// `false` both mean off, same as `cmux_agent_enabled_requires_present_true`.
+    #[test]
+    fn ssh_agent_relay_requested_requires_present_true() {
+        let config1 = parse(r#"{"image": "alpine:latest"}"#);
+        assert!(!config1.ssh_agent_relay_requested());
+
+        let config2 = parse(r#"{"sshAgent": {"relay": false}}"#);
+        assert!(!config2.ssh_agent_relay_requested());
+
+        let config3 = parse(r#"{"sshAgent": {"relay": true}}"#);
+        assert!(config3.ssh_agent_relay_requested());
     }
 }

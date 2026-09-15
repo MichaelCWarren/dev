@@ -6,10 +6,11 @@
 //! descendant, so it listens on loopback and runs each forwarded verb against
 //! the real CLI here.
 //!
-//! What reaches this listener from a container reaches it from anything else
-//! on the host's loopback: Docker Desktop proxies `host.docker.internal`
-//! through it, so the bind address gates nothing. The per-session token and
-//! [`verb_allowed`] are the whole boundary.
+//! The relay binds loopback on every daemon it runs on, never wider. A daemon
+//! whose containers cannot reach a host loopback listener gets no relay at
+//! all instead of a bind widened to reach it — see
+//! [`HostAccess::host_callback`]. The per-session token and [`verb_allowed`]
+//! are the rest of the boundary.
 //!
 //! The container side is the `cmux-agent` feature's shim. It is installed at
 //! build time, not copied in, because it needs a PATH entry only a root
@@ -25,8 +26,9 @@ use tokio::task::JoinHandle;
 
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
-use crate::runtime::ContainerRuntime;
+use crate::runtime::{ContainerRuntime, HostAccess};
 use crate::util::paths::DevHome;
+use crate::util::token::mint_token;
 
 use super::Spawner;
 
@@ -92,6 +94,7 @@ const MAX_BODY: usize = 1 << 20;
 pub struct Relay {
     addr: SocketAddr,
     token: String,
+    alias: &'static str,
     task: JoinHandle<()>,
 }
 
@@ -108,18 +111,18 @@ impl Relay {
     /// hooks through, so naming the shim there means hooks work even if the
     /// user's shell rewrote PATH out from under the feature's entry.
     pub fn env(&self) -> Vec<(String, SecretValue)> {
-        relay_env(self.addr.port(), &self.token)
+        relay_env(self.alias, self.addr.port(), &self.token)
     }
 }
 
-/// The environment a container needs, built from the two things that vary.
+/// The environment a container needs, built from the things that vary.
 /// Separate from [`Relay`] so it can be read back without binding a port or
 /// resolving a cmux, neither of which this decides anything about.
-fn relay_env(port: u16, token: &str) -> Vec<(String, SecretValue)> {
+fn relay_env(alias: &str, port: u16, token: &str) -> Vec<(String, SecretValue)> {
     let mut env = vec![
         (
             "DEV_CMUX_RELAY".to_string(),
-            SecretValue::new(format!("host.docker.internal:{port}")),
+            SecretValue::new(format!("{alias}:{port}")),
         ),
         ("DEV_CMUX_TOKEN".to_string(), SecretValue::new(token)),
         (
@@ -139,29 +142,33 @@ fn relay_env(port: u16, token: &str) -> Vec<(String, SecretValue)> {
     env
 }
 
+/// The shim's `ping` command, as `dev status`'s relay check execs it. Kept
+/// here so `SHIM_PATH` itself stays private to this module.
+pub fn ping_command() -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        format!("exec {SHIM_PATH} ping"),
+        "dev-status".to_string(),
+    ]
+}
+
 /// Start a relay for this session, or `None` if there is no cmux to forward
-/// to. Silent on every failure, like everything else in this module.
-pub async fn start() -> Option<Relay> {
+/// to, or this daemon's containers have no route to host loopback. Silent on
+/// every failure, like everything else in this module.
+pub async fn start(access: HostAccess) -> Option<Relay> {
     let spawner = super::live()?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+    let callback = access.host_callback().ok()?;
+    let listener = TcpListener::bind((callback.bind, 0)).await.ok()?;
     let addr = listener.local_addr().ok()?;
     let token = mint_token()?;
     let task = tokio::spawn(accept_loop(listener, token.clone(), spawner));
-    Some(Relay { addr, token, task })
-}
-
-/// 32 bytes of urandom, hex encoded. The only thing standing between this
-/// listener and anything else that can reach the host's loopback, so it is
-/// read straight from the kernel rather than derived from anything guessable.
-fn mint_token() -> Option<String> {
-    use std::io::Read;
-
-    let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .ok()?
-        .read_exact(&mut buf)
-        .ok()?;
-    Some(hex::encode(buf))
+    Some(Relay {
+        addr,
+        token,
+        alias: callback.alias,
+        task,
+    })
 }
 
 async fn accept_loop(listener: TcpListener, token: String, spawner: &'static Spawner) {
@@ -338,36 +345,12 @@ const FEATURE_NAME: &str = "cmux-agent";
 
 /// Write the feature out and hand back the path a build can resolve it by.
 ///
-/// Rewritten every run rather than written once, so an upgraded `dev` refreshes
-/// a shim staged by an older one. The content is identical between runs of the
-/// same build, which is what keeps the generated Dockerfile byte-identical and
-/// the layer cache warm.
-///
-/// Nothing here is made executable: `dev` chmods `install.sh` before running it,
-/// and `install.sh` lands the shim with `install -m 0755`.
+/// Delegates the staging loop itself to
+/// [`crate::devcontainer::features::stage_embedded_feature`], shared with
+/// [`crate::ssh_agent::stage_feature_in`] so the two do not copy it between
+/// them.
 pub fn stage_feature_in(home: &DevHome) -> Result<PathBuf, DevError> {
-    let dir = home.staged_feature_dir(FEATURE_NAME);
-    let staged = |e: std::io::Error| DevError::Runtime(format!("staging {FEATURE_NAME}: {e}"));
-    std::fs::create_dir_all(&dir).map_err(staged)?;
-    for (name, contents) in FEATURE_FILES {
-        let path = dir.join(name);
-        std::fs::write(&path, contents).map_err(staged)?;
-        set_staged_mode(&path).map_err(staged)?;
-    }
-    Ok(dir)
-}
-
-/// These files are tarred into the build context, and that tar is a Docker cache
-/// key, so a mode the invoking shell's umask happened to pick cannot decide it.
-#[cfg(unix)]
-fn set_staged_mode(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
-}
-
-#[cfg(not(unix))]
-fn set_staged_mode(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
+    crate::devcontainer::features::stage_embedded_feature(home, FEATURE_NAME, &FEATURE_FILES)
 }
 
 /// One of cmux's wrappers, beside the CLI this process resolved.
@@ -696,17 +679,22 @@ mod tests {
     }
 
     /// Reads back the environment without binding a port or resolving a cmux,
-    /// so the test says the same thing on a machine that has neither.
+    /// so the test says the same thing on a machine that has neither. Drives
+    /// two different aliases through the same call so the literal that used
+    /// to live here cannot quietly come back.
     #[test]
     fn the_container_is_handed_a_reachable_address_and_the_session_token() {
-        let env: std::collections::HashMap<_, _> = relay_env(51482, "a".repeat(64).as_str())
-            .into_iter()
-            .map(|(k, v)| (k, v.expose().to_string()))
-            .collect();
-        assert_eq!(env["DEV_CMUX_RELAY"], "host.docker.internal:51482");
-        assert_eq!(env["DEV_CMUX_TOKEN"].len(), 64);
-        assert_eq!(env["CMUX_SOCKET_PATH"], SOCKET_PATH);
-        assert_eq!(env["CMUX_BUNDLED_CLI_PATH"], SHIM_PATH);
+        for alias in ["host.docker.internal", "host.containers.internal"] {
+            let env: std::collections::HashMap<_, _> =
+                relay_env(alias, 51482, "a".repeat(64).as_str())
+                    .into_iter()
+                    .map(|(k, v)| (k, v.expose().to_string()))
+                    .collect();
+            assert_eq!(env["DEV_CMUX_RELAY"], format!("{alias}:51482"));
+            assert_eq!(env["DEV_CMUX_TOKEN"].len(), 64);
+            assert_eq!(env["CMUX_SOCKET_PATH"], SOCKET_PATH);
+            assert_eq!(env["CMUX_BUNDLED_CLI_PATH"], SHIM_PATH);
+        }
     }
 
     fn embedded(name: &str) -> &'static str {
@@ -789,12 +777,5 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o644, "{name} took its mode from the umask");
         }
-    }
-
-    #[test]
-    fn tokens_differ_between_sessions() {
-        let first = mint_token().expect("urandom is readable");
-        assert_eq!(first.len(), 64);
-        assert_ne!(first, mint_token().unwrap());
     }
 }

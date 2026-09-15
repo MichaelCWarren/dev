@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Stands in for UNIX-CONNECT when the base layer's ssh-agent-relay.sh is
+# handed a tcp: upstream instead of a mounted host socket. socat's EXEC:
+# address runs this once per client connection with the client's stream on
+# this script's own stdin/stdout; it never binds or forks anything itself.
+#
+# Every failure here is silent and non-zero, with nothing read from stdin
+# first: a container that carries this feature but was never handed a relay
+# is the normal case, and a shim that blocked on stdin before it had
+# anywhere to send bytes would hang every ssh in that container.
+set -u
+export LC_ALL=C
+
+# Bumped with the host relay's own constant whenever the handshake below
+# changes shape. A mismatch is refused on the host side rather than
+# half-understood here.
+readonly PROTOCOL="dev-ssh-agent/1"
+
+# Bounds only the handshake reply. Past that the pump has no timeout: an
+# ssh-agent connection is idle for as long as the user goes without signing
+# something.
+readonly HANDSHAKE_TIMEOUT=5
+
+# The file first, the environment second. A container's environment is fixed
+# at create and cannot be changed while it runs, so the copy in there is good
+# for as long as the container is; dev rewrites this file every time it starts
+# a relay. A container built before the file existed has only the
+# environment, which is why that stays a fallback rather than a removal.
+# An argument, not an environment variable: a project's own containerEnv must
+# not be able to say where the token comes from. The base layer's relay
+# script passes none and gets the default.
+readonly TOKEN_FILE=${1:-/run/dev-ssh/token}
+
+upstream=${DEV_SSH_AGENT_UPSTREAM:-}
+token=""
+if [ -r "$TOKEN_FILE" ]; then
+  read -r token < "$TOKEN_FILE" || token=""
+fi
+[ -n "$token" ] || token=${DEV_SSH_AGENT_TOKEN:-}
+[ -n "$token" ] || exit 1
+case $upstream in
+  tcp:*) ;;
+  *) exit 1 ;; # unset, empty, or unix: -- the base script connects those itself
+esac
+relay=${upstream#tcp:}
+host=${relay%:*}
+port=${relay##*:}
+[ -n "$host" ] && [ -n "$port" ] || exit 1
+
+# bash's own net redirection: no nc, socat, or python in a base image.
+exec 3<>"/dev/tcp/$host/$port" || exit 1
+
+printf '%s %s\n' "$PROTOCOL" "$token" >&3 || exit 1
+
+read -r -t "$HANDSHAKE_TIMEOUT" status <&3 || exit 1
+[ "$status" = "ok" ] || exit 1
+
+# One direction of the pump, run as a background job with its descriptors
+# given at the call. It holds on to its cat's pid so the EXIT trap below can
+# end a direction still blocked on a descriptor the other side has already
+# given up on -- killing the job alone leaves the cat holding both streams
+# open, and an ssh whose shim never ends never completes or fails either.
+pump() {
+  trap 'kill "${inner:-}" 2>/dev/null; exit 0' TERM
+  # Never through a shell variable: bash drops NUL bytes on assignment and
+  # the agent protocol is length-prefixed binary full of them. The explicit
+  # stdin is what stops the shell handing this background job /dev/null.
+  cat <&0 &
+  inner=$!
+  wait "$inner" 2>/dev/null
+  kill -USR1 "$self" 2>/dev/null
+}
+
+self=$$
+# A background job is given /dev/null as stdin unless it names a descriptor
+# of its own, which would EOF this direction the moment it started.
+exec 4<&0
+# Whichever direction ends first has to end the script: a relay that closes
+# after admitting the shim leaves nothing to answer stdin, and a client that
+# closes leaves nothing to answer the relay. bash defers a trap until a
+# foreground command returns and has no `wait -n` before 5.1, so `wait` plus
+# a signal is what both a container bash and an Apple-shipped 3.2 honour.
+trap 'exit 0' USR1
+trap 'kill "${from_relay:-}" "${to_relay:-}" 2>/dev/null' EXIT
+pump <&3 &
+from_relay=$!
+pump <&4 >&3 &
+to_relay=$!
+wait
+exit 0

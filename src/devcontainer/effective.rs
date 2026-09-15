@@ -5,6 +5,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::DevError;
+use crate::runtime::{ALLOW_RELAY_PROPERTY, RELAY_PROPERTY};
 use crate::util::paths::base_config_dir;
 
 use super::config::DevcontainerConfig;
@@ -170,6 +171,7 @@ pub(crate) fn load_effective_config_value_tracked(
     let mut base_feature_ids = HashSet::new();
     if include_base && base_config_path.is_file() {
         let mut base = read_json_file(base_config_path)?;
+        reject_base_relay_key(&base, base_config_path)?;
         if !base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
             if let Some(base_dir) = base_config_path.parent() {
                 absolutize_config_paths(&mut base, base_dir);
@@ -208,6 +210,32 @@ pub(crate) fn prune_reporting_dropped(
         .into_iter()
         .filter(|k| merged.get(k).is_none())
         .collect()
+}
+
+/// The base layer may permit the relay but never turn it on.
+///
+/// `sshAgent.relay` there would relay for every project on the machine,
+/// including one the user has only cloned, which is the state the split into
+/// a separate `sshAgent.allowRelay` grant exists to end. A key that works
+/// today is not something to downgrade to a warning: a warning on the way to
+/// the same behavior is a warning that gets scrolled past.
+pub(crate) fn reject_base_relay_key(base: &Value, base_path: &Path) -> Result<(), DevError> {
+    if base
+        .get("sshAgent")
+        .and_then(|settings| settings.get("relay"))
+        .is_none()
+    {
+        return Ok(());
+    }
+    Err(DevError::InvalidConfig(format!(
+        "{RELAY_PROPERTY} is not allowed in {}. In the base config it would turn the SSH agent \
+         relay on for every project, including one you have only cloned. Set \
+         {ALLOW_RELAY_PROPERTY} there instead — it lets a project's own {RELAY_PROPERTY} be \
+         honoured rather than standing in for it. Run \
+         `dev base config set {ALLOW_RELAY_PROPERTY} true` and remove {RELAY_PROPERTY} from that \
+         file.",
+        base_path.display()
+    )))
 }
 
 fn declared_feature_ids(value: &Value) -> HashSet<String> {
@@ -416,6 +444,55 @@ mod tests {
         let path = base_dir.join("devcontainer.json");
         fs::write(&path, content).unwrap();
         path
+    }
+
+    /// The migration this fix forces, and the reason it is an error rather
+    /// than a warning: a base `sshAgent.relay` works today, so a warning
+    /// beside behavior that has not changed gets scrolled past, and the user
+    /// stays in the state where every cloned repository reaches their agent.
+    #[test]
+    fn a_relay_key_in_the_base_layer_is_refused_by_name() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(&home, r#"{"sshAgent": {"relay": true}}"#);
+
+        let error = load_effective_config_value(&config_path, true, &base_path)
+            .expect_err("a base layer that turns the relay on for every project must not load")
+            .to_string();
+
+        assert!(
+            error.contains(&base_path.display().to_string()),
+            "the file to edit must be named: {error}"
+        );
+        assert!(
+            error.contains("sshAgent.allowRelay"),
+            "the key that replaces it must be named: {error}"
+        );
+    }
+
+    /// `--no-base` is the one way past it, and only because it drops the
+    /// layer entirely; the grant itself is read elsewhere and is not a
+    /// devcontainer setting `--no-base` withdraws.
+    #[test]
+    fn the_base_relay_refusal_only_applies_to_the_layer_being_read() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "sshAgent": {"relay": true}}"#,
+        );
+        let base_path = write_base_config(&home, r#"{"sshAgent": {"relay": true}}"#);
+
+        assert!(
+            load_effective_config_value(&config_path, false, &base_path).is_ok(),
+            "--no-base reads no base layer, so there is nothing to refuse"
+        );
+        let merged = effective_value(&config_path, false, &base_path);
+        assert_eq!(
+            merged["sshAgent"]["relay"], true,
+            "a project's own request is not what the refusal is about"
+        );
     }
 
     fn load_config_with_base(

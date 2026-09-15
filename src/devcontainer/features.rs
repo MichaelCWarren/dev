@@ -134,24 +134,46 @@ enum FeatureRefKind {
     Oci { oci_ref: String, version: String },
 }
 
-/// Parse feature references from the config and resolve them into installable features.
+/// [`resolve_features_in`] for tests whose configs declare neither of the
+/// features `dev` supplies itself, so there is no relay decision to thread.
+///
+/// Production has no caller: every build path holds the `DevHome` its config
+/// was read from and passes the decision resolved against that home. A
+/// wrapper that re-derived the decision from `DevHome::current()` would make
+/// a computed image tag depend on the machine rather than on that home, which
+/// is how `dev prune` came to compute a keep set the developer's own
+/// `~/.dev` could change.
+#[cfg(test)]
 pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeature>, DevError> {
-    resolve_features_in(config, &DevHome::current())
+    resolve_features_in(
+        config,
+        &DevHome::current(),
+        crate::ssh_agent::RelayDecision::Off,
+    )
 }
 
-/// Every feature the config asks for, plus the one `dev` supplies itself.
+/// Every feature the config asks for, plus the ones `dev` supplies itself.
 ///
-/// `cmux.agent` is an opt-in for a capability, not a request for a particular
-/// image layer, so turning it on is what puts the `cmux-agent` feature in the
-/// build. That feature ships inside this binary (see
-/// [`crate::cmux::agent::stage_feature_in`]) rather than in a registry or the
-/// repository, so nothing has to be fetched or copied for the key to work.
+/// `cmux.agent` and the SSH agent relay are each an opt-in for a capability,
+/// not a request for a particular image layer, so turning either on is what
+/// puts its feature in the build. Both ship inside this binary (see
+/// [`crate::cmux::agent::stage_feature_in`] and
+/// [`crate::ssh_agent::stage_feature_in`]) rather than in a registry or the
+/// repository, so nothing has to be fetched or copied for either key to
+/// work. They are independent keys and each gets its own condition here: a
+/// user who wants one capability must not have to carry the other's image
+/// layer to get it.
 ///
 /// This is the one choke point every build path calls, which is why the
 /// injection lives here rather than at each of `up` and `build`'s call sites.
+/// The relay's layer follows the resolved decision rather than the project's
+/// `sshAgent.relay`, so a project the base has not allowed does not get the
+/// shim baked into its image — which would change the image hash and leave
+/// `dev status` reporting a relay that never runs.
 pub fn resolve_features_in(
     config: &DevcontainerConfig,
     home: &DevHome,
+    relay: crate::ssh_agent::RelayDecision,
 ) -> Result<Vec<ResolvedFeature>, DevError> {
     let mut resolved: Vec<ResolvedFeature> = config
         .features
@@ -168,7 +190,59 @@ pub fn resolve_features_in(
         ));
     }
 
+    if relay.is_on() {
+        let staged = crate::ssh_agent::stage_feature_in(home)?;
+        resolved.push(resolve_one(
+            &staged.to_string_lossy(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        ));
+    }
+
     Ok(resolved)
+}
+
+/// Write one of `dev`'s embedded features out under `home`'s staged features
+/// directory, and hand back the path a build can resolve it by.
+///
+/// Shared by [`crate::cmux::agent::stage_feature_in`] and
+/// [`crate::ssh_agent::stage_feature_in`], the only two callers, so the
+/// staging loop and its mode-setting are not copied between them.
+///
+/// Rewritten every run rather than written once, so an upgraded `dev`
+/// refreshes a shim staged by an older one. The content is identical between
+/// runs of the same build, which is what keeps the generated Dockerfile
+/// byte-identical and the layer cache warm.
+///
+/// Nothing here is made executable: each feature's own `install.sh` lands
+/// its shim with `install -m 0755` after `dev` chmods `install.sh` itself.
+pub(crate) fn stage_embedded_feature(
+    home: &DevHome,
+    name: &str,
+    files: &[(&str, &str)],
+) -> Result<PathBuf, DevError> {
+    let dir = home.staged_feature_dir(name);
+    let staged = |e: std::io::Error| DevError::Runtime(format!("staging {name}: {e}"));
+    std::fs::create_dir_all(&dir).map_err(staged)?;
+    for (file_name, contents) in files {
+        let path = dir.join(file_name);
+        std::fs::write(&path, contents).map_err(staged)?;
+        set_staged_mode(&path).map_err(staged)?;
+    }
+    Ok(dir)
+}
+
+/// These files are tarred into the build context, and that tar is a Docker
+/// cache key, so a mode the invoking shell's umask happened to pick cannot
+/// decide it.
+#[cfg(unix)]
+fn set_staged_mode(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(not(unix))]
+fn set_staged_mode(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// One entry of a `features` map, before anything has been downloaded.
@@ -1267,6 +1341,7 @@ fn union_string_array(value: Option<&serde_json::Value>, target: &mut Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh_agent::RelayDecision;
     use tempfile::TempDir;
 
     fn feature(id: &str) -> ResolvedFeature {
@@ -1557,8 +1632,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = DevHome::at(tmp.path());
 
-        let resolved =
-            resolve_features_in(&config_with(r#"{"cmux": {"agent": true}}"#), &home).unwrap();
+        let resolved = resolve_features_in(
+            &config_with(r#"{"cmux": {"agent": true}}"#),
+            &home,
+            RelayDecision::Off,
+        )
+        .unwrap();
 
         let staged = tmp.path().join("features/cmux-agent");
         assert_eq!(resolved.len(), 1);
@@ -1572,6 +1651,7 @@ mod tests {
         let resolved = resolve_features_in(
             &config_with(r#"{"features": {"ghcr.io/x/y:1": {}}, "cmux": {"agent": true}}"#),
             &DevHome::at(tmp.path()),
+            RelayDecision::Off,
         )
         .unwrap();
 
@@ -1591,10 +1671,67 @@ mod tests {
             r#"{"cmux": {"agent": false}}"#,
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            let resolved =
-                resolve_features_in(&config_with(json), &DevHome::at(tmp.path())).unwrap();
+            let resolved = resolve_features_in(
+                &config_with(json),
+                &DevHome::at(tmp.path()),
+                RelayDecision::Off,
+            )
+            .unwrap();
             assert!(resolved.is_empty(), "{json} added a feature");
             assert!(!tmp.path().join("features").exists(), "{json} staged one");
+        }
+    }
+
+    /// The relay is its own capability, independent of `cmux.agent`: a
+    /// consented relay is what puts the SSH shim in the build.
+    #[test]
+    fn a_consented_relay_adds_the_feature_dev_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+
+        let resolved = resolve_features_in(
+            &config_with(r#"{"sshAgent": {"relay": true}}"#),
+            &home,
+            RelayDecision::On,
+        )
+        .unwrap();
+
+        let staged = tmp.path().join("features/ssh-agent-relay");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, staged.to_string_lossy());
+        assert!(staged.join("install.sh").is_file());
+    }
+
+    /// Two packaging decisions in one table. `cmux.agent` must not carry the
+    /// SSH shim along with it, since the two keys gate independent image
+    /// layers — and the last row is the security one: a project that asked
+    /// without the base's permission must not get the shim baked into its
+    /// image either, or its image hash changes and `dev status` reports a
+    /// relay that will never run.
+    #[test]
+    fn without_a_consented_relay_the_shim_is_not_added_or_staged() {
+        for (json, relay) in [
+            (r#"{"image": "alpine"}"#, RelayDecision::Off),
+            (r#"{"sshAgent": {"relay": false}}"#, RelayDecision::Off),
+            (r#"{"cmux": {"agent": true}}"#, RelayDecision::Off),
+            (
+                r#"{"sshAgent": {"relay": true}}"#,
+                RelayDecision::RequestedNotAllowed,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let resolved =
+                resolve_features_in(&config_with(json), &DevHome::at(tmp.path()), relay).unwrap();
+            assert!(
+                !tmp.path().join("features/ssh-agent-relay").exists(),
+                "{json} staged the SSH shim"
+            );
+            assert!(
+                resolved
+                    .iter()
+                    .all(|f| !f.id.ends_with("features/ssh-agent-relay")),
+                "{json} added the SSH shim"
+            );
         }
     }
 
