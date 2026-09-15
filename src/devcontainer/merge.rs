@@ -81,7 +81,7 @@ const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts"];
 const ARRAY_CONCAT_FIELDS: &[&str] = &["runArgs"];
 
 /// Fields that are key-value maps and should be merged (base keys override template keys).
-const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy", "cmux"];
+const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy", "cmux", "sshAgent"];
 
 /// Fields that are feature maps (special merge: union of keys).
 const FEATURE_FIELDS: &[&str] = &["features"];
@@ -565,6 +565,25 @@ mod tests {
         let cmux = json["cmux"].as_object().unwrap();
         assert_eq!(cmux["status"], true); // base wins
         assert_eq!(cmux["agent"], true); // template sub-key survives
+    }
+
+    /// `sshAgent` only has one sub-key today, so this pairs it with an
+    /// unrelated one to prove the entry buys per-sub-key merge rather than
+    /// relying on the struct's own shape.
+    #[test]
+    fn test_merge_ssh_agent_per_sub_key() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"sshAgent": {"note": "from base"}}"#,
+            r#"{"sshAgent": {"relay": true}}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let ssh_agent = json["sshAgent"].as_object().unwrap();
+        assert_eq!(ssh_agent["relay"], true); // project sub-key survives
+        assert_eq!(ssh_agent["note"], "from base"); // base sub-key survives too
     }
 
     #[test]

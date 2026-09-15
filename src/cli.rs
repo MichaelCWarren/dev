@@ -231,6 +231,18 @@ pub enum Command {
         #[command(subcommand)]
         action: VscodeAction,
     },
+
+    /// Internal: the SSH agent relay daemon, spawned by `dev up`. Hidden
+    /// because nothing invokes it directly — the token that gates
+    /// connections travels through its environment, never argv, and the
+    /// listener arrives on stdin already bound.
+    #[command(hide = true)]
+    SshAgentRelay {
+        /// The workspace this relay belongs to, hashed: it names the lock
+        /// and state files under `~/.dev/ssh-relay/`.
+        #[arg(long)]
+        workspace_hash: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

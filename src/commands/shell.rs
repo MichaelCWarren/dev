@@ -92,10 +92,9 @@ pub(crate) async fn run_with_runtime(
 ///
 /// Three things have to hold, and each rules out a different way of being
 /// wrong: the project asked for it, this terminal has a cmux to report to,
-/// and the container carries the `cmux-agent` feature's shim. Podman and
-/// Apple are excluded because neither host alias nor socket behavior has been
-/// proven there, and a relay the container cannot reach would point cmux's
-/// wrapper at a dead end rather than fail cleanly.
+/// and the runtime's host access descriptor says a container can reach a
+/// loopback listener on the host. A relay the container cannot reach would
+/// point cmux's wrapper at a dead end rather than fail cleanly.
 async fn start_agent_relay(
     config: Option<&DevcontainerConfig>,
     cmux: &Cmux,
@@ -105,12 +104,12 @@ async fn start_agent_relay(
 ) -> Option<agent::Relay> {
     if !config.is_some_and(DevcontainerConfig::cmux_agent_enabled)
         || !cmux.available()
-        || runtime.runtime_name() != "docker"
+        || runtime.host_access().host_callback().is_err()
     {
         return None;
     }
     let agents = agent::installed_agents(runtime, &container.id, user).await?;
-    let relay = agent::start().await?;
+    let relay = agent::start(runtime.host_access()).await?;
     agent::prepare_container(runtime, &container.id, user, &agents)
         .await
         .then_some(relay)

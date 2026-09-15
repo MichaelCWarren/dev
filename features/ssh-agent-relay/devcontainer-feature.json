@@ -1,0 +1,8 @@
+{
+  "id": "ssh-agent-relay",
+  "version": "1.0.0",
+  "name": "ssh agent relay upstream",
+  "description": "Installs the shim the base layer's ssh-agent-relay.sh execs into when dev hands the container a tcp: upstream instead of a mounted host socket. Does nothing until a dev up session starts a relay.",
+  "documentationURL": "https://github.com/squirrelsoft-dev/dev/blob/main/features/ssh-agent-relay/README.md",
+  "options": {}
+}

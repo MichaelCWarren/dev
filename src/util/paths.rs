@@ -92,6 +92,25 @@ impl DevHome {
     pub fn workspace_logs_dir(&self, workspace_hash: &str) -> PathBuf {
         self.root.join("logs").join(workspace_hash)
     }
+
+    /// A workspace's SSH agent relay state file,
+    /// `~/.dev/ssh-relay/<workspace-hash>.json`. Records the daemon's port
+    /// and pid, so a later `dev up` can tell its own relay from a stale one.
+    pub fn ssh_relay_state_file(&self, workspace_hash: &str) -> PathBuf {
+        self.root
+            .join("ssh-relay")
+            .join(format!("{workspace_hash}.json"))
+    }
+
+    /// A workspace's SSH agent relay lock file,
+    /// `~/.dev/ssh-relay/<workspace-hash>.lock`. Separate from the state
+    /// file because that one is replaced by rename: a lock taken on an
+    /// inode a rename then unlinks stops excluding anything.
+    pub fn ssh_relay_lock_file(&self, workspace_hash: &str) -> PathBuf {
+        self.root
+            .join("ssh-relay")
+            .join(format!("{workspace_hash}.lock"))
+    }
 }
 
 /// VS Code remote-containers configs directory.

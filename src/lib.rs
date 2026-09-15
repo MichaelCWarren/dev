@@ -8,6 +8,7 @@ pub mod error;
 pub mod oci;
 pub mod runtime;
 pub mod session;
+pub mod ssh_agent;
 pub mod tui;
 pub mod util;
 

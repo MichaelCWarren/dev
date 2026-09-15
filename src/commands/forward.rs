@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use crate::runtime::{ContainerRuntime, ContainerState, detect_runtime};
 use crate::util::naming::workspace_hash;
 use crate::util::paths::dev_home;
+use crate::util::process::{is_process_alive, kill_and_wait};
 use crate::util::workspace_labels;
 
 // CLI entry point: arity mirrors the `dev forward` flag surface.
@@ -71,10 +72,6 @@ fn forward_dir() -> std::path::PathBuf {
 
 fn pid_file_path(workspace: &Path, host_port: u16) -> std::path::PathBuf {
     forward_dir().join(format!("{}-{}.pid", workspace_hash(workspace), host_port))
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 fn read_pid_file(path: &Path) -> anyhow::Result<u32> {
@@ -222,19 +219,7 @@ fn stop_forwarder(workspace: &Path, host_port: u16) -> anyhow::Result<()> {
         anyhow::bail!("Forwarder on port {host_port} (PID {pid}) is no longer running");
     }
 
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-
-    // Wait up to 2 seconds for graceful exit
-    for _ in 0..20 {
-        if !is_process_alive(pid) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    if is_process_alive(pid) {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    }
+    kill_and_wait(pid);
 
     let _ = std::fs::remove_file(&path);
     remove_custom_name(workspace, host_port);

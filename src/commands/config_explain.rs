@@ -7,6 +7,7 @@ use crate::devcontainer::Recipe;
 use crate::devcontainer::compose::compose_recipe_config_tracked_in;
 use crate::devcontainer::effective::load_effective_config_value_tracked;
 use crate::devcontainer::merge::{LayerId, Provenance};
+use crate::runtime::{ALLOW_RELAY_PROPERTY, RELAY_PROPERTY};
 use crate::util::ConfigSource;
 use crate::util::paths::DevHome;
 
@@ -44,6 +45,28 @@ struct ExplainReport {
     config: Value,
     origins: BTreeMap<String, LayerId>,
     dropped: Vec<String>,
+    relay: RelayPermission,
+}
+
+/// The base config's half of the SSH agent relay decision.
+///
+/// It is read from that file directly and never merged, so `Provenance` has
+/// nothing to say about it and the report must not pretend otherwise — a
+/// fabricated `base` origin would be exactly the kind of lie the probed bits
+/// of `HostAccess` exist to avoid. Hence its own block, outside the
+/// merged-key table.
+struct RelayPermission {
+    base: PathBuf,
+    allowed: bool,
+}
+
+impl RelayPermission {
+    fn read(dev_home: &DevHome) -> Self {
+        Self {
+            base: dev_home.base_config(),
+            allowed: crate::runtime::ssh_agent_relay_allowed_in(dev_home),
+        }
+    }
 }
 
 /// Build the report by running the same tracked pipeline `dev up` merges with.
@@ -84,6 +107,7 @@ fn explain(
                 config,
                 origins: prov.into_origins(),
                 dropped,
+                relay: RelayPermission::read(dev_home),
             })
         }
         ConfigSource::Recipe(recipe_path) => {
@@ -105,6 +129,7 @@ fn explain(
                 config: composed.value,
                 origins: prov.into_origins(),
                 dropped,
+                relay: RelayPermission::read(dev_home),
             })
         }
     }
@@ -180,12 +205,55 @@ impl ExplainReport {
                 "# dropped by selector precedence: {key} (the highest layer's image/build/compose choice wins)\n"
             ));
         }
+        out.push_str(&self.render_relay());
         out.push_str(
             "# notes: ${...} variables are shown unexpanded (substitution happens per consumer at run time);\n\
              #        duplicate array entries stay credited to the first layer that contributed them;\n\
              #        `dev up --ports` applies after this merge.\n",
         );
         out
+    }
+
+    /// Whether the merged config asks for the relay, and which layer asked.
+    /// The request does pass through the merge, so this origin is real.
+    fn relay_requested(&self) -> bool {
+        self.config
+            .get("sshAgent")
+            .and_then(|settings| settings.get("relay"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn relay_requested_by(&self) -> Option<&LayerId> {
+        self.origins.get(RELAY_PROPERTY)
+    }
+
+    fn relay_effective(&self) -> bool {
+        self.relay.allowed && self.relay_requested()
+    }
+
+    fn render_relay(&self) -> String {
+        let allowed_by = if self.relay.allowed {
+            format!("{} ({ALLOW_RELAY_PROPERTY})", self.relay.base.display())
+        } else {
+            format!(
+                "not allowed ({} does not set {ALLOW_RELAY_PROPERTY})",
+                self.relay.base.display()
+            )
+        };
+        let requested_by = match (self.relay_requested(), self.relay_requested_by()) {
+            (true, Some(layer)) => layer.to_string(),
+            (true, None) => "requested, layer unrecorded".to_string(),
+            (false, _) => "not requested".to_string(),
+        };
+        format!(
+            "# ssh agent relay (decided outside the merge; the permission is read from the base \
+             file alone):\n\
+             #   allowed by     {allowed_by}\n\
+             #   requested by   {requested_by}\n\
+             #   effective      {}\n",
+            if self.relay_effective() { "on" } else { "off" }
+        )
     }
 
     /// Origin entries with array indexes in numeric order (`mounts[2]` before
@@ -214,6 +282,13 @@ impl ExplainReport {
                 .map(|(k, v)| (k.clone(), Value::String(v.to_string())))
                 .collect::<serde_json::Map<_, _>>(),
             "dropped": self.dropped,
+            "sshAgentRelay": {
+                "allowedBy": self.relay.allowed.then(|| self.relay.base.display().to_string()),
+                "requestedBy": self.relay_requested()
+                    .then(|| self.relay_requested_by().map(LayerId::to_string))
+                    .flatten(),
+                "effective": self.relay_effective(),
+            },
             "notes": [
                 "variables-unexpanded",
                 "duplicates-credited-to-first-contributing-layer",
@@ -307,6 +382,81 @@ mod tests {
         assert!(
             rendered.contains("remoteUser = \"vscode\"  <- base"),
             "{rendered}"
+        );
+    }
+
+    /// The relay consent gets its own block because the permission never
+    /// passes through the merge: `Provenance` has no honest origin for it,
+    /// and inventing a `base` one would be the same lie the probed bits of
+    /// `HostAccess` exist to prevent. The request does merge, so that half
+    /// is credited to a real layer.
+    #[test]
+    fn explain_reports_the_relay_consent_outside_the_merged_keys() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        write(
+            &dev_home.base_config(),
+            r#"{"sshAgent": {"allowRelay": true}}"#,
+        );
+        write(
+            &workspace.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:24.04", "sshAgent": {"relay": true}}"#,
+        );
+
+        let report = explain(&dev_home, workspace.path(), "docker", true).unwrap();
+        let rendered = report.render();
+
+        assert_eq!(report.origins["sshAgent.relay"], LayerId::Project);
+        assert!(
+            rendered.contains(&format!(
+                "allowed by     {}",
+                dev_home.base_config().display()
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("requested by   project"), "{rendered}");
+        assert!(rendered.contains("effective      on"), "{rendered}");
+        assert_eq!(report.to_json()["sshAgentRelay"]["effective"], true);
+    }
+
+    /// A project writing `allowRelay` into its own config puts the key in the
+    /// merged document, where it is reported as the merged key it is — and
+    /// the block still says not allowed, because the block reads the base
+    /// file and not the merge. A block sourced from the merged value would
+    /// read this project's own key as its permission.
+    #[test]
+    fn explain_reports_a_relay_request_the_base_did_not_allow() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        write(&dev_home.base_config(), r#"{"remoteUser": "vscode"}"#);
+        write(
+            &workspace.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:24.04", "sshAgent": {"relay": true, "allowRelay": true}}"#,
+        );
+
+        let report = explain(&dev_home, workspace.path(), "docker", true).unwrap();
+        let rendered = report.render();
+
+        assert_eq!(
+            report.origins["sshAgent.allowRelay"],
+            LayerId::Project,
+            "the merged document is reported as it is"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "not allowed ({} does not set sshAgent.allowRelay)",
+                dev_home.base_config().display()
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("effective      off"), "{rendered}");
+        assert_eq!(report.to_json()["sshAgentRelay"]["allowedBy"], Value::Null);
+        assert_eq!(
+            report.to_json()["sshAgentRelay"]["requestedBy"],
+            "project",
+            "the user should still see that the project asked"
         );
     }
 
@@ -462,6 +612,7 @@ mod tests {
             config: serde_json::json!({}),
             origins,
             dropped: vec![],
+            relay: RelayPermission::read(&DevHome::at("/nonexistent")),
         };
         let keys: Vec<String> = report.to_json()["origins"]
             .as_object()

@@ -2,7 +2,9 @@ use std::path::Path;
 
 use crate::cmux::{Cmux, SESSION_PILL_STYLE, SHELL_KEY};
 use crate::commands::shell::{SessionPill, session_pill_action};
-use crate::devcontainer::compose::load_workspace_config;
+use crate::commands::status_runtime;
+use crate::devcontainer::DevcontainerConfig;
+use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::runtime::{ContainerInfo, ContainerRuntime, ContainerState, detect_runtime};
 use crate::session::{self, SessionMarker};
 use crate::util::{find_config_source, workspace_folder_name, workspace_labels};
@@ -25,8 +27,24 @@ pub async fn run(
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let containers = runtime.list_containers(&filters).await?;
 
+    // Loaded once: for a recipe-backed workspace this is a full recipe
+    // composition, and both the pill and the report want the same answer.
+    let config =
+        load_workspace_config_or_warn(workspace, runtime.runtime_name()).map(|(_, config)| config);
+
     let sessions = collect_sessions(runtime.as_ref(), &containers).await;
-    repaint_session_pill(workspace, runtime.as_ref(), &containers, &sessions).await;
+    repaint_session_pill(
+        workspace,
+        runtime.as_ref(),
+        &containers,
+        &sessions,
+        config.as_ref(),
+    )
+    .await;
+
+    let report =
+        status_runtime::build_report(workspace, runtime.as_ref(), &containers, config.as_ref())
+            .await;
 
     if json {
         let items: Vec<serde_json::Value> = containers
@@ -42,10 +60,15 @@ pub async fn run(
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        let output = serde_json::json!({
+            "containers": items,
+            "runtime": report.to_json(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else if containers.is_empty() {
         println!("No containers running for this workspace.");
         println!("Use `dev up` to start a container for this workspace.");
+        print!("{}", report.render());
     } else {
         println!("{:<30} {:<12} IMAGE", "NAME", "STATE");
         for c in &containers {
@@ -57,6 +80,7 @@ pub async fn run(
             );
         }
         print_sessions(&containers, &sessions);
+        print!("{}", report.render());
     }
 
     Ok(())
@@ -118,17 +142,17 @@ fn pill_evidence<'a>(
 /// leaves the pill up with nothing left to clear it; this is the other place
 /// that reads the live session list and can notice. It holds no guard: the
 /// decision below is the whole of what `dev status` does to the pill, and
-/// exiting is not by itself a reason to take a live shell's pill down. The
-/// config gate goes first because a config that does not load is the cheapest
-/// answer of all; either way `dev status` prints nothing new, including on a
-/// broken config.
+/// exiting is not by itself a reason to take a live shell's pill down. A
+/// workspace whose config did not load gets no pill decision at all; either
+/// way `dev status` prints nothing new, including on a broken config.
 async fn repaint_session_pill(
     workspace: &Path,
     runtime: &dyn ContainerRuntime,
     containers: &[ContainerInfo],
     sessions: &[ContainerSessions],
+    config: Option<&DevcontainerConfig>,
 ) {
-    let Ok((_, config)) = load_workspace_config(workspace, runtime.runtime_name()) else {
+    let Some(config) = config else {
         return;
     };
     let cmux = Cmux::detect(config.cmux_status_enabled());

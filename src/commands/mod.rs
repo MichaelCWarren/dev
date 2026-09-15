@@ -14,5 +14,6 @@ pub mod open;
 pub mod prune;
 pub mod shell;
 pub mod status;
+pub mod status_runtime;
 pub mod up;
 pub mod vscode;

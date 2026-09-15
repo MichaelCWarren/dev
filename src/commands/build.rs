@@ -10,8 +10,9 @@ use crate::devcontainer::features::{
 };
 use crate::devcontainer::substitute_variables;
 use crate::devcontainer::uid;
-use crate::devcontainer::{Recipe, download_features, resolve_features, stage_feature_context};
+use crate::devcontainer::{Recipe, download_features, resolve_features_in, stage_feature_context};
 use crate::runtime::{detect_runtime, resolve_remote_user};
+use crate::util::paths::DevHome;
 use crate::util::{ConfigSource, container_name, find_config_source, workspace_folder_name};
 
 #[allow(clippy::too_many_arguments)]
@@ -57,6 +58,7 @@ pub(crate) async fn run_with_runtime(
     no_base: bool,
     cmux: &Cmux,
 ) -> anyhow::Result<()> {
+    let host_access = runtime.host_access();
     let (config_path, recipe_config) = match find_config_source(workspace)? {
         ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
@@ -80,8 +82,14 @@ pub(crate) async fn run_with_runtime(
     let config = effective.config;
     let mut pill = cmux.guard(BUILD_KEY, config.cmux_status_enabled());
 
+    // The relay's shim is an image layer, so the permission decides what gets
+    // built here as much as it decides whether a daemon runs in `dev up`.
+    let dev_home = DevHome::current();
+    let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, &dev_home);
+    relay.report();
+
     let folder_image = container_name(workspace);
-    let features = resolve_features(&config)?;
+    let features = resolve_features_in(&config, &dev_home, relay.decision())?;
     let has_features = !features.is_empty();
     let default_tag = if has_features {
         feature_image_tag(&folder_image, &config, &features)
@@ -124,6 +132,7 @@ pub(crate) async fn run_with_runtime(
                 &config,
                 remote_user.as_deref(),
                 update_remote_user_uid_default,
+                host_access,
             ) {
                 pill.phase("build: remapping uid", BUILD_STYLE);
                 let meta = runtime.inspect_image_metadata(final_tag).await?;
@@ -192,6 +201,7 @@ pub(crate) async fn run_with_runtime(
             &config,
             feature_user.as_deref(),
             update_remote_user_uid_default,
+            host_access,
         ) {
             pill.phase("build: remapping uid", BUILD_STYLE);
             let meta = runtime.inspect_image_metadata(final_tag).await?;
@@ -316,6 +326,7 @@ pub(crate) async fn run_with_runtime(
             &config,
             feature_user.as_deref(),
             update_remote_user_uid_default,
+            host_access,
         ) {
             pill.phase("build: remapping uid", BUILD_STYLE);
             let meta = runtime.inspect_image_metadata(compose_final_tag).await?;
@@ -384,6 +395,7 @@ pub(crate) async fn run_with_runtime(
         &config,
         feature_user.as_deref(),
         update_remote_user_uid_default,
+        host_access,
     ) {
         pill.phase("build: remapping uid", BUILD_STYLE);
         let meta = runtime.inspect_image_metadata(final_tag).await?;
@@ -411,11 +423,13 @@ mod tests {
     use crate::cmux::{BUILD_KEY, Cmux};
     use crate::devcontainer::secrets::SecretValue;
     use crate::error::DevError;
+    use crate::runtime::docker::DockerFlavor;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
-        ImageMetadata,
+        HostAccess, ImageMetadata,
     };
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn write_project_config(dir: &TempDir, content: &str) -> std::path::PathBuf {
@@ -437,11 +451,40 @@ mod tests {
     /// A runtime whose pull and build always succeed, modelling the
     /// image-only, no-features path `dev build` takes for these tests. Every
     /// other method is unreached by that path and errors if it ever is.
-    struct FakeRuntime;
+    /// Built tags are recorded, so the UID-remapping layer is observable
+    /// without a daemon.
+    struct FakeRuntime {
+        built_tags: Arc<Mutex<Vec<String>>>,
+        host_access: HostAccess,
+    }
+
+    impl FakeRuntime {
+        fn new() -> Self {
+            FakeRuntime {
+                built_tags: Arc::new(Mutex::new(Vec::new())),
+                host_access: HostAccess::unknown(),
+            }
+        }
+
+        fn on_flavor(flavor: DockerFlavor) -> Self {
+            FakeRuntime {
+                host_access: HostAccess::for_flavor(flavor),
+                ..Self::new()
+            }
+        }
+
+        fn built_tags(&self) -> Vec<String> {
+            self.built_tags.lock().unwrap().clone()
+        }
+    }
 
     impl ContainerRuntime for FakeRuntime {
         fn runtime_name(&self) -> &'static str {
             "fake"
+        }
+
+        fn host_access(&self) -> HostAccess {
+            self.host_access
         }
 
         fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
@@ -452,11 +495,12 @@ mod tests {
             &self,
             _dockerfile: &str,
             _context: &std::path::Path,
-            _tag: &str,
+            tag: &str,
             _build_args: &std::collections::HashMap<String, String>,
             _no_cache: bool,
             _verbose: bool,
         ) -> BoxFut<'_, ()> {
+            self.built_tags.lock().unwrap().push(tag.to_string());
             Box::pin(async { Ok(()) })
         }
 
@@ -528,18 +572,67 @@ mod tests {
     /// features, `no_base: true` — the path that walks straight to the
     /// bare-tag print at the bottom of the function.
     async fn run_build_with_cmux(workspace: &TempDir, cmux: &Cmux) -> anyhow::Result<()> {
+        run_build(workspace, &FakeRuntime::new(), "never", cmux).await
+    }
+
+    /// [`run_with_runtime`] with the runtime and the UID default supplied,
+    /// the two the remapping decision reads.
+    async fn run_build(
+        workspace: &TempDir,
+        runtime: &FakeRuntime,
+        update_remote_user_uid_default: &str,
+        cmux: &Cmux,
+    ) -> anyhow::Result<()> {
         run_with_runtime(
             workspace.path(),
-            &FakeRuntime,
+            runtime,
             /* tag */ None,
             /* no_cache */ false,
             /* verbose */ false,
             /* frozen_lockfile */ false,
-            /* update_remote_user_uid_default */ "never",
+            update_remote_user_uid_default,
             /* no_base */ true,
             cmux,
         )
         .await
+    }
+
+    /// `dev build`'s own remapping decision, which reads the same descriptor
+    /// field `dev up` does and was equally unexercised: on a Mac the old
+    /// blanket platform skip and Docker Desktop's descriptor agree, so a
+    /// regression is invisible until someone runs OrbStack.
+    #[tokio::test]
+    async fn build_remaps_uid_by_descriptor_and_not_by_host_platform() {
+        let cases = [
+            (DockerFlavor::DockerDesktop, false),
+            (DockerFlavor::OrbStack, true),
+        ];
+
+        for (flavor, expect_remap) in cases {
+            let workspace = TempDir::new().unwrap();
+            let config = write_project_config(
+                &workspace,
+                r#"{"build":{"dockerfile":"Dockerfile"},"remoteUser":"dev"}"#,
+            );
+            // A plain `image` with no features prints the image and returns
+            // before any remapping decision, so the Dockerfile path is where
+            // `dev build` actually reads the descriptor.
+            fs::write(
+                config.parent().unwrap().join("Dockerfile"),
+                "FROM ubuntu:24.04
+",
+            )
+            .unwrap();
+            let runtime = FakeRuntime::on_flavor(flavor);
+
+            run_build(&workspace, &runtime, "on", &Cmux::recording().0)
+                .await
+                .expect("the build must succeed either way");
+
+            let built = runtime.built_tags();
+            let remapped = built.iter().any(|tag| tag.ends_with("-uid"));
+            assert_eq!(remapped, expect_remap, "{flavor:?}: built {built:?}");
+        }
     }
 
     /// The pull phase is set before the print, and cleared by the guard's

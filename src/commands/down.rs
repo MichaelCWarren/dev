@@ -4,6 +4,7 @@ use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
 use crate::devcontainer::DevcontainerConfig;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::runtime::{ContainerState, detect_runtime};
+use crate::util::paths::DevHome;
 use crate::util::{container_name, workspace_labels};
 
 pub async fn run(
@@ -37,6 +38,7 @@ pub async fn run(
     run_with_runtime(
         workspace,
         &*runtime,
+        &DevHome::current(),
         remove,
         crate::caddy::unregister_site,
         &mut pill,
@@ -50,10 +52,17 @@ pub async fn run(
 pub async fn run_with_runtime(
     workspace: &Path,
     runtime: &dyn crate::runtime::ContainerRuntime,
+    dev_home: &DevHome,
     remove: bool,
     unregister_caddy: impl FnOnce(&Path) -> anyhow::Result<()>,
     pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
+    // First, so that a listener which can sign with the user's keys does not
+    // outlive the container it was opened for even when that container is
+    // already gone and every branch below returns early. Compose never starts
+    // a relay, so its own teardown path has nothing to stop.
+    crate::ssh_agent::stop_relay(dev_home, workspace);
+
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let containers = runtime.list_containers(&filters).await?;
@@ -206,6 +215,7 @@ mod tests {
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
+    use crate::util::paths::DevHome;
     use std::collections::HashMap;
     use std::io;
     use std::path::Path;
@@ -433,6 +443,7 @@ mod tests {
     async fn failed_stop_still_triggers_remove() {
         let mut rt = FakeRuntime::new();
         let workspace = Path::new("/tmp/fake-workspace");
+        let dev_home = tempfile::tempdir().unwrap();
 
         // Container 0: stop fails, but inspect reports Stopped.
         rt.stop_responses
@@ -444,7 +455,15 @@ mod tests {
             .insert("2222".to_string(), ContainerState::Stopped);
 
         let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
+        let res = run_with_runtime(
+            workspace,
+            &rt,
+            &DevHome::at(dev_home.path()),
+            true,
+            |_: &Path| Ok(()),
+            &mut pill,
+        )
+        .await;
 
         // remove_container must be called for each container, including the one whose stop failed.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -460,6 +479,7 @@ mod tests {
     async fn removal_success_after_stop_failure_does_not_fail_the_command() {
         let mut rt = FakeRuntime::new();
         let workspace = Path::new("/tmp/fake-workspace");
+        let dev_home = tempfile::tempdir().unwrap();
 
         // Container 0: stop fails, inspect reports Stopped, remove succeeds.
         // Container 1: same — stop fails, inspect Stopped, remove succeeds.
@@ -475,7 +495,15 @@ mod tests {
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
         let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
+        let res = run_with_runtime(
+            workspace,
+            &rt,
+            &DevHome::at(dev_home.path()),
+            true,
+            |_: &Path| Ok(()),
+            &mut pill,
+        )
+        .await;
 
         // remove_container was called for each container — no error.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -491,6 +519,7 @@ mod tests {
     async fn stop_failure_on_one_container_does_not_abandon_the_rest() {
         let mut rt = FakeRuntime::new();
         let workspace = Path::new("/tmp/fake-workspace");
+        let dev_home = tempfile::tempdir().unwrap();
 
         // Container 0: stop fails, inspect reports Stopped.
         rt.stop_responses
@@ -507,7 +536,15 @@ mod tests {
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
         let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
-        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(()), &mut pill).await;
+        let res = run_with_runtime(
+            workspace,
+            &rt,
+            &DevHome::at(dev_home.path()),
+            true,
+            |_: &Path| Ok(()),
+            &mut pill,
+        )
+        .await;
 
         // remove_container should have been called for both containers: a stop
         // failure must not skip removal, so both are removed.
@@ -526,6 +563,7 @@ mod tests {
     async fn down_sets_stop_phase_and_clears() {
         let mut rt = FakeRuntime::new();
         let workspace = Path::new("/tmp/fake-workspace");
+        let dev_home = tempfile::tempdir().unwrap();
         rt.inspect_states
             .insert("1111".to_string(), ContainerState::Stopped);
         rt.inspect_states
@@ -533,7 +571,15 @@ mod tests {
 
         let (cmux, recorder) = Cmux::recording();
         let mut pill = cmux.guard(BUILD_KEY, true);
-        let res = run_with_runtime(workspace, &rt, false, |_: &Path| Ok(()), &mut pill).await;
+        let res = run_with_runtime(
+            workspace,
+            &rt,
+            &DevHome::at(dev_home.path()),
+            false,
+            |_: &Path| Ok(()),
+            &mut pill,
+        )
+        .await;
         assert!(
             res.is_ok(),
             "run_with_runtime should succeed: {:?}",

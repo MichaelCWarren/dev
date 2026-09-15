@@ -8,6 +8,7 @@ mod error;
 mod oci;
 mod runtime;
 mod session;
+mod ssh_agent;
 mod tui;
 mod util;
 
@@ -199,6 +200,9 @@ async fn run() -> anyhow::Result<()> {
                 commands::vscode::repair(&workspace)?;
             }
         },
+        Command::SshAgentRelay { workspace_hash } => {
+            ssh_agent::run_daemon(&workspace_hash).await?;
+        }
     }
 
     Ok(())
