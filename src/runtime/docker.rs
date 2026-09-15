@@ -1922,9 +1922,11 @@ mod tests {
     /// that reads as plain Ubuntu on its own — proving the `name` rule
     /// outranks the Ubuntu guest text rather than falling through to Engine —
     /// and a daemon that names nothing recognizable, which is `Engine` only
-    /// where the daemon can share the host kernel. The last row proves an
-    /// unrecognized daemon still falls through to the socket path rather than
-    /// stopping at `None`.
+    /// where the daemon can share the host kernel. The two gated rows carry
+    /// that split. On macOS an unrecognized daemon falls through to the
+    /// socket path, which names Colima from a `.colima` component and gives
+    /// up as `None` on a path shared by every flavor. On any other kernel
+    /// both stop at the `Engine` catch-all and the path is never read.
     #[test]
     fn the_daemon_names_its_own_flavor() {
         let mut cases = vec![
@@ -1959,27 +1961,37 @@ mod tests {
                 "/var/run/docker.sock",
                 Some(DockerFlavor::Colima),
             ),
+        ];
+        #[cfg(target_os = "macos")]
+        cases.extend([
             (
                 "Ubuntu 24.04.1 LTS",
                 "some-box",
                 "/Users/mo/.colima/work/docker.sock",
                 Some(DockerFlavor::Colima),
             ),
-        ];
-        #[cfg(target_os = "macos")]
-        cases.push((
-            "Ubuntu 24.04.1 LTS",
-            "some-linux-box",
-            "/var/run/docker.sock",
-            None,
-        ));
+            (
+                "Ubuntu 24.04.1 LTS",
+                "some-linux-box",
+                "/var/run/docker.sock",
+                None,
+            ),
+        ]);
         #[cfg(not(target_os = "macos"))]
-        cases.push((
-            "Ubuntu 24.04.1 LTS",
-            "some-linux-box",
-            "/var/run/docker.sock",
-            Some(DockerFlavor::Engine),
-        ));
+        cases.extend([
+            (
+                "Ubuntu 24.04.1 LTS",
+                "some-box",
+                "/Users/mo/.colima/work/docker.sock",
+                Some(DockerFlavor::Engine),
+            ),
+            (
+                "Ubuntu 24.04.1 LTS",
+                "some-linux-box",
+                "/var/run/docker.sock",
+                Some(DockerFlavor::Engine),
+            ),
+        ]);
 
         for (operating_system, name, socket_path, expected) in cases {
             let info = SystemInfo {
