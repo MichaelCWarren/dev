@@ -21,20 +21,21 @@ use super::provider::ProviderRegistry;
 use super::reference::SecretRef;
 use crate::devcontainer::variables::substitute_variables_with_user;
 use crate::error::DevError;
+use crate::util::paths::DevHome;
 
-/// A `secrets.json` that has been found, parsed, checked against the provider
-/// registry, and variable-substituted. Empty when the workspace declares no
-/// secrets.
+/// The base and project `secrets.json` files, found, parsed, checked against
+/// the provider registry, variable-substituted, and merged. Empty when neither
+/// file exists.
 #[derive(Debug, Clone, Default)]
 pub struct ValidatedSecrets {
-    source: Option<PathBuf>,
+    sources: Vec<PathBuf>,
     entries: Vec<SecretRef>,
 }
 
 impl ValidatedSecrets {
-    /// The file these entries came from, or `None` when there was no sidecar.
-    pub fn source(&self) -> Option<&Path> {
-        self.source.as_deref()
+    /// The files these entries came from, base first. Empty when there were none.
+    pub fn sources(&self) -> &[PathBuf] {
+        &self.sources
     }
 
     pub fn entries(&self) -> &[SecretRef] {
@@ -49,7 +50,7 @@ impl ValidatedSecrets {
 }
 
 /// Load, validate, and variable-substitute the `secrets.json` beside
-/// `config_path`, if there is one.
+/// `config_path`, merged over `~/.dev/base/secrets.json`.
 ///
 /// `workspace` and `remote_user` exist only for substitution and are the same
 /// two values the `runArgs` substitution passes, so one rule covers the whole
@@ -60,12 +61,14 @@ impl ValidatedSecrets {
 // `dev up` goes through `validate_secrets_at` so the sidecar-vs-override choice
 // lives in one place. `dev exec` and `dev shell` discover from a config path.
 pub fn validate_secrets_for_config(
+    dev_home: &DevHome,
     config_path: &Path,
     workspace: &Path,
     remote_user: Option<&str>,
     registry: &ProviderRegistry,
 ) -> Result<ValidatedSecrets, DevError> {
     validate_secrets_at(
+        dev_home,
         super::discovery::secrets_path_beside(config_path),
         workspace,
         remote_user,
@@ -76,23 +79,33 @@ pub fn validate_secrets_for_config(
 /// [`validate_secrets_for_config`] against an explicit references file.
 ///
 /// `--secrets` replaces the sidecar, never merges with it, so this takes the one
-/// path the invocation settled on rather than a second source.
+/// path the invocation settled on rather than a second source. The base file
+/// sits under whichever one that is, and a project key replaces a base key of
+/// the same name, the way a project's `remoteEnv` beats the base layer's.
 pub fn validate_secrets_at(
+    dev_home: &DevHome,
     path: Option<PathBuf>,
     workspace: &Path,
     remote_user: Option<&str>,
     registry: &ProviderRegistry,
 ) -> Result<ValidatedSecrets, DevError> {
-    let Some(path) = path else {
-        return Ok(ValidatedSecrets::default());
-    };
-    let mut entries = file::load(&path)?.secrets;
+    let base = dev_home.base_secrets();
+    let sources: Vec<PathBuf> = base
+        .is_file()
+        .then_some(base)
+        .into_iter()
+        .chain(path)
+        .collect();
+    let mut entries: Vec<SecretRef> = Vec::new();
+    for source in &sources {
+        for entry in file::load(source)?.secrets {
+            entries.retain(|e| e.key() != entry.key());
+            entries.push(entry);
+        }
+    }
     check_providers(&entries, registry)?;
     substitute_entries(&mut entries, workspace, remote_user)?;
-    Ok(ValidatedSecrets {
-        source: Some(path),
-        entries,
-    })
+    Ok(ValidatedSecrets { sources, entries })
 }
 
 /// One lookup per distinct provider name, in declaration order.
@@ -177,9 +190,95 @@ mod tests {
         ProviderRegistry::with_builtins_in(workspace, PluginPath::from_os_str(OsStr::new("")))
     }
 
+    /// A `~/.dev` with no base secrets, so no test reads the real one.
+    fn no_base(workspace: &Path) -> DevHome {
+        DevHome::at(workspace.join("dev-home"))
+    }
+
+    /// A `~/.dev` whose `base/secrets.json` holds `secrets`.
+    fn with_base(workspace: &Path, secrets: &str) -> DevHome {
+        let home = DevHome::at(workspace.join("dev-home"));
+        fs::create_dir_all(home.base_secrets().parent().unwrap()).unwrap();
+        fs::write(home.base_secrets(), secrets).unwrap();
+        home
+    }
+
+    fn validate_with(home: &DevHome, f: &Fixture) -> Result<ValidatedSecrets, DevError> {
+        let registry = registry(&f.workspace);
+        validate_secrets_for_config(home, &f.config_path, &f.workspace, None, &registry)
+    }
+
+    #[test]
+    fn base_secrets_reach_a_project_with_none_of_its_own() {
+        let dir = TempDir::new().unwrap();
+        let devcontainer = dir.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer).unwrap();
+        let config_path = devcontainer.join("devcontainer.json");
+        fs::write(&config_path, r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let home = with_base(
+            dir.path(),
+            r#"{"version":1,"secrets":{"GH_TOKEN":"env://GH"}}"#,
+        );
+
+        let validated = validate_secrets_for_config(
+            &home,
+            &config_path,
+            dir.path(),
+            None,
+            &registry(dir.path()),
+        )
+        .unwrap();
+        let keys: Vec<&str> = validated.entries().iter().map(|e| e.key()).collect();
+        assert_eq!(keys, ["GH_TOKEN"]);
+        assert_eq!(validated.sources(), [home.base_secrets()]);
+    }
+
+    #[test]
+    fn a_project_key_replaces_the_base_key_of_the_same_name() {
+        let f =
+            fixture(r#"{"version":1,"secrets":{"GH_TOKEN":"env://PROJECT","OWN":"env://OWN"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"GH_TOKEN":"env://BASE","SHARED":"env://SHARED"}}"#,
+        );
+
+        let validated = validate_with(&home, &f).unwrap();
+        let entries: Vec<(&str, &str)> = validated
+            .entries()
+            .iter()
+            .map(|e| (e.key(), e.reference()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("SHARED", "SHARED"),
+                ("GH_TOKEN", "PROJECT"),
+                ("OWN", "OWN")
+            ]
+        );
+        assert_eq!(validated.sources().len(), 2);
+    }
+
+    #[test]
+    fn a_broken_base_file_fails_every_project() {
+        let f = fixture(r#"{"version":1,"secrets":{"OWN":"env://OWN"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"GH_TOKEN":"nosuch://x"}}"#,
+        );
+        let msg = format!("{}", validate_with(&home, &f).unwrap_err());
+        assert!(msg.contains("GH_TOKEN"), "{msg}");
+    }
+
     fn validate(f: &Fixture) -> Result<ValidatedSecrets, DevError> {
         let registry = registry(&f.workspace);
-        validate_secrets_for_config(&f.config_path, &f.workspace, None, &registry)
+        validate_secrets_for_config(
+            &no_base(&f.workspace),
+            &f.config_path,
+            &f.workspace,
+            None,
+            &registry,
+        )
     }
 
     fn only_entry(f: &Fixture) -> SecretRef {
@@ -197,10 +296,16 @@ mod tests {
         fs::write(&config_path, r#"{"image":"ubuntu:24.04"}"#).unwrap();
 
         let registry = registry(dir.path());
-        let validated =
-            validate_secrets_for_config(&config_path, dir.path(), None, &registry).unwrap();
+        let validated = validate_secrets_for_config(
+            &no_base(dir.path()),
+            &config_path,
+            dir.path(),
+            None,
+            &registry,
+        )
+        .unwrap();
         assert!(validated.entries().is_empty());
-        assert!(validated.source().is_none());
+        assert!(validated.sources().is_empty());
     }
 
     #[test]
@@ -209,8 +314,8 @@ mod tests {
         let validated = validate(&f).unwrap();
         assert_eq!(validated.entries().len(), 1);
         assert_eq!(
-            validated.source().unwrap(),
-            f.config_path.parent().unwrap().join("secrets.json")
+            validated.sources(),
+            [f.config_path.parent().unwrap().join("secrets.json")]
         );
     }
 
@@ -271,8 +376,14 @@ mod tests {
         let f = fixture(r#"{"version":1,"secrets":{"A":"fake://a","B":"fake://b","C":"env://C"}}"#);
         let mut registry = registry(&f.workspace);
         registry.register(Box::new(FakeProvider::answers_everything()));
-        let validated =
-            validate_secrets_for_config(&f.config_path, &f.workspace, None, &registry).unwrap();
+        let validated = validate_secrets_for_config(
+            &no_base(&f.workspace),
+            &f.config_path,
+            &f.workspace,
+            None,
+            &registry,
+        )
+        .unwrap();
         assert_eq!(validated.entries().len(), 3);
     }
 

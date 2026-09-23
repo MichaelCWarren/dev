@@ -10,6 +10,7 @@ use crate::runtime::{
     ContainerInfo, ContainerRuntime, ContainerState, detect_runtime, resolve_remote_user,
 };
 use crate::session::{self, HostIdentity, SessionKind, SessionMarker};
+use crate::util::paths::DevHome;
 use crate::util::{workspace_folder_name, workspace_labels};
 
 pub async fn run(
@@ -20,7 +21,15 @@ pub async fn run(
     let runtime = detect_runtime(runtime_override).await?;
     let registry = ProviderRegistry::with_builtins(workspace);
     let cmux = Cmux::detect(true);
-    let exit_code = run_with_runtime(workspace, runtime.as_ref(), shell, &registry, &cmux).await?;
+    let exit_code = run_with_runtime(
+        workspace,
+        runtime.as_ref(),
+        shell,
+        &registry,
+        &cmux,
+        &DevHome::current(),
+    )
+    .await?;
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -35,6 +44,7 @@ pub(crate) async fn run_with_runtime(
     shell: Option<&str>,
     registry: &ProviderRegistry,
     cmux: &Cmux,
+    dev_home: &DevHome,
 ) -> anyhow::Result<i32> {
     let container = running_container(runtime, workspace).await?;
 
@@ -56,7 +66,8 @@ pub(crate) async fn run_with_runtime(
     // without a recreate. A compose container is not re-checked: `dev up`
     // rejects a compose project that declares secrets, and refusing a shell too
     // would leave a running container with no way in.
-    let mut secrets = resolve_exec_secrets(config_path, workspace, config_user, registry).await?;
+    let mut secrets =
+        resolve_exec_secrets(config_path, workspace, config_user, registry, dev_home).await?;
 
     // Held across the session: dropping it aborts the listener, and
     // `attend_session` returns on both its own exit and a signal, so there is
@@ -407,6 +418,7 @@ mod tests {
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
+    use crate::util::paths::DevHome;
     use crate::util::{workspace_folder_name, workspace_labels};
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -707,6 +719,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), answers()),
             &Cmux::recording().0,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -731,6 +744,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), answers()),
             &Cmux::recording().0,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -754,6 +768,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), provider.clone()),
             &Cmux::recording().0,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -775,6 +790,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::failing_for("TOKEN")),
             &Cmux::recording().0,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect_err("a required secret that cannot resolve fails the command");
@@ -798,6 +814,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), answers()),
             &Cmux::recording().0,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -824,6 +841,7 @@ mod tests {
                 None,
                 &registry,
                 &Cmux::recording().0,
+                &DevHome::at(workspace.path().join("dev-home")),
             )
             .await
             .expect("dev shell should open a session");
@@ -922,6 +940,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::recording()),
             &cmux,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -946,6 +965,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::recording()),
             &cmux,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -1045,6 +1065,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::recording()),
             &cmux,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -1080,6 +1101,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::recording()),
             &cmux,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");
@@ -1108,6 +1130,7 @@ mod tests {
             None,
             &registry_with(workspace.path(), FakeProvider::recording()),
             &cmux,
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev shell should open a session");

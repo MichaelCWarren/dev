@@ -262,6 +262,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             workspace,
             providers,
             secrets_override,
+            dev_home,
         )?;
         reject_secrets_for_compose(&config, &secrets)?;
         return run_compose(
@@ -317,6 +318,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         workspace,
         providers,
         secrets_override,
+        dev_home,
     )?;
 
     // Run initializeCommand on the host before anything else (Gap 9).
@@ -944,9 +946,11 @@ fn validate_workspace_secrets(
     workspace: &Path,
     providers: &ProviderRegistry,
     secrets_override: Option<&Path>,
+    dev_home: &DevHome,
 ) -> anyhow::Result<ValidatedSecrets> {
     let path = secrets_file_path(secrets_override, config_path)?;
     Ok(validate_secrets_at(
+        dev_home,
         path,
         workspace,
         config.remote_user.as_deref(),
@@ -1099,16 +1103,18 @@ fn reject_secrets_for_compose(
     if !config.is_compose() {
         return Ok(());
     }
-    let Some(path) = secrets.source() else {
-        return Ok(());
-    };
     let create_time: Vec<&str> = secrets.create_time_entries().map(|r| r.key()).collect();
     if create_time.is_empty() {
         return Ok(());
     }
     anyhow::bail!(
         "create-time secrets are not supported for Docker Compose devcontainers in `dev`; they are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. In {}, either add `\"createTime\": false` to {} so the value is injected on `dev exec` and `dev shell` instead, or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
-        path.display(),
+        secrets
+            .sources()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" or "),
         create_time.join(", ")
     );
 }
@@ -2758,6 +2764,7 @@ mod tests {
         write_secrets_json(workspace, content);
         let fake = FakeProvider::answers_everything();
         validate_secrets_for_config(
+            &DevHome::at(workspace.path().join("dev-home")),
             &config_path,
             workspace.path(),
             None,
@@ -2784,7 +2791,7 @@ mod tests {
 
         assert!(msg.contains("TOKEN"), "error should name the key: {msg}");
         assert!(
-            msg.contains(&secrets.source().unwrap().display().to_string()),
+            msg.contains(&secrets.sources()[0].display().to_string()),
             "error should name the discovered file: {msg}"
         );
         assert!(msg.contains("Compose"), "{msg}");

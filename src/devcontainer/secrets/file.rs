@@ -72,8 +72,8 @@ fn check_version(version: u32, path: &Path) -> Result<(), DevError> {
     )))
 }
 
-/// No path argument: every error below here names a key, and one `dev up` reads
-/// exactly one references file.
+/// No path argument: every error below here names a key, which is enough to
+/// find it in the base file or the one project file a `dev up` reads.
 fn build_refs(raw: Vec<(String, Value)>) -> Result<Vec<SecretRef>, DevError> {
     raw.iter()
         .map(|(key, value)| {

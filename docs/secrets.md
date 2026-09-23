@@ -62,6 +62,21 @@ for a private repo. Not fine for a public one. For that case keep the file
 outside the tree (or gitignored) and point at it with
 [`dev up --secrets <path>`](#dev-up---secrets-path).
 
+### Secrets for every container
+
+`~/.dev/base/secrets.json` sits beside the base config and applies to every
+workspace, with or without a sidecar of its own. The project's file (or the
+`--secrets` file) is read on top of it, and a project key replaces a base key
+of the same name. `dev exec` and `dev shell` read both, the same as `dev up`.
+
+A broken base file fails every workspace, so give its entries `"optional": true`
+unless every container really needs them. Base entries are create-time by
+default like any other, which Compose projects refuse, so a base secret meant
+for every container usually wants `"createTime": false` too.
+
+`--no-base` does not skip it. That flag drops the base config layer at `dev up`,
+but `dev exec` and `dev shell` have no record of it.
+
 ## File format
 
 ```json

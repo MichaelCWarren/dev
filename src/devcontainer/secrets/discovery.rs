@@ -57,9 +57,10 @@ pub fn find_secrets_file_in(
 /// The references file for this invocation: the explicit `--secrets` path when
 /// given, otherwise whatever sits beside the config.
 ///
-/// Replacement, never a merge, so exactly one references file is read per
-/// `dev up` and there is no precedence order between two reference sources to
-/// reason about. An explicitly named path must exist; a missing sidecar stays
+/// Replacement, never a merge, so exactly one project references file is read
+/// per `dev up` (on top of `~/.dev/base/secrets.json`, which `validate` adds)
+/// and there is no precedence order between two project sources to reason
+/// about. An explicitly named path must exist; a missing sidecar stays
 /// what it has always been, which is simply no secrets.
 ///
 /// The override is a `dev up` flag only. `dev exec` and `dev shell` rediscover

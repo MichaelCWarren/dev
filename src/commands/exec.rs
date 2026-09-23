@@ -8,6 +8,7 @@ use crate::runtime::{
     ContainerRuntime, ContainerState, ExecResult, detect_runtime, resolve_remote_user,
 };
 use crate::session::{self, SessionKind};
+use crate::util::paths::DevHome;
 use crate::util::{workspace_folder_name, workspace_labels};
 
 pub async fn run(
@@ -18,7 +19,15 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let registry = ProviderRegistry::with_builtins(workspace);
-    run_with_runtime(workspace, runtime.as_ref(), user, cmd, &registry).await
+    run_with_runtime(
+        workspace,
+        runtime.as_ref(),
+        user,
+        cmd,
+        &registry,
+        &DevHome::current(),
+    )
+    .await
 }
 
 pub(crate) async fn run_with_runtime(
@@ -27,6 +36,7 @@ pub(crate) async fn run_with_runtime(
     user: Option<&str>,
     cmd: &[String],
     registry: &ProviderRegistry,
+    dev_home: &DevHome,
 ) -> anyhow::Result<()> {
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -66,6 +76,7 @@ pub(crate) async fn run_with_runtime(
         workspace,
         config.as_ref().and_then(|c| c.remote_user.as_deref()),
         registry,
+        dev_home,
     )
     .await?;
 
@@ -125,11 +136,13 @@ pub(crate) async fn resolve_exec_secrets(
     workspace: &Path,
     remote_user: Option<&str>,
     registry: &ProviderRegistry,
+    dev_home: &DevHome,
 ) -> Result<Vec<(String, SecretValue)>, DevError> {
     let Some(config_path) = config_path else {
         return Ok(Vec::new());
     };
-    let secrets = validate_secrets_for_config(config_path, workspace, remote_user, registry)?;
+    let secrets =
+        validate_secrets_for_config(dev_home, config_path, workspace, remote_user, registry)?;
     registry.resolve_all(secrets.entries()).await
 }
 
@@ -264,6 +277,7 @@ mod tests {
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
     };
+    use crate::util::paths::DevHome;
     use crate::util::workspace_labels;
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -553,6 +567,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -575,6 +590,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -595,6 +611,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -634,6 +651,7 @@ mod tests {
             None,
             &hostile,
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -659,6 +677,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should fall back to the bare command");
@@ -691,6 +710,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &silent_registry(workspace.path()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should fall back to the bare command");
@@ -721,6 +741,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), provider.clone()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -749,6 +770,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), provider.clone()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should fall back to the bare command");
@@ -774,6 +796,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), answers()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -796,6 +819,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), provider.clone()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -817,6 +841,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), FakeProvider::failing_for("TOKEN")),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect_err("a required secret that cannot resolve fails the command");
@@ -843,6 +868,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), provider),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("an optional secret that fails is not fatal");
@@ -866,6 +892,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), answers()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -891,6 +918,7 @@ mod tests {
             None,
             &words(&["cargo", "test"]),
             &registry_with(workspace.path(), answers()),
+            &DevHome::at(workspace.path().join("dev-home")),
         )
         .await
         .expect("dev exec should run the command");
@@ -918,6 +946,7 @@ mod tests {
                 None,
                 &words(&["cargo", "test"]),
                 &registry,
+                &DevHome::at(workspace.path().join("dev-home")),
             )
             .await
             .expect("dev exec should run the command");

@@ -83,6 +83,11 @@ impl DevHome {
         self.root.join("base/devcontainer.json")
     }
 
+    /// The base secrets file, `~/.dev/base/secrets.json`.
+    pub fn base_secrets(&self) -> PathBuf {
+        self.root.join("base/secrets.json")
+    }
+
     /// A runtime's config file, `~/.dev/<runtime>/devcontainer.json`.
     pub fn runtime_config(&self, runtime: &str) -> PathBuf {
         self.root.join(runtime).join("devcontainer.json")
