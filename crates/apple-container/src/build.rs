@@ -614,6 +614,13 @@ struct BuilderSink {
     /// How long a single send may make no progress. Only tests set this to
     /// anything but [`BUILDER_IDLE_TIMEOUT`].
     idle: std::time::Duration,
+    /// How long the context may produce nothing. Separate from [`Self::idle`]
+    /// because the two bound opposite ends of the same walk — the builder
+    /// refusing packets, and the filesystem refusing to yield them — and a
+    /// single budget lets whichever fires first speak for both. Production
+    /// sets them alike; a test that shortens one is naming which stall it is
+    /// about. Only tests set this to anything but [`BUILDER_IDLE_TIMEOUT`].
+    produce: std::time::Duration,
 }
 
 impl BuilderSink {
@@ -621,6 +628,7 @@ impl BuilderSink {
         Self {
             packets,
             idle: BUILDER_IDLE_TIMEOUT,
+            produce: BUILDER_IDLE_TIMEOUT,
         }
     }
 
@@ -883,7 +891,7 @@ async fn prepare_walk(
     fssync::require_tar_walk_mode(metadata)?;
     let context = context.to_path_buf();
     let filter = filter.clone();
-    blocking(builder.idle, move || {
+    blocking(builder.produce, move || {
         let entries = fssync::collect_context(&context, &filter)?;
         let checksum = fssync::context_tar_checksum(&entries)?;
         Ok((entries, checksum))
@@ -1005,13 +1013,13 @@ async fn send_archive_chunks(
             writer.abort();
             WalkFailure::Reportable(AppleContainerError::XpcError(format!(
                 "the build context produced nothing for {}s; giving up on the build",
-                builder.idle.as_secs()
+                builder.produce.as_secs()
             )))
         };
 
     let mut pending: Option<Vec<u8>> = None;
     loop {
-        let next = match tokio::time::timeout(builder.idle, chunks.recv()).await {
+        let next = match tokio::time::timeout(builder.produce, chunks.recv()).await {
             Ok(next) => next,
             Err(_) => return Err(give_up(chunks, &writer)),
         };
@@ -1033,14 +1041,14 @@ async fn send_archive_chunks(
 
     // The sender is dropped when the writer finishes, so the loop above has
     // already ended by the time this resolves.
-    let streamed = match tokio::time::timeout(builder.idle, join_blocking(writer)).await {
+    let streamed = match tokio::time::timeout(builder.produce, join_blocking(writer)).await {
         Ok(streamed) => streamed.map_err(WalkFailure::Reportable)?,
         Err(_) => {
             chunks.close();
             return Err(WalkFailure::Reportable(AppleContainerError::XpcError(
                 format!(
                     "the build context did not finish within {}s; giving up on the build",
-                    builder.idle.as_secs()
+                    builder.produce.as_secs()
                 ),
             )));
         }
@@ -2493,7 +2501,8 @@ mod tests {
         BuilderSink::new(packets.clone())
     }
 
-    /// A sink that gives up on a stalled send almost immediately.
+    /// A sink that gives up on a stalled send almost immediately, while
+    /// leaving the context all the time it needs.
     ///
     /// The deadline tests need to reach the give-up path, and the real budget
     /// is ten minutes. Shortening the budget rather than accelerating the clock
@@ -2501,10 +2510,27 @@ mod tests {
     /// the blocking pool, and a paused clock deliberately stops advancing while
     /// blocking work is outstanding, so a test written against one would be
     /// reasoning about the runtime's bookkeeping instead of the deadline.
+    ///
+    /// `produce` stays at the production budget on purpose. Shortening both is
+    /// what made this flaky: the walk tars four megabytes on the blocking pool
+    /// before the sink is ever offered a packet, and a loaded runner that takes
+    /// longer than the shared budget to deliver the first chunk failed the
+    /// producer's deadline instead, reporting a stall the test was not about.
     fn impatient_sink(packets: &tokio::sync::mpsc::Sender<ClientStream>) -> BuilderSink {
         BuilderSink {
             packets: packets.clone(),
-            idle: std::time::Duration::from_millis(50),
+            idle: std::time::Duration::from_millis(1),
+            produce: BUILDER_IDLE_TIMEOUT,
+        }
+    }
+
+    /// The mirror of [`impatient_sink`]: the context is out of time, the
+    /// builder is not.
+    fn impatient_producer(packets: &tokio::sync::mpsc::Sender<ClientStream>) -> BuilderSink {
+        BuilderSink {
+            packets: packets.clone(),
+            idle: BUILDER_IDLE_TIMEOUT,
+            produce: std::time::Duration::from_millis(1),
         }
     }
 
@@ -2988,7 +3014,7 @@ mod tests {
                 &mut chunks_rx,
                 writer,
                 &"0".repeat(64),
-                &impatient_sink(&tx),
+                &impatient_producer(&tx),
                 REPLY_ID,
                 &request,
             ))
