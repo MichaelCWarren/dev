@@ -248,8 +248,9 @@ pub(crate) async fn read_captured(mut reader: tokio::io::DuplexStream) -> Vec<u8
 }
 
 /// Run one piped exec against captured stdout and stderr, failing the test
-/// instead of hanging if it outlasts `budget`. Returns what `exec` resolved to
-/// and everything written to each stream.
+/// instead of hanging if it outlasts `budget`. The reads are bounded too: a
+/// relay leaked past the exec keeps its stream open forever. Returns what
+/// `exec` resolved to and everything written to each stream.
 pub(crate) async fn run_captured_piped<F>(
     budget: Duration,
     stdin: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
@@ -270,9 +271,11 @@ where
         .unwrap_or_else(|_| {
             panic!("a piped exec must finish within {budget:?} instead of hanging")
         });
-    (
-        result,
-        read_captured(stdout_back).await,
-        read_captured(stderr_back).await,
-    )
+    let reads = async { tokio::join!(read_captured(stdout_back), read_captured(stderr_back)) };
+    let (stdout, stderr) = tokio::time::timeout(budget, reads)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("a piped exec's output must close once it returns, not stay held by a relay")
+        });
+    (result, stdout, stderr)
 }

@@ -2650,8 +2650,17 @@ mod tests {
     /// What a released reader looks like from the daemon's side, with the
     /// pipes closed afterwards so a regression fails this test instead of
     /// wedging the whole suite on a reader still parked on them.
-    fn readers_released(daemon: &FakeExecDaemon) -> bool {
-        let attached = daemon.output_readers_attached();
+    ///
+    /// Polled, because macOS has no `pipe2`: a process another test spawns
+    /// between `pipe()` and the `FD_CLOEXEC` fcntl inherits the read end and
+    /// keeps it until it exits. A reader the code under test leaks never lets go.
+    async fn readers_released(daemon: &FakeExecDaemon) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut attached = daemon.output_readers_attached();
+        while attached && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attached = daemon.output_readers_attached();
+        }
         daemon.close_output();
         !attached
     }
@@ -2675,7 +2684,7 @@ mod tests {
             "the real error must propagate, got: {err}"
         );
         assert!(
-            readers_released(&daemon),
+            readers_released(&daemon).await,
             "a refused start must release its output readers, not leave them \
              on pipes the daemon still holds the write ends of"
         );
@@ -2702,7 +2711,7 @@ mod tests {
             daemon.calls()
         );
         assert!(
-            readers_released(&daemon),
+            readers_released(&daemon).await,
             "a failed wait must release its output readers, not leave them on \
              the pipes of a process nothing has closed"
         );
@@ -2782,7 +2791,7 @@ mod tests {
             "the real error must propagate, got: {err}"
         );
         assert!(
-            readers_released(&daemon),
+            readers_released(&daemon).await,
             "a refused start must release its relays, not leave them on pipes the daemon holds"
         );
     }
@@ -2895,7 +2904,7 @@ mod tests {
             daemon.calls()
         );
         assert!(
-            readers_released(&daemon),
+            readers_released(&daemon).await,
             "a refused start must release its output readers"
         );
         assert!(
