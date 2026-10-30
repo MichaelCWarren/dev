@@ -3821,7 +3821,7 @@ mod tests {
                 }
                 if let Some(refusals_left) = refusals_left {
                     let refusing = refusals_left
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                         .is_ok();
                     if refusing {
                         return Err(DevError::Runtime("exec failed (test-injected)".to_string()));
@@ -3832,7 +3832,7 @@ mod tests {
                     std::future::pending::<()>().await;
                 }
                 let still_settling = settling
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_ok();
                 if exec_fails || still_settling {
                     return Err(DevError::Runtime(if command_missing {
@@ -3884,7 +3884,7 @@ mod tests {
             let errors_left = self.inspect_errors_before_success.clone();
             Box::pin(async move {
                 let transient = errors_left
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_ok();
                 if transient {
                     return Err(DevError::Runtime(
@@ -3924,7 +3924,7 @@ mod tests {
                         std::future::pending::<()>().await;
                     }
                     let transient = list_errors
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                         .is_ok();
                     if transient || list_always_fails {
                         return Err(DevError::Runtime(
@@ -3936,7 +3936,7 @@ mod tests {
                     return Ok(Vec::new());
                 }
                 let still_settling = settling
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_ok();
                 let known = containers.lock().unwrap().clone();
                 Ok(known
