@@ -104,7 +104,7 @@ dev status              # container state (add --json for machine-readable)
 dev down                # stop (add --remove to delete the container)
 ```
 
-`dev status` also reports the runtime section: the socket and daemon behind it, what a container on it can reach on the host, and four live checks against the running container (host alias, SSH agent, docker-in-docker, cmux relay). `--json` returns `{"containers": [...], "runtime": {...}}` — a breaking change from the bare array `dev status --json` used to return.
+`dev status` also reports the runtime section: the socket and daemon behind it, what a container on it can reach on the host, and five live checks against the running container (host alias, SSH agent, docker-in-docker, cmux relay, ssh server). `--json` returns `{"containers": [...], "runtime": {...}}` — a breaking change from the bare array `dev status --json` used to return.
 
 ## Attaching VS Code to the running container
 
@@ -201,7 +201,7 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
 | Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
-| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy`, `cmux` |
+| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy`, `cmux`, `sshAgent`, `sshServer` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
@@ -508,6 +508,60 @@ Five gates, and any one of them failing leaves the container on the mount exactl
 
 A unix agent socket is protected by file permissions and a TCP port is not, so the listener binds `127.0.0.1` only, and every connection presents its token before a byte reaches the agent.
 
+## SSH server (`sshServer`)
+
+`sshServer` gives each workspace one ssh alias that lands in its running container. Every connection starts its own `sshd -i` over the runtime's exec, so there is no published port, no daemon and nothing listening. It works on Docker, Podman and Apple. It is a generic ssh server: `ssh`, VS Code Remote-SSH, Zed, JetBrains Gateway and T3 Code can all use it.
+
+It is off by default. Turn it on for every container, or in one project:
+
+```sh
+dev base config set sshServer.enabled true
+```
+
+Unlike `sshAgent.relay`, the base layer may turn it on. The `ssh-server` feature is baked in at build time, so an existing container needs `dev up --rebuild` once. The image needs Debian 12+ or Ubuntu 22.04+ (OpenSSH 8.7).
+
+Add one line to `~/.ssh/config`, at the top and before any `Host` block (an `Include` inside a `Host` block only applies to that host). chezmoi users get it from their dotfiles:
+
+```
+Include ~/.dev/ssh/config.d/*
+```
+
+`ssh -G <alias>` shows the `proxycommand` when it is wired up.
+
+### What `dev` writes
+
+```
+~/.dev/ssh/
+  config.d/<hash>            the alias (Host block with a ProxyCommand running `dev ssh-proxy`)
+  <hash>/id_ed25519(.pub)    client key (dir 0700, files 0600)
+  <hash>/host_ed25519(.pub)  host key
+  <hash>/workspace.json      alias, workspace and user
+  known_hosts                the host key, under the alias name
+  hinted/<hash>              marks that the T3 Code hint was printed
+```
+
+`dev` generates both keys with `ssh-keygen`. They never go into an image; they reach the container per connection through a 0700 directory in `/dev/shm`. They are not in 1Password because T3 reconnects in the background. The host key is pinned with `StrictHostKeyChecking yes`, so there is no first-use prompt and no warning after a rebuild.
+
+A session sees the env, secrets and ssh agent a `dev exec` gets. A rotated secret needs a reconnect.
+
+### Lifecycle
+
+The alias is `dev-<folder>`, with a hash suffix only on a collision, and it never changes once chosen. It stays while the container exists. `dev down --remove` deletes the alias file, both keys and the `known_hosts` line, but keeps `workspace.json` (so the name stays reserved for this workspace) and the hint marker. Turning `sshServer` off removes the alias at the next `dev up`.
+
+A stopped or missing container fails fast with `<alias>: container is not running (run dev up in <workspace>)`. `ssh-proxy` never starts one.
+
+`dev ssh [-- cmd]` is the quick test; it runs `ssh <alias>` through your `~/.ssh/config`, so it needs the `Include` line.
+
+### T3 Code
+
+The first `dev up` prints `T3 Code: add "<alias>" under Settings → Environments → SSH (once per project)`. Add the alias there once per project. A stopped container shows as not connected, and T3 reconnects after `dev up`.
+
+To keep T3's `~/.t3/userdata/environment-id` stable across rebuilds, mount a named volume `dev-t3-${devcontainerId}` on the container's `~/.t3`. Set it up in your base config; `dev` does not. Without it, or after deleting it, a rebuild looks like a different machine to T3 and the environment must be removed and added again.
+
+### Troubleshooting
+
+The `ssh server` row of `dev status` checks that the alias file is there, that `/usr/sbin/sshd` is in the image, and that a real `ssh` round trip through `ssh-proxy` runs `true`. It reads only the alias file, not your `~/.ssh/config`, so use `ssh -G <alias>` to check the `Include` line.
+
 ## Local `.test` domains
 
 `dev` integrates with [Caddy](https://caddyserver.com/) and dnsmasq to give each project a `.test` hostname (e.g. `appname.test`) so you don't memorize port numbers.
@@ -732,6 +786,7 @@ dev up    [--rebuild] [--no-cache] [--buildkit] [--no-base] [--ports …] [--fro
 dev down  [--remove]
 dev shell [--shell /bin/bash]
 dev exec  [-u <user>] -- <cmd>…
+dev ssh   [-- <cmd>…]   # ssh <alias> for this workspace (needs sshServer.enabled)
 
 dev status [--json]     # containers, sessions, and the runtime section
                         # --json returns {"containers": …, "runtime": …}, not a bare array

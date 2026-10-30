@@ -116,6 +116,63 @@ impl DevHome {
             .join("ssh-relay")
             .join(format!("{workspace_hash}.lock"))
     }
+
+    /// The directory `dev` keeps ssh server material in, `~/.dev/ssh/`.
+    pub fn ssh_dir(&self) -> PathBuf {
+        self.root.join("ssh")
+    }
+
+    /// A workspace's ssh key directory, `~/.dev/ssh/<workspace-hash>/`.
+    pub fn ssh_workspace_dir(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_dir().join(workspace_hash)
+    }
+
+    /// A workspace's ssh client key, `~/.dev/ssh/<workspace-hash>/id_ed25519`.
+    /// The public half is the same path plus `.pub`.
+    pub fn ssh_client_key(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_workspace_dir(workspace_hash).join("id_ed25519")
+    }
+
+    /// A workspace's sshd host key, `~/.dev/ssh/<workspace-hash>/host_ed25519`.
+    /// The public half is the same path plus `.pub`.
+    pub fn ssh_host_key(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_workspace_dir(workspace_hash).join("host_ed25519")
+    }
+
+    /// Maps a workspace hash back to its workspace,
+    /// `~/.dev/ssh/<workspace-hash>/workspace.json`.
+    pub fn ssh_workspace_record(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_workspace_dir(workspace_hash)
+            .join("workspace.json")
+    }
+
+    /// The host keys `dev` pins, `~/.dev/ssh/known_hosts`.
+    pub fn ssh_known_hosts(&self) -> PathBuf {
+        self.ssh_dir().join("known_hosts")
+    }
+
+    /// Serializes rewrites of the known_hosts file,
+    /// `~/.dev/ssh/known_hosts.lock`.
+    pub fn ssh_known_hosts_lock(&self) -> PathBuf {
+        self.ssh_dir().join("known_hosts.lock")
+    }
+
+    /// The directory of per-workspace alias files, `~/.dev/ssh/config.d/`.
+    pub fn ssh_alias_dir(&self) -> PathBuf {
+        self.ssh_dir().join("config.d")
+    }
+
+    /// A workspace's ssh alias file, `~/.dev/ssh/config.d/<workspace-hash>`.
+    /// No extension, so an `Include ~/.dev/ssh/config.d/*` glob picks it up.
+    pub fn ssh_alias_file(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_alias_dir().join(workspace_hash)
+    }
+
+    /// Marks that a workspace's T3 hint was shown,
+    /// `~/.dev/ssh/hinted/<workspace-hash>`.
+    pub fn ssh_hint_marker(&self, workspace_hash: &str) -> PathBuf {
+        self.ssh_dir().join("hinted").join(workspace_hash)
+    }
 }
 
 /// VS Code remote-containers configs directory.

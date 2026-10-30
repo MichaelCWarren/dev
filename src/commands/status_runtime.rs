@@ -12,14 +12,22 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cmux::agent as cmux_agent;
+use crate::commands::exec::{ExitSignals, SignalSource};
+use crate::commands::ssh_proxy::RELEASE_BUDGET;
 use crate::commands::up;
 use crate::devcontainer::DevcontainerConfig;
 use crate::devcontainer::secrets::SecretValue;
+use crate::error::DevError;
 use crate::runtime::docker::DockerFlavor;
 use crate::runtime::{
-    ContainerInfo, ContainerRuntime, ContainerState, ExecResult, HostAccess, resolve_remote_user,
+    BoxFut, ContainerInfo, ContainerRuntime, ContainerState, ExecResult, HostAccess,
+    resolve_remote_user,
 };
 use crate::ssh_agent;
+use crate::ssh_server::{SSHD_PATH, WorkspaceRecord, registered_alias_in};
+use crate::util::naming::workspace_hash;
+use crate::util::paths::DevHome;
+use crate::util::process::{Bounded, exit_as_signalled, output_within};
 
 /// Bounds one probe exec against a daemon that stopped answering entirely.
 /// `dev up` already gated this container through its own readiness budget;
@@ -36,6 +44,7 @@ const HOST_ALIAS: &str = "host alias";
 const SSH_AGENT: &str = "ssh agent";
 const DIND: &str = "dind";
 const CMUX_RELAY: &str = "cmux relay";
+const SSH_SERVER: &str = "ssh server";
 
 const NO_HOST_ALIAS_NOTE: &str = "This flavor has no host alias, so every integration that calls back to the host is off: the cmux agent relay and the SSH agent relay alike.";
 
@@ -43,7 +52,7 @@ const NO_CONTAINER_HINT: &str =
     "The live checks need a running container.\n\n  dev up\n\nThen try `dev status` again.";
 
 /// The whole runtime section: static facts about the daemon plus, when a
-/// container is running, the four live checks against it.
+/// container is running, the five live checks against it.
 pub(crate) struct RuntimeReport {
     socket_path: Option<String>,
     daemon_version: Option<String>,
@@ -107,7 +116,10 @@ pub(crate) async fn build_report(
     runtime: &dyn ContainerRuntime,
     containers: &[ContainerInfo],
     config: Option<&DevcontainerConfig>,
-) -> RuntimeReport {
+    home: &DevHome,
+    host_ssh: &dyn HostSsh,
+    interrupt: &Interrupt,
+) -> Result<RuntimeReport, Interrupted> {
     let socket_path = runtime.socket_path().map(str::to_string);
     let daemon_version = runtime.daemon_version().map(str::to_string);
     let mut access = runtime.host_access();
@@ -119,22 +131,38 @@ pub(crate) async fn build_report(
         .find(|c| c.state == ContainerState::Running)
     {
         Some(container) => {
-            let user = resolve_check_user(runtime, container, config).await;
-            let (rows, refined) =
-                run_live_checks(runtime, &container.id, user.as_deref(), config, access).await;
+            let user = interrupt
+                .or(resolve_check_user(runtime, container, config))
+                .await?;
+            let hash = workspace_hash(workspace);
+            let ssh = SshServerInputs {
+                home,
+                workspace_hash: &hash,
+                host_ssh,
+                interrupt,
+            };
+            let (rows, refined) = run_live_checks(
+                runtime,
+                &container.id,
+                user.as_deref(),
+                config,
+                access,
+                &ssh,
+            )
+            .await?;
             access = refined;
             Some(rows)
         }
         None => None,
     };
 
-    RuntimeReport {
+    Ok(RuntimeReport {
         socket_path,
         daemon_version,
         access,
         checks,
         mount_warning,
-    }
+    })
 }
 
 /// The user each probe runs as, matching `dev exec`'s own resolution: the
@@ -386,23 +414,39 @@ fn failed_row(name: &'static str, detail: impl Into<String>, remediation: String
     }
 }
 
-/// Run the four live checks, in the fixed order a fake asserts on. A
-/// successful cmux ping is the only thing that ever refines `access`.
+/// Run the five live checks. The rows come back in the fixed order a fake
+/// asserts on, the ssh server row last, though its check runs alongside the
+/// others because its host round trip can take the longest. A successful
+/// cmux ping is the only thing that ever refines `access`.
+///
+/// An interrupt drops the in-order checks at once but waits for the ssh check
+/// to stop its process group.
 async fn run_live_checks(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
     user: Option<&str>,
     config: Option<&DevcontainerConfig>,
     access: HostAccess,
-) -> (Vec<CheckRow>, HostAccess) {
-    let mut rows = vec![
-        check_host_alias(runtime, container_id, user, access).await,
-        check_ssh_agent(runtime, container_id, user).await,
-        check_dind(runtime, container_id, user).await,
-    ];
-    let (cmux_row, verified) = check_cmux_relay(runtime, container_id, user, config, access).await;
-    rows.push(cmux_row);
-    (rows, verified.unwrap_or(access))
+    ssh: &SshServerInputs<'_>,
+) -> Result<(Vec<CheckRow>, HostAccess), Interrupted> {
+    let in_order = async {
+        let mut rows = vec![
+            check_host_alias(runtime, container_id, user, access).await,
+            check_ssh_agent(runtime, container_id, user).await,
+            check_dind(runtime, container_id, user).await,
+        ];
+        let (cmux_row, verified) =
+            check_cmux_relay(runtime, container_id, user, config, access).await;
+        rows.push(cmux_row);
+        (rows, verified)
+    };
+    let (in_order, ssh_row) = tokio::join!(
+        ssh.interrupt.or(in_order),
+        check_ssh_server(runtime, container_id, user, config, ssh)
+    );
+    let (mut rows, verified) = in_order?;
+    rows.push(ssh_row?);
+    Ok((rows, verified.unwrap_or(access)))
 }
 
 /// What one bounded exec came back with, collapsed to the four shapes every
@@ -914,12 +958,311 @@ fn remediation_cmux_relay() -> String {
     "The cmux agent shim did not answer.\n\n  Recreate the container so the relay is reachable again: `dev down && dev up`\n\nThen try `dev status` again.".to_string()
 }
 
+/// The signal that cut the live checks short. `dev status` ends by it
+/// instead of printing a report.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Interrupted(pub(crate) i32);
+
+/// A Ctrl-C or SIGTERM to `dev status` while the live checks run, seen by
+/// every check at once. Once this is watching, the first of those signals no
+/// longer ends `dev` by itself, so whoever builds one has to act on
+/// [`Interrupted`]. A second one ends `dev` at once, as the first.
+#[derive(Clone)]
+pub(crate) struct Interrupt(tokio::sync::watch::Receiver<Option<i32>>);
+
+impl Interrupt {
+    pub(crate) fn watch() -> anyhow::Result<Self> {
+        Ok(Self::from_signals(ExitSignals::watch()?, |first| {
+            exit_as_signalled(first)
+        }))
+    }
+
+    /// `on_repeat` gets the first signal when a second one arrives, while
+    /// `dev` is still waiting out the probes or ssh's grace.
+    fn from_signals(
+        mut signals: impl SignalSource + Send + 'static,
+        on_repeat: impl FnOnce(i32) + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        tokio::spawn(async move {
+            let first = signals.next().await;
+            let _ = sender.send(Some(first));
+            signals.next().await;
+            on_repeat(first);
+        });
+        Self(receiver)
+    }
+
+    async fn arrived(&self) -> i32 {
+        let mut receiver = self.0.clone();
+        let arrived = receiver
+            .wait_for(Option::is_some)
+            .await
+            .map(|signal| *signal);
+        match arrived {
+            Ok(signal) => signal.expect("waited for a signal"),
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    /// `work`, unless the interrupt arrives first; `work` is dropped then.
+    async fn or<F: std::future::Future>(&self, work: F) -> Result<F::Output, Interrupted> {
+        tokio::select! {
+            output = work => Ok(output),
+            signal = self.arrived() => Err(Interrupted(signal)),
+        }
+    }
+}
+
+/// What the ssh server check needs from the host: where `dev` keeps its alias
+/// files, which workspace this is, a way to run the host's `ssh`, and the
+/// interrupt that stops it.
+pub(crate) struct SshServerInputs<'a> {
+    pub(crate) home: &'a DevHome,
+    pub(crate) workspace_hash: &'a str,
+    pub(crate) host_ssh: &'a dyn HostSsh,
+    pub(crate) interrupt: &'a Interrupt,
+}
+
+/// How one host ssh round trip ended.
+#[derive(Debug)]
+pub(crate) enum RoundTrip {
+    Exited(ExecResult),
+    /// ssh outlasted this budget and has been stopped.
+    TimedOut(Duration),
+    /// The interrupt arrived with this signal and ssh has been stopped.
+    Interrupted(i32),
+}
+
+/// The one host process the ssh server check starts, behind a trait because a
+/// container fake cannot stand in for it.
+pub(crate) trait HostSsh: Send + Sync {
+    fn round_trip<'a>(
+        &'a self,
+        alias_file: &'a Path,
+        alias: &'a str,
+        budget: Duration,
+        interrupt: &'a Interrupt,
+    ) -> BoxFut<'a, RoundTrip>;
+}
+
+/// How long ssh's process group, `dev ssh-proxy` included, gets after SIGTERM
+/// before SIGKILL. Longer than ssh-proxy's own release, so the KILL never
+/// lands while it is hanging up the session.
+const SSH_STOP_GRACE: Duration = RELEASE_BUDGET.saturating_add(Duration::from_secs(1));
+
+pub(crate) struct SystemSsh {
+    program: PathBuf,
+}
+
+impl Default for SystemSsh {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("ssh"),
+        }
+    }
+}
+
+impl HostSsh for SystemSsh {
+    fn round_trip<'a>(
+        &'a self,
+        alias_file: &'a Path,
+        alias: &'a str,
+        budget: Duration,
+        interrupt: &'a Interrupt,
+    ) -> BoxFut<'a, RoundTrip> {
+        Box::pin(async move {
+            let mut command = tokio::process::Command::new(&self.program);
+            command
+                .args(round_trip_args(alias_file, alias))
+                .stdin(std::process::Stdio::null());
+            let ended = output_within(command, budget, SSH_STOP_GRACE, interrupt.arrived())
+                .await
+                .map_err(|e| DevError::Runtime(e.to_string()))?;
+            Ok(match ended {
+                Bounded::Exited(output) => RoundTrip::Exited(ExecResult {
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                }),
+                Bounded::TimedOut => RoundTrip::TimedOut(budget),
+                Bounded::Interrupted(signal) => RoundTrip::Interrupted(signal),
+            })
+        })
+    }
+}
+
+/// `-F` keeps the check on the file `dev` owns, ignoring the user's own
+/// `~/.ssh/config`; `BatchMode` means nothing can prompt.
+fn round_trip_args(alias_file: &Path, alias: &str) -> Vec<String> {
+    vec![
+        "-F".to_string(),
+        alias_file.display().to_string(),
+        "-T".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "LogLevel=ERROR".to_string(),
+        alias.to_string(),
+        "true".to_string(),
+    ]
+}
+
+/// ssh-proxy prints its own cause before ssh adds `kex_exchange_identification`,
+/// and ssh's host-key warning banner is made of `@` lines.
+fn first_ssh_error_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('@'))
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn check_ssh_server(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: Option<&str>,
+    config: Option<&DevcontainerConfig>,
+    ssh: &SshServerInputs<'_>,
+) -> Result<CheckRow, Interrupted> {
+    let (alias_file, record) = match locate_ssh_alias(config, ssh) {
+        Ok(found) => found,
+        Err(row) => return Ok(row),
+    };
+    let probed = ssh.interrupt.or(probe_sshd(runtime, container_id, user));
+    if let Some(row) = probed.await? {
+        return Ok(row);
+    }
+    round_trip_row(ssh, &alias_file, &record.alias).await
+}
+
+fn locate_ssh_alias(
+    config: Option<&DevcontainerConfig>,
+    ssh: &SshServerInputs<'_>,
+) -> Result<(PathBuf, WorkspaceRecord), CheckRow> {
+    if !config.is_some_and(DevcontainerConfig::ssh_server_enabled) {
+        return Err(skip_row(
+            SSH_SERVER,
+            "sshServer is not enabled for this project",
+        ));
+    }
+    match registered_alias_in(ssh.home, ssh.workspace_hash) {
+        Ok(record) => Ok((ssh.home.ssh_alias_file(ssh.workspace_hash), record)),
+        Err(missing) => Err(missing_alias_row(&missing)),
+    }
+}
+
+fn missing_alias_row(path: &Path) -> CheckRow {
+    failed_row(
+        SSH_SERVER,
+        format!("{} is missing or unreadable", path.display()),
+        remediation_ssh_server_alias_missing(),
+    )
+}
+
+/// `None` means sshd is there and the round trip can run.
+async fn probe_sshd(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: Option<&str>,
+) -> Option<CheckRow> {
+    let cmd = probe_cmd(format!("test -x {SSHD_PATH}"));
+    match run_probe(runtime, container_id, &cmd, user, &[])
+        .await
+        .decidable(SSH_SERVER, remediation_ssh_server_sshd_missing)
+    {
+        Ok(ProbeOutcome::Ran(r)) if r.exit_code == 0 => None,
+        Ok(_) => Some(failed_row(
+            SSH_SERVER,
+            format!("no {SSHD_PATH} in this container"),
+            remediation_ssh_server_sshd_missing(),
+        )),
+        Err(row) => Some(row),
+    }
+}
+
+async fn round_trip_row(
+    ssh: &SshServerInputs<'_>,
+    alias_file: &Path,
+    alias: &str,
+) -> Result<CheckRow, Interrupted> {
+    let attempt = ssh
+        .host_ssh
+        .round_trip(alias_file, alias, PROBE_BUDGET, ssh.interrupt)
+        .await;
+    let failed = |detail: String| {
+        failed_row(
+            SSH_SERVER,
+            detail,
+            remediation_ssh_server_round_trip(alias_file, alias),
+        )
+    };
+    Ok(match attempt {
+        Ok(RoundTrip::Exited(r)) if r.exit_code == 0 => ok_row(
+            SSH_SERVER,
+            format!("ssh `{alias}` ran `true` through ssh-proxy"),
+        ),
+        Ok(RoundTrip::Exited(r)) => {
+            let line = first_ssh_error_line(&r.stderr);
+            let suffix = if line.is_empty() {
+                String::new()
+            } else {
+                format!(": {line}")
+            };
+            failed(format!("ssh `{alias}` exited {}{suffix}", r.exit_code))
+        }
+        Err(e) => failed(format!("could not run ssh: {e}")),
+        Ok(RoundTrip::TimedOut(budget)) => failed_row(
+            SSH_SERVER,
+            timeout_detail(budget.as_secs_f64()),
+            remediation_ssh_server_timeout(alias_file, alias),
+        ),
+        Ok(RoundTrip::Interrupted(signal)) => return Err(Interrupted(signal)),
+    })
+}
+
+fn remediation_ssh_server_alias_missing() -> String {
+    "`dev up` writes the ssh alias for this workspace, and it has not been written.\n\n  Run it from this workspace: `dev up`\n\nThen try `dev status` again.".to_string()
+}
+
+fn remediation_ssh_server_sshd_missing() -> String {
+    format!(
+        "The ssh-server feature is baked in at build time, so turning `sshServer` on later needs a rebuild.\n\n  dev up --rebuild\n\nThen try `dev status` again. (Expected {SSHD_PATH} in the image.)"
+    )
+}
+
+fn remediation_ssh_server_round_trip(alias_file: &Path, alias: &str) -> String {
+    round_trip_remediation(
+        "The ssh round trip through ssh-proxy failed.",
+        alias_file,
+        alias,
+    )
+}
+
+fn remediation_ssh_server_timeout(alias_file: &Path, alias: &str) -> String {
+    round_trip_remediation(
+        "The ssh round trip did not finish in time. ssh-proxy resolves secrets on every connection, so a slow or prompting secrets backend is a likely cause.",
+        alias_file,
+        alias,
+    )
+}
+
+fn round_trip_remediation(cause: &str, alias_file: &Path, alias: &str) -> String {
+    format!(
+        "{cause}\n\n  See the full error: `ssh -F {} {alias} true`\n  After moving or upgrading `dev`, rewrite the alias: `dev up`\n\nThen try `dev status` again.",
+        alias_file.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::exec::ScriptedSignals;
     use crate::error::DevError;
     use crate::runtime::host_access::Probed;
-    use crate::runtime::{AttachedExec, BoxFut, ContainerConfig, ImageMetadata};
+    use crate::runtime::{AttachedExec, ContainerConfig, ImageMetadata};
+    use crate::util::fs::write_private_file;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1107,6 +1450,173 @@ mod tests {
             .expect("a minimal config with cmux.agent enabled must parse")
     }
 
+    fn enabled_cmux_and_ssh_server_config() -> DevcontainerConfig {
+        serde_json::from_str(
+            r#"{"image": "ubuntu:24.04", "cmux": {"agent": true}, "sshServer": {"enabled": true}}"#,
+        )
+        .expect("a config with cmux.agent and sshServer enabled must parse")
+    }
+
+    const SSH_HASH: &str = "0123456789abcdef";
+
+    /// An enabled workspace under a temp home: a placeholder alias file and
+    /// the record `dev up` would have written, so no ssh-keygen is needed.
+    fn enabled_ssh_server_home(tmp: &Path) -> DevHome {
+        let home = DevHome::at(tmp);
+        write_private_file(&home.ssh_alias_file(SSH_HASH), b"Host dev-proj\n").unwrap();
+        let record = WorkspaceRecord {
+            alias: "dev-proj".to_string(),
+            workspace: PathBuf::from("/w"),
+            user: "dev".to_string(),
+            runtime: None,
+        };
+        crate::ssh_server::write_workspace_record(&home, SSH_HASH, &record).unwrap();
+        home
+    }
+
+    enum HostReply {
+        Result(ExecResult),
+        Err(String),
+        /// Exits 0 after this long, unless interrupted first, as `SystemSsh`
+        /// would be.
+        Delayed(Duration),
+        /// Reports the budget it was handed as run out, at once.
+        TimedOut,
+    }
+
+    fn host_exit(code: i32, stderr: &str) -> HostReply {
+        HostReply::Result(ExecResult {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    /// Records each `(alias_file, alias)` it is asked about and answers with
+    /// a fixed reply.
+    struct FakeHostSsh {
+        reply: HostReply,
+        calls: Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    impl FakeHostSsh {
+        fn new(reply: HostReply) -> Self {
+            Self {
+                reply,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(PathBuf, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl HostSsh for FakeHostSsh {
+        fn round_trip<'a>(
+            &'a self,
+            alias_file: &'a Path,
+            alias: &'a str,
+            budget: Duration,
+            interrupt: &'a Interrupt,
+        ) -> BoxFut<'a, RoundTrip> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((alias_file.to_path_buf(), alias.to_string()));
+                match &self.reply {
+                    HostReply::Result(r) => Ok(RoundTrip::Exited(r.clone())),
+                    HostReply::Err(message) => Err(DevError::Runtime(message.clone())),
+                    HostReply::Delayed(delay) => {
+                        let ran = interrupt.or(tokio::time::sleep(*delay)).await;
+                        Ok(match ran {
+                            Ok(()) => RoundTrip::Exited(ExecResult {
+                                exit_code: 0,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                            }),
+                            Err(Interrupted(signal)) => RoundTrip::Interrupted(signal),
+                        })
+                    }
+                    HostReply::TimedOut => Ok(RoundTrip::TimedOut(budget)),
+                }
+            })
+        }
+    }
+
+    fn never_interrupted() -> &'static Interrupt {
+        static NEVER: std::sync::LazyLock<Interrupt> =
+            std::sync::LazyLock::new(|| Interrupt(tokio::sync::watch::channel(None).1));
+        &NEVER
+    }
+
+    fn ssh_inputs<'a>(home: &'a DevHome, host_ssh: &'a FakeHostSsh) -> SshServerInputs<'a> {
+        interrupted_ssh_inputs(home, host_ssh, never_interrupted())
+    }
+
+    fn interrupted_ssh_inputs<'a>(
+        home: &'a DevHome,
+        host_ssh: &'a FakeHostSsh,
+        interrupt: &'a Interrupt,
+    ) -> SshServerInputs<'a> {
+        SshServerInputs {
+            home,
+            workspace_hash: SSH_HASH,
+            host_ssh,
+            interrupt,
+        }
+    }
+
+    /// An interrupt that arrives with `signal` after `delay`, and no other.
+    fn interrupt_after(delay: Duration, signal: i32) -> Interrupt {
+        Interrupt::from_signals(ScriptedSignals::after(&[(delay, signal)]), |_| {
+            unreachable!("only one signal was scripted")
+        })
+    }
+
+    /// The first signal interrupts; what the second one ends `dev` with is
+    /// sent on the returned channel.
+    fn repeated_interrupt(
+        script: &[(Duration, i32)],
+    ) -> (Interrupt, tokio::sync::oneshot::Receiver<i32>) {
+        let (ended, ended_with) = tokio::sync::oneshot::channel();
+        let interrupt = Interrupt::from_signals(ScriptedSignals::after(script), move |first| {
+            let _ = ended.send(first);
+        });
+        (interrupt, ended_with)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_signal_ends_dev_at_once_with_the_first() {
+        let second_at = INTERRUPT_AT * 2;
+        let (interrupt, ended_with) =
+            repeated_interrupt(&[(INTERRUPT_AT, libc::SIGINT), (second_at, libc::SIGTERM)]);
+        let started = tokio::time::Instant::now();
+
+        assert_eq!(interrupt.arrived().await, libc::SIGINT);
+        let ended = tokio::time::timeout(Duration::from_secs(600), ended_with).await;
+
+        assert_eq!(
+            ended.expect("the second signal ended dev"),
+            Ok(libc::SIGINT)
+        );
+        assert_eq!(started.elapsed(), second_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_signal_alone_leaves_ending_dev_to_the_caller() {
+        let (interrupt, mut ended_with) = repeated_interrupt(&[(INTERRUPT_AT, libc::SIGINT)]);
+
+        assert_eq!(interrupt.arrived().await, libc::SIGINT);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(
+            ended_with.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+    }
+
     /// Answers every probe shape this module issues: host alias, ssh agent
     /// (including its liveness fallback), dind, matched on the script text
     /// rather than call order.
@@ -1120,20 +1630,31 @@ mod tests {
             exec_exit(1, "", "")
         } else if script.starts_with("docker version") {
             ok("27.4.0\n")
+        } else if script.starts_with("test -x /usr/sbin/sshd") {
+            ok("")
         } else {
             exec_exit(127, "", "")
         }
     }
 
-    /// Runs the four live checks against `generic_dispatch` and hands back
+    /// Runs the five live checks against `generic_dispatch` and hands back
     /// both the outcomes and everything the fake recorded.
     async fn drive_all_checks(
         access: HostAccess,
         config: &DevcontainerConfig,
+        ssh: &SshServerInputs<'_>,
     ) -> (Vec<CheckRow>, Vec<RecordedCall>) {
         let runtime = CheckFakeRuntime::new(generic_dispatch);
-        let (rows, _) =
-            run_live_checks(&runtime, "container-id", Some("dev"), Some(config), access).await;
+        let (rows, _) = run_live_checks(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(config),
+            access,
+            ssh,
+        )
+        .await
+        .unwrap();
         (rows, runtime.calls())
     }
 
@@ -1581,9 +2102,23 @@ mod tests {
 
     #[tokio::test]
     async fn every_probe_runs_as_the_resolved_remote_user_through_a_login_shell() {
-        let (rows, calls) = drive_all_checks(desktop_access(), &enabled_cmux_config()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let (rows, calls) = drive_all_checks(
+            desktop_access(),
+            &enabled_cmux_and_ssh_server_config(),
+            &ssh_inputs(&home, &host_ssh),
+        )
+        .await;
 
         assert!(!calls.is_empty());
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.cmd[2].starts_with("test -x /usr/sbin/sshd")),
+            "the sshd probe must have run, not been skipped: {calls:?}"
+        );
         for call in &calls {
             assert_eq!(call.cmd[0], "sh", "{call:?}");
             assert_eq!(call.cmd[1], "-lc", "{call:?}");
@@ -1607,7 +2142,15 @@ mod tests {
     /// itself may carry `DEV_CMUX_TOKEN`.
     #[tokio::test]
     async fn only_the_relay_probe_is_given_relay_credentials() {
-        let (_, calls) = drive_all_checks(desktop_access(), &enabled_cmux_config()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let (_, calls) = drive_all_checks(
+            desktop_access(),
+            &enabled_cmux_config(),
+            &ssh_inputs(&home, &host_ssh),
+        )
+        .await;
 
         assert!(!calls.is_empty());
         let is_relay_ping = |call: &RecordedCall| {
@@ -1628,6 +2171,468 @@ mod tests {
                 "the relay ping must carry its own token: {call:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_live_checks_run_in_a_fixed_order_ending_with_the_ssh_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let (rows, _) = drive_all_checks(
+            desktop_access(),
+            &enabled_cmux_and_ssh_server_config(),
+            &ssh_inputs(&home, &host_ssh),
+        )
+        .await;
+
+        let names: Vec<&str> = rows.iter().map(|row| row.name).collect();
+        assert_eq!(names, [HOST_ALIAS, SSH_AGENT, DIND, CMUX_RELAY, SSH_SERVER]);
+    }
+
+    /// The ssh round trip overlaps the in-order checks, so the slower of the
+    /// two sets the time rather than their sum.
+    #[tokio::test(start_paused = true)]
+    async fn the_ssh_round_trip_runs_alongside_the_other_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let slow = Duration::from_secs(2);
+        let host_ssh = FakeHostSsh::new(HostReply::Delayed(slow));
+        let runtime = CheckFakeRuntime::new(move |cmd| {
+            if cmd.get(2).is_some_and(|s| s.starts_with("getent hosts")) {
+                ExecReply::Delayed(slow)
+            } else {
+                generic_dispatch(cmd)
+            }
+        });
+        let started = tokio::time::Instant::now();
+
+        let (rows, _) = run_live_checks(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_and_ssh_server_config()),
+            desktop_access(),
+            &ssh_inputs(&home, &host_ssh),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(started.elapsed(), slow);
+        assert_eq!(rows.last().unwrap().status, CheckStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_ssh_server_that_is_off_skips_without_execing_or_dialing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let off = enabled_cmux_config();
+
+        for config in [Some(&off), None] {
+            let runtime = CheckFakeRuntime::new(generic_dispatch);
+            let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+
+            let row = check_ssh_server(
+                &runtime,
+                "container-id",
+                Some("dev"),
+                config,
+                &ssh_inputs(&home, &host_ssh),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(row.status, CheckStatus::Skipped);
+            assert_eq!(row.detail, "sshServer is not enabled for this project");
+            assert!(runtime.calls().is_empty());
+            assert!(host_ssh.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_alias_file_fails_before_any_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+        let runtime = CheckFakeRuntime::new(generic_dispatch);
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+
+        let row = check_ssh_server(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_and_ssh_server_config()),
+            &ssh_inputs(&home, &host_ssh),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(row.status, CheckStatus::Failed);
+        assert!(
+            row.detail
+                .contains(&home.ssh_alias_file(SSH_HASH).display().to_string()),
+            "{}",
+            row.detail
+        );
+        assert!(row.remediation.as_deref().unwrap().contains("dev up"));
+        assert!(runtime.calls().is_empty());
+        assert!(host_ssh.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_image_without_sshd_fails_and_never_dials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let replies: [fn() -> ExecReply; 3] = [
+            || exec_exit(1, "", ""),
+            || exec_exit(127, "", ""),
+            || ExecReply::Err(DevError::Runtime("missing-command: test".into())),
+        ];
+
+        for reply in replies {
+            let runtime = CheckFakeRuntime::new(move |_| reply());
+            let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+
+            let row = check_ssh_server(
+                &runtime,
+                "container-id",
+                Some("dev"),
+                Some(&enabled_cmux_and_ssh_server_config()),
+                &ssh_inputs(&home, &host_ssh),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(row.status, CheckStatus::Failed);
+            assert!(row.detail.contains("/usr/sbin/sshd"), "{}", row.detail);
+            assert!(row.remediation.as_deref().unwrap().contains("--rebuild"));
+            assert!(host_ssh.calls().is_empty());
+        }
+    }
+
+    async fn ssh_row_for(reply: HostReply, home: &DevHome) -> (CheckRow, FakeHostSsh) {
+        let runtime = CheckFakeRuntime::new(generic_dispatch);
+        let host_ssh = FakeHostSsh::new(reply);
+        let row = check_ssh_server(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_and_ssh_server_config()),
+            &ssh_inputs(home, &host_ssh),
+        )
+        .await
+        .unwrap();
+        (row, host_ssh)
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_that_exits_nonzero_reports_ssh_proxys_own_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let stderr = "dev-proj: container is not running (run dev up in /w)\nkex_exchange_identification: Connection closed by remote host\n";
+
+        let (row, _) = ssh_row_for(host_exit(255, stderr), &home).await;
+
+        assert_eq!(row.status, CheckStatus::Failed);
+        assert!(row.detail.contains("container is not running"));
+        assert!(!row.detail.contains("kex_exchange_identification"));
+        let remediation = row.remediation.unwrap();
+        assert!(remediation.contains(&home.ssh_alias_file(SSH_HASH).display().to_string()));
+        assert!(remediation.contains("dev-proj"));
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_that_ran_true_is_ok_and_dials_the_recorded_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+
+        let (row, host_ssh) = ssh_row_for(host_exit(0, ""), &home).await;
+
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert_eq!(
+            host_ssh.calls(),
+            [(home.ssh_alias_file(SSH_HASH), "dev-proj".to_string())]
+        );
+    }
+
+    /// The fake reports back the budget it was handed, so the detail names
+    /// the bound `round_trip_row` actually applied.
+    #[tokio::test]
+    async fn a_round_trip_that_runs_out_reports_the_budget_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+
+        let (row, _) = ssh_row_for(HostReply::TimedOut, &home).await;
+
+        assert_eq!(row.status, CheckStatus::Failed);
+        assert_eq!(row.detail, timeout_detail(PROBE_BUDGET.as_secs_f64()));
+        assert!(row.remediation.unwrap().contains("secrets"));
+    }
+
+    const INTERRUPT_AT: Duration = Duration::from_millis(10);
+
+    /// A constant relation, tested as one because the relation is the
+    /// invariant: a grace at or under the release budget SIGKILLs ssh-proxy
+    /// while it is still hanging up the session.
+    #[test]
+    fn the_ssh_stop_grace_outlasts_ssh_proxys_release() {
+        assert!(SSH_STOP_GRACE > RELEASE_BUDGET);
+    }
+
+    /// The probe answers inside its budget, so without the race the round
+    /// trip would run once it did.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_during_the_sshd_probe_starts_no_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let interrupt = interrupt_after(INTERRUPT_AT, libc::SIGINT);
+        let runtime = CheckFakeRuntime::new(|cmd| {
+            if cmd[2].starts_with("test -x") {
+                ExecReply::Delayed(PROBE_BUDGET / 2)
+            } else {
+                generic_dispatch(cmd)
+            }
+        });
+        let started = tokio::time::Instant::now();
+
+        let ended = check_ssh_server(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_and_ssh_server_config()),
+            &interrupted_ssh_inputs(&home, &host_ssh, &interrupt),
+        )
+        .await;
+
+        assert_eq!(ended.err(), Some(Interrupted(libc::SIGINT)));
+        assert_eq!(started.elapsed(), INTERRUPT_AT);
+        assert!(host_ssh.calls().is_empty(), "no round trip was attempted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupted_round_trip_ends_the_live_checks_with_its_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(HostReply::Delayed(Duration::from_secs(60)));
+        let interrupt = interrupt_after(INTERRUPT_AT, libc::SIGINT);
+        let runtime = CheckFakeRuntime::new(generic_dispatch);
+        let started = tokio::time::Instant::now();
+
+        let ended = run_live_checks(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_and_ssh_server_config()),
+            desktop_access(),
+            &interrupted_ssh_inputs(&home, &host_ssh, &interrupt),
+        )
+        .await;
+
+        assert_eq!(ended.err(), Some(Interrupted(libc::SIGINT)));
+        assert_eq!(started.elapsed(), INTERRUPT_AT);
+        assert_eq!(host_ssh.calls().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_drops_the_in_order_checks_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let interrupt = interrupt_after(INTERRUPT_AT, libc::SIGTERM);
+        let runtime = CheckFakeRuntime::new(|_| ExecReply::Delayed(Duration::from_secs(60)));
+        let started = tokio::time::Instant::now();
+
+        let ended = run_live_checks(
+            &runtime,
+            "container-id",
+            Some("dev"),
+            Some(&enabled_cmux_config()),
+            desktop_access(),
+            &interrupted_ssh_inputs(&home, &host_ssh, &interrupt),
+        )
+        .await;
+
+        assert_eq!(ended.err(), Some(Interrupted(libc::SIGTERM)));
+        assert_eq!(started.elapsed(), INTERRUPT_AT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_while_the_probe_user_resolves_ends_the_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+        let host_ssh = FakeHostSsh::new(host_exit(0, ""));
+        let interrupt = interrupt_after(INTERRUPT_AT, libc::SIGINT);
+        let runtime = CheckFakeRuntime::new(generic_dispatch)
+            .with_image_inspect(Duration::from_secs(60), "image-user");
+        let started = tokio::time::Instant::now();
+
+        let ended = build_report(
+            tmp.path(),
+            &runtime,
+            &[running_container("ubuntu:24.04")],
+            Some(&config_naming_no_remote_user()),
+            &home,
+            &host_ssh,
+            &interrupt,
+        )
+        .await;
+
+        assert_eq!(ended.err(), Some(Interrupted(libc::SIGINT)));
+        assert_eq!(started.elapsed(), INTERRUPT_AT);
+        assert!(runtime.calls().is_empty(), "no probe ran");
+    }
+
+    /// A stand-in for the host's `ssh` that notes its pid and arguments
+    /// beside itself, then runs `body`.
+    fn stub_ssh(dir: &Path, body: &str) -> SystemSsh {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("ssh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho $$ > \"$0.pid\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\n{body}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SystemSsh { program }
+    }
+
+    fn stub_pid(dir: &Path) -> i32 {
+        std::fs::read_to_string(dir.join("ssh.pid"))
+            .expect("the stub ran")
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// What the stub's process group left behind, killing it so nothing
+    /// outlives the test either way.
+    fn reap_stub_group(dir: &Path) -> String {
+        let group = stub_pid(dir);
+        let left = crate::util::process::group_members(group);
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        left
+    }
+
+    const STUB_HANGS: &str = "sleep 3031 &\nsleep 3031 &\nwait";
+
+    #[tokio::test]
+    async fn system_ssh_stops_its_group_at_the_budget_it_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stub_ssh(tmp.path(), STUB_HANGS);
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+
+        let ended = ssh
+            .round_trip(
+                Path::new("/h/alias"),
+                "dev-proj",
+                budget,
+                never_interrupted(),
+            )
+            .await
+            .unwrap();
+
+        let elapsed = started.elapsed();
+        let left = reap_stub_group(tmp.path());
+        assert!(
+            matches!(ended, RoundTrip::TimedOut(b) if b == budget),
+            "{ended:?}"
+        );
+        assert!(elapsed >= budget, "{elapsed:?}");
+        assert!(elapsed < budget + SSH_STOP_GRACE, "{elapsed:?}");
+        assert_eq!(left, "", "ssh's whole group is gone");
+    }
+
+    #[tokio::test]
+    async fn system_ssh_hands_back_what_ssh_exited_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stub_ssh(tmp.path(), "echo 'proxy said no' >&2\nexit 255");
+
+        let ended = ssh
+            .round_trip(
+                Path::new("/h/alias"),
+                "dev-proj",
+                Duration::from_secs(10),
+                never_interrupted(),
+            )
+            .await
+            .unwrap();
+
+        let RoundTrip::Exited(result) = ended else {
+            panic!("ssh exited: {ended:?}");
+        };
+        assert_eq!(result.exit_code, 255);
+        assert_eq!(result.stderr, "proxy said no\n");
+        let args = std::fs::read_to_string(tmp.path().join("ssh.args")).unwrap();
+        let expected: String = round_trip_args(Path::new("/h/alias"), "dev-proj")
+            .iter()
+            .map(|arg| format!("{arg}\n"))
+            .collect();
+        assert_eq!(args, expected);
+    }
+
+    #[tokio::test]
+    async fn system_ssh_stops_its_group_on_a_forwarded_interrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stub_ssh(tmp.path(), STUB_HANGS);
+        let interrupt_at = Duration::from_millis(200);
+        let interrupt = interrupt_after(interrupt_at, libc::SIGINT);
+        let started = std::time::Instant::now();
+
+        let ended = ssh
+            .round_trip(
+                Path::new("/h/alias"),
+                "dev-proj",
+                Duration::from_secs(30),
+                &interrupt,
+            )
+            .await
+            .unwrap();
+
+        let elapsed = started.elapsed();
+        let left = reap_stub_group(tmp.path());
+        assert!(
+            matches!(ended, RoundTrip::Interrupted(libc::SIGINT)),
+            "{ended:?}"
+        );
+        assert!(elapsed >= interrupt_at, "{elapsed:?}");
+        assert!(elapsed < interrupt_at + SSH_STOP_GRACE, "{elapsed:?}");
+        assert_eq!(left, "", "ssh's whole group is gone");
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_ssh_could_not_start_is_a_failure_naming_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = enabled_ssh_server_home(tmp.path());
+
+        let (row, _) = ssh_row_for(HostReply::Err("no such file".to_string()), &home).await;
+
+        assert_eq!(row.status, CheckStatus::Failed);
+        assert!(
+            row.detail.starts_with("could not run ssh:"),
+            "{}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn the_first_ssh_error_line_skips_blank_lines_and_the_host_key_banner() {
+        let stderr = "\n  \n@@@@@@@@\n@ WARNING @\n@@@@@@@@\n  real cause  \nlater\n";
+
+        assert_eq!(first_ssh_error_line(stderr), "real cause");
+        assert_eq!(first_ssh_error_line("\n \n"), "");
+    }
+
+    #[test]
+    fn the_round_trip_reads_only_the_alias_file_and_never_prompts() {
+        let args = round_trip_args(Path::new("/h/config.d/abc"), "dev-proj");
+
+        let flag = args.iter().position(|a| a == "-F").expect("-F");
+        assert_eq!(args[flag + 1], "/h/config.d/abc");
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert_eq!(args[args.len() - 2], "dev-proj");
+        assert_eq!(args[args.len() - 1], "true");
     }
 
     #[test]

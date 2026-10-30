@@ -232,6 +232,24 @@ pub enum Command {
         action: VscodeAction,
     },
 
+    /// Open an ssh session to the container through its alias
+    Ssh {
+        /// Command to run instead of a login shell, after `--`
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+
+    /// Internal: the ProxyCommand behind a workspace's ssh alias. Hidden
+    /// because only ssh invokes it. It finds the running container and never
+    /// starts one.
+    #[command(hide = true)]
+    SshProxy {
+        /// The workspace this alias belongs to, hashed: it names the files
+        /// under `~/.dev/ssh/`.
+        #[arg(long)]
+        workspace_hash: String,
+    },
+
     /// Internal: the SSH agent relay daemon, spawned by `dev up`. Hidden
     /// because nothing invokes it directly — the token that gates
     /// connections travels through its environment, never argv, and the
@@ -354,6 +372,23 @@ pub enum ConfigAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_takes_its_command_after_a_double_dash() {
+        let cli = Cli::try_parse_from(["dev", "ssh", "--", "ls", "-la"]).unwrap();
+        let Command::Ssh { cmd } = cli.command else {
+            panic!("expected ssh");
+        };
+        assert_eq!(cmd, ["ls", "-la"]);
+        assert!(Cli::try_parse_from(["dev", "ssh", "ls"]).is_err());
+
+        let cli = Cli::try_parse_from(["dev", "ssh-proxy", "--workspace-hash", "0123456789abcdef"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::SshProxy { workspace_hash } if workspace_hash == "0123456789abcdef"
+        ));
+    }
 
     fn parsed_runtime(args: &[&str]) -> Option<String> {
         Cli::try_parse_from(args).unwrap().runtime

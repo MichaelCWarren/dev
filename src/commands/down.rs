@@ -20,30 +20,48 @@ pub async fn run(
         .as_ref()
         .is_some_and(|(_, config)| config.cmux_status_enabled());
     let mut pill = Cmux::detect(pill_enabled).guard(BUILD_KEY, pill_enabled);
-    if let Some((config_path, config)) = loaded
-        && config.is_compose()
-    {
-        return run_compose_down(
-            workspace,
-            &config,
-            &config_path,
-            runtime.runtime_name(),
-            remove,
-            &mut pill,
-        )
-        .await;
-    }
+    let dev_home = DevHome::current();
+    let torn_down = match loaded {
+        Some((config_path, config)) if config.is_compose() => {
+            run_compose_down(
+                workspace,
+                &config,
+                &config_path,
+                runtime.runtime_name(),
+                remove,
+                &mut pill,
+            )
+            .await
+        }
+        _ => {
+            run_with_runtime(
+                workspace,
+                &*runtime,
+                &dev_home,
+                remove,
+                crate::caddy::unregister_site,
+                &mut pill,
+            )
+            .await
+        }
+    };
+    forget_alias_after(torn_down, remove, &dev_home, workspace)
+}
 
-    // Non-compose: label-based container stop/remove.
-    run_with_runtime(
-        workspace,
-        &*runtime,
-        &DevHome::current(),
-        remove,
-        crate::caddy::unregister_site,
-        &mut pill,
-    )
-    .await
+/// The ssh alias goes only with a teardown that fully succeeded: a container
+/// that failed to go keeps the alias that reaches it. Runs whether or not
+/// `sshServer` is still enabled, since it removes whatever is there.
+fn forget_alias_after(
+    torn_down: anyhow::Result<()>,
+    remove: bool,
+    dev_home: &DevHome,
+    workspace: &Path,
+) -> anyhow::Result<()> {
+    torn_down?;
+    if remove {
+        crate::ssh_server::remove_alias_or_warn(dev_home, workspace);
+    }
+    Ok(())
 }
 
 /// Internal: run the non-compose teardown path against a specific runtime.
@@ -109,10 +127,10 @@ pub async fn run_with_runtime(
 
     if !failures.is_empty() {
         Err(anyhow::anyhow!("{}", failures.join("; ")))
-    } else if let Err(e) = unregister_caddy(workspace) {
-        eprintln!("Warning: Caddy cleanup failed: {e}");
-        Ok(())
     } else {
+        if let Err(e) = unregister_caddy(workspace) {
+            eprintln!("Warning: Caddy cleanup failed: {e}");
+        }
         Ok(())
     }
 }
@@ -207,7 +225,7 @@ mod tests {
     //!   1. `remove_container` is still called for the container whose stop failed.
     //!   2. A stop failure on container 0 does not skip removal for container 1.
     //!   3. Removal success after stop failure does not fail the command.
-    use super::run_with_runtime;
+    use super::{forget_alias_after, run_with_runtime};
     use crate::cmux::{BUILD_KEY, Cmux};
     use crate::devcontainer::secrets::SecretValue;
     use crate::error::DevError;
@@ -236,6 +254,8 @@ mod tests {
         remove_responses: HashMap<String, Result<(), StubDevError>>,
         /// Track how many containers remove_container was called for (count of Ok).
         removed: Arc<AtomicU32>,
+        /// When set, `list_containers` finds nothing.
+        no_containers: bool,
     }
 
     #[derive(Debug)]
@@ -259,6 +279,7 @@ mod tests {
                 inspect_states: HashMap::new(),
                 remove_responses: HashMap::new(),
                 removed: Arc::new(AtomicU32::new(0)),
+                no_containers: false,
             }
         }
 
@@ -411,7 +432,7 @@ mod tests {
                     image: "fake/image:latest".to_string(),
                 },
             ];
-            as_fut(Ok(info))
+            as_fut(Ok(if self.no_containers { Vec::new() } else { info }))
         }
 
         fn image_exists(&self, _image: &str) -> BoxFut<'static, bool> {
@@ -605,5 +626,88 @@ mod tests {
             Some(&vec!["clear-status".to_string(), BUILD_KEY.to_string()]),
             "last call must be the clear: {calls:?}"
         );
+    }
+
+    /// A real directory, registered in a temp home, so the hash `down`
+    /// derives is the one the alias was written under.
+    struct Registered {
+        _workspace: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        workspace: std::path::PathBuf,
+        dev_home: DevHome,
+        hash: String,
+    }
+
+    fn registered_alias() -> Registered {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let path = workspace.path().canonicalize().unwrap();
+        crate::ssh_server::register_alias_in(
+            &dev_home,
+            &path,
+            "root",
+            "docker",
+            Path::new("/bin/dev"),
+        )
+        .unwrap();
+        let hash = crate::util::naming::workspace_hash(&path);
+        assert!(dev_home.ssh_alias_file(&hash).exists());
+        Registered {
+            _workspace: workspace,
+            _home: home,
+            workspace: path,
+            dev_home,
+            hash,
+        }
+    }
+
+    /// The non-compose teardown followed by the alias step `run` applies to
+    /// whichever teardown ran.
+    async fn down(rt: &FakeRuntime, reg: &Registered, remove: bool) -> anyhow::Result<()> {
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        let torn_down = run_with_runtime(
+            &reg.workspace,
+            rt,
+            &reg.dev_home,
+            remove,
+            |_: &Path| Ok(()),
+            &mut pill,
+        )
+        .await;
+        forget_alias_after(torn_down, remove, &reg.dev_home, &reg.workspace)
+    }
+
+    #[tokio::test]
+    async fn down_remove_deletes_the_alias() {
+        let reg = registered_alias();
+        down(&FakeRuntime::new(), &reg, true).await.unwrap();
+        assert!(!reg.dev_home.ssh_alias_file(&reg.hash).exists());
+    }
+
+    #[tokio::test]
+    async fn down_without_remove_keeps_the_alias() {
+        let reg = registered_alias();
+        down(&FakeRuntime::new(), &reg, false).await.unwrap();
+        assert!(reg.dev_home.ssh_alias_file(&reg.hash).exists());
+    }
+
+    #[tokio::test]
+    async fn down_remove_with_no_containers_still_deletes_the_alias() {
+        let reg = registered_alias();
+        let mut rt = FakeRuntime::new();
+        rt.no_containers = true;
+        down(&rt, &reg, true).await.unwrap();
+        assert!(!reg.dev_home.ssh_alias_file(&reg.hash).exists());
+    }
+
+    #[tokio::test]
+    async fn down_remove_keeps_the_alias_when_a_removal_fails() {
+        let reg = registered_alias();
+        let mut rt = FakeRuntime::new();
+        rt.remove_responses
+            .insert("1111".to_string(), Err(StubDevError("busy".to_string())));
+        assert!(down(&rt, &reg, true).await.is_err());
+        assert!(reg.dev_home.ssh_alias_file(&reg.hash).exists());
     }
 }

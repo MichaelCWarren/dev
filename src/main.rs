@@ -9,6 +9,7 @@ mod oci;
 mod runtime;
 mod session;
 mod ssh_agent;
+mod ssh_server;
 mod tui;
 mod util;
 
@@ -200,6 +201,12 @@ async fn run() -> anyhow::Result<()> {
                 commands::vscode::repair(&workspace)?;
             }
         },
+        Command::Ssh { cmd } => {
+            commands::ssh::run(&workspace, runtime_override, &cmd).await?;
+        }
+        Command::SshProxy { workspace_hash } => {
+            commands::ssh_proxy::run(&workspace_hash, runtime_override).await?;
+        }
         Command::SshAgentRelay { workspace_hash } => {
             ssh_agent::run_daemon(&workspace_hash).await?;
         }

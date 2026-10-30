@@ -7,11 +7,11 @@ use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
 use crate::runtime::{
-    ContainerInfo, ContainerRuntime, ContainerState, detect_runtime, resolve_remote_user,
+    ContainerInfo, ContainerRuntime, detect_runtime, find_running_container, resolve_remote_user,
 };
 use crate::session::{self, HostIdentity, SessionKind, SessionMarker};
 use crate::util::paths::DevHome;
-use crate::util::{workspace_folder_name, workspace_labels};
+use crate::util::workspace_folder_name;
 
 pub async fn run(
     workspace: &Path,
@@ -278,13 +278,8 @@ async fn running_container(
     runtime: &dyn ContainerRuntime,
     workspace: &Path,
 ) -> anyhow::Result<ContainerInfo> {
-    let labels = workspace_labels(workspace, None);
-    let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    runtime
-        .list_containers(&filters)
+    find_running_container(runtime, workspace)
         .await?
-        .into_iter()
-        .find(|c| c.state == ContainerState::Running)
         .ok_or_else(|| {
             anyhow::anyhow!("No running container found for this workspace. Run `dev up` first.")
         })

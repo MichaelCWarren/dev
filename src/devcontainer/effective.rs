@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use crate::error::DevError;
 use crate::runtime::{ALLOW_RELAY_PROPERTY, RELAY_PROPERTY};
-use crate::util::paths::base_config_dir;
 
 use super::config::DevcontainerConfig;
 use super::features::{ResolvedFeature, features_required_by};
@@ -26,9 +25,20 @@ pub(crate) fn load_effective_config(
     config_path: &Path,
     include_base: bool,
 ) -> anyhow::Result<EffectiveConfig> {
-    let base_path = base_config_dir().join("devcontainer.json");
+    load_effective_config_in(
+        &crate::util::paths::DevHome::current(),
+        config_path,
+        include_base,
+    )
+}
+
+pub(crate) fn load_effective_config_in(
+    dev_home: &crate::util::paths::DevHome,
+    config_path: &Path,
+    include_base: bool,
+) -> anyhow::Result<EffectiveConfig> {
     let (value, base_feature_ids) =
-        load_effective_config_value(config_path, include_base, &base_path)?;
+        load_effective_config_value(config_path, include_base, &dev_home.base_config())?;
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")))?;
     Ok(EffectiveConfig {
@@ -503,6 +513,33 @@ mod tests {
         let (value, _) = load_effective_config_value(config_path, include_base, base_config_path)
             .expect("effective config should load");
         serde_json::from_value(value).expect("effective config should deserialize")
+    }
+
+    #[test]
+    fn a_base_layer_may_turn_the_ssh_server_on() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(&home, r#"{"sshServer": {"enabled": true}}"#);
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(config.ssh_server_enabled());
+    }
+
+    #[test]
+    fn a_project_turns_off_what_the_base_turned_on() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "sshServer": {"enabled": false}}"#,
+        );
+        let base_path = write_base_config(&home, r#"{"sshServer": {"enabled": true}}"#);
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(!config.ssh_server_enabled());
     }
 
     fn effective_value(

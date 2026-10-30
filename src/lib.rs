@@ -9,6 +9,7 @@ pub mod oci;
 pub mod runtime;
 pub mod session;
 pub mod ssh_agent;
+pub mod ssh_server;
 pub mod tui;
 pub mod util;
 

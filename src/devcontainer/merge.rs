@@ -81,7 +81,14 @@ const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts"];
 const ARRAY_CONCAT_FIELDS: &[&str] = &["runArgs"];
 
 /// Fields that are key-value maps and should be merged (base keys override template keys).
-const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv", "caddy", "cmux", "sshAgent"];
+const MAP_FIELDS: &[&str] = &[
+    "remoteEnv",
+    "containerEnv",
+    "caddy",
+    "cmux",
+    "sshAgent",
+    "sshServer",
+];
 
 /// Fields that are feature maps (special merge: union of keys).
 const FEATURE_FIELDS: &[&str] = &["features"];
@@ -584,6 +591,22 @@ mod tests {
         let ssh_agent = json["sshAgent"].as_object().unwrap();
         assert_eq!(ssh_agent["relay"], true); // project sub-key survives
         assert_eq!(ssh_agent["note"], "from base"); // base sub-key survives too
+    }
+
+    #[test]
+    fn test_merge_ssh_server_per_sub_key() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"sshServer": {"note": "from base"}}"#,
+            r#"{"sshServer": {"enabled": true}}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let ssh_server = json["sshServer"].as_object().unwrap();
+        assert_eq!(ssh_server["enabled"], true);
+        assert_eq!(ssh_server["note"], "from base");
     }
 
     #[test]

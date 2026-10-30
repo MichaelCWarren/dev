@@ -1,3 +1,4 @@
+pub mod fs;
 pub mod naming;
 pub mod paths;
 pub mod process;

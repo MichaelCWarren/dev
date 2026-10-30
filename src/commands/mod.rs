@@ -13,6 +13,8 @@ pub mod new;
 pub mod open;
 pub mod prune;
 pub mod shell;
+pub mod ssh;
+pub mod ssh_proxy;
 pub mod status;
 pub mod status_runtime;
 pub mod up;

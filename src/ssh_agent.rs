@@ -533,29 +533,8 @@ fn read_relay_state_in(dev_home: &DevHome, hash: &str) -> Option<RelayState> {
 /// unparsable JSON, and a daemon nothing can find is a signing listener
 /// nothing can stop.
 fn write_relay_state_in(dev_home: &DevHome, hash: &str, state: &RelayState) -> Option<()> {
-    use std::io::Write;
-
-    let path = dev_home.ssh_relay_state_file(hash);
-    let dir = path.parent()?;
-    std::fs::create_dir_all(dir).ok()?;
     let json = serde_json::to_string(state).ok()?;
-    let temp = dir.join(format!("{hash}.{}.tmp", std::process::id()));
-    let mut open = std::fs::OpenOptions::new();
-    open.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.mode(0o600);
-    }
-    let written = open
-        .open(&temp)
-        .and_then(|mut file| file.write_all(json.as_bytes()))
-        .and_then(|()| std::fs::rename(&temp, &path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return None;
-    }
-    Some(())
+    crate::util::fs::write_private_file(&dev_home.ssh_relay_state_file(hash), json.as_bytes()).ok()
 }
 
 fn remove_relay_state_in(dev_home: &DevHome, hash: &str) {
@@ -569,15 +548,9 @@ fn remove_relay_state_in(dev_home: &DevHome, hash: &str) {
 fn hold_relay_lock(dev_home: &DevHome, hash: &str) -> Option<std::fs::File> {
     let path = dev_home.ssh_relay_lock_file(hash);
     std::fs::create_dir_all(path.parent()?).ok()?;
-    let mut open = std::fs::OpenOptions::new();
-    open.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.mode(0o600);
-    }
-    let file = open.open(&path).ok()?;
-    try_lock(&file).then_some(file)
+    crate::util::fs::lock_file(&path, crate::util::fs::LockWait::NonBlocking)
+        .ok()
+        .flatten()
 }
 
 fn try_lock(file: &std::fs::File) -> bool {

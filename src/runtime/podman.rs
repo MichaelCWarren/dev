@@ -15,7 +15,7 @@ use crate::runtime::terminal_relay::{
 };
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult, ImageInfo,
-    ImageMetadata, terminal_size,
+    ImageMetadata, PipedStdio, terminal_size,
 };
 
 /// Podman runtime backed by the same bollard client, connecting to the Podman socket.
@@ -402,6 +402,21 @@ impl ContainerRuntime for PodmanRuntime {
         user: Option<&str>,
     ) -> BoxFut<'_, AttachedExec> {
         self.0.exec_attached(id, cmd, user)
+    }
+
+    fn exec_piped(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[(String, SecretValue)],
+        stdio: PipedStdio,
+    ) -> BoxFut<'_, i32> {
+        self.0.exec_piped(id, cmd, user, env, stdio)
+    }
+
+    fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
+        self.0.container_env(id)
     }
 
     // The podman socket is not a Docker daemon, so its row is the constant
@@ -886,5 +901,40 @@ mod tests {
             );
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn podman_forwards_the_piped_exec_and_env_reads() {
+        use crate::runtime::fake_daemon::{ExecScript, ScriptedExecDaemon, run_captured_piped};
+
+        let daemon = ScriptedExecDaemon::start(ExecScript {
+            read_stdin_to_eof: true,
+            stdout: b"pong".to_vec(),
+            stderr: b"warn".to_vec(),
+            exit_code: 3,
+            container_body: r#"{"Id":"c1","Config":{"Env":["B=2","A=1"]}}"#.to_string(),
+            ..ExecScript::default()
+        });
+        let runtime = PodmanRuntime(
+            BollardRuntime::connect_to_socket(&daemon.socket())
+                .expect("building a podman client must not need a daemon"),
+        );
+        let cmd = ["sshd".to_string()];
+
+        let (code, stdout, stderr) = run_captured_piped(
+            std::time::Duration::from_secs(20),
+            Box::new(&b"ping"[..]),
+            |stdio| (&runtime as &dyn ContainerRuntime).exec_piped("c1", &cmd, None, &[], stdio),
+        )
+        .await;
+        let env = (&runtime as &dyn ContainerRuntime)
+            .container_env("c1")
+            .await
+            .unwrap();
+
+        assert_eq!(code.unwrap(), 3);
+        assert_eq!(stdout, b"pong");
+        assert_eq!(stderr, b"warn");
+        assert_eq!(env, vec!["B=2", "A=1"]);
     }
 }

@@ -7,6 +7,8 @@ use crate::devcontainer::DevcontainerConfig;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::runtime::{ContainerInfo, ContainerRuntime, ContainerState, detect_runtime};
 use crate::session::{self, SessionMarker};
+use crate::util::paths::DevHome;
+use crate::util::process::exit_as_signalled;
 use crate::util::{find_config_source, workspace_folder_name, workspace_labels};
 
 pub async fn run(
@@ -42,9 +44,21 @@ pub async fn run(
     )
     .await;
 
-    let report =
-        status_runtime::build_report(workspace, runtime.as_ref(), &containers, config.as_ref())
-            .await;
+    let interrupt = status_runtime::Interrupt::watch()?;
+    let report = match status_runtime::build_report(
+        workspace,
+        runtime.as_ref(),
+        &containers,
+        config.as_ref(),
+        &DevHome::current(),
+        &status_runtime::SystemSsh::default(),
+        &interrupt,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(status_runtime::Interrupted(signal)) => exit_as_signalled(signal),
+    };
 
     if json {
         let items: Vec<serde_json::Value> = containers

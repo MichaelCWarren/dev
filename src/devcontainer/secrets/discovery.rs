@@ -68,16 +68,8 @@ pub fn find_secrets_file_in(
 /// in a repo with no sidecar gets create-time secrets and no exec-time refresh,
 /// and in a repo *with* a sidecar gets exec-time values from a different file
 /// than it was created with.
-#[allow(dead_code)]
-pub fn secrets_file_path(
-    secrets_override: Option<&Path>,
-    config_path: &Path,
-) -> Result<Option<PathBuf>, DevError> {
-    secrets_file_path_in(&DevHome::current(), secrets_override, config_path)
-}
-
-/// [`secrets_file_path`] against an explicit `~/.dev/` layout. The explicit-path
-/// branch never touches `dev_home`.
+///
+/// The explicit-path branch never touches `dev_home`.
 pub fn secrets_file_path_in(
     _dev_home: &DevHome,
     secrets_override: Option<&Path>,

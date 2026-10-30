@@ -35,7 +35,7 @@ fn site_config_path(app_name: &str) -> PathBuf {
 
 /// Derive a DNS-safe hostname from a workspace path.
 /// Uses the folder name, lowercased, non-alphanumeric chars replaced by dashes.
-fn app_name_from_workspace(workspace: &Path) -> String {
+pub(crate) fn app_name_from_workspace(workspace: &Path) -> String {
     let dirname = workspace
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

@@ -173,6 +173,7 @@ mod tests {
             dotfiles: None,
             cmux: None,
             ssh_agent: None,
+            ssh_server: None,
         }
     }
 

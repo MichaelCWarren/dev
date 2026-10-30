@@ -195,6 +195,8 @@ pub struct DevcontainerConfig {
     pub cmux: Option<CmuxSettings>,
     /// SSH agent relay configuration.
     pub ssh_agent: Option<SshAgentSettings>,
+    /// SSH server configuration.
+    pub ssh_server: Option<SshServerSettings>,
 }
 
 /// Configuration for cloning a dotfiles repository into the container.
@@ -243,6 +245,19 @@ pub struct SshAgentSettings {
     pub relay: bool,
 }
 
+/// A dev-only extension, not part of the devcontainer spec — other tooling
+/// ignores it.
+///
+/// Unlike `sshAgent.relay`, the base layer is allowed to turn this on:
+/// enabling it opens no path to host credentials, because reaching sshd takes
+/// the per-workspace client key that only the host holds.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SshServerSettings {
+    /// Whether the image carries OpenSSH's server for `dev`'s per-connection sshd.
+    pub enabled: bool,
+}
+
 impl DevcontainerConfig {
     /// Read and parse a devcontainer.json file (supports JSONC with comments).
     pub fn from_path(path: &Path) -> Result<Self, DevError> {
@@ -282,6 +297,11 @@ impl DevcontainerConfig {
     /// gate. Never treat this alone as "the relay is on".
     pub fn ssh_agent_relay_requested(&self) -> bool {
         self.ssh_agent.as_ref().is_some_and(|s| s.relay)
+    }
+
+    /// True only when `sshServer.enabled` is present and true.
+    pub fn ssh_server_enabled(&self) -> bool {
+        self.ssh_server.as_ref().is_some_and(|s| s.enabled)
     }
 
     /// Returns the effective workspace bind-mount target inside the container,
@@ -415,6 +435,7 @@ mod workspace_mount_tests {
             dotfiles: None,
             cmux: None,
             ssh_agent: None,
+            ssh_server: None,
         }
     }
 
@@ -865,5 +886,23 @@ mod tests {
 
         let config3 = parse(r#"{"sshAgent": {"relay": true}}"#);
         assert!(config3.ssh_agent_relay_requested());
+    }
+
+    #[test]
+    fn ssh_server_parses_the_enabled_flag() {
+        let config = parse(r#"{"sshServer": {"enabled": true}}"#);
+        assert!(config.ssh_server.unwrap().enabled);
+    }
+
+    #[test]
+    fn ssh_server_enabled_requires_present_true() {
+        for json in [
+            r#"{"image": "alpine:latest"}"#,
+            r#"{"sshServer": {}}"#,
+            r#"{"sshServer": {"enabled": false}}"#,
+        ] {
+            assert!(!parse(json).ssh_server_enabled(), "{json} turned it on");
+        }
+        assert!(parse(r#"{"sshServer": {"enabled": true}}"#).ssh_server_enabled());
     }
 }

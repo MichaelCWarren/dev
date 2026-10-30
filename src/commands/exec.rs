@@ -5,11 +5,11 @@ use crate::devcontainer::secrets::validate::validate_secrets_for_config;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
 use crate::error::DevError;
 use crate::runtime::{
-    ContainerRuntime, ContainerState, ExecResult, detect_runtime, resolve_remote_user,
+    ContainerRuntime, ExecResult, detect_runtime, find_running_container, resolve_remote_user,
 };
 use crate::session::{self, SessionKind};
 use crate::util::paths::DevHome;
-use crate::util::{workspace_folder_name, workspace_labels};
+use crate::util::workspace_folder_name;
 
 pub async fn run(
     workspace: &Path,
@@ -38,13 +38,8 @@ pub(crate) async fn run_with_runtime(
     registry: &ProviderRegistry,
     dev_home: &DevHome,
 ) -> anyhow::Result<()> {
-    let labels = workspace_labels(workspace, None);
-    let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let containers = runtime.list_containers(&filters).await?;
-
-    let container = containers
-        .iter()
-        .find(|c| c.state == ContainerState::Running)
+    let container = find_running_container(runtime, workspace)
+        .await?
         .ok_or_else(|| {
             anyhow::anyhow!("No running container found for this workspace. Run `dev up` first.")
         })?;
@@ -170,34 +165,99 @@ async fn attend_command(
     host: &session::HostIdentity,
     secrets: &[(String, SecretValue)],
 ) -> anyhow::Result<Outcome> {
-    use tokio::signal::unix::{SignalKind, signal};
+    let running = run_recorded(runtime, container_id, cmd, user, workdir, host, secrets);
+    match until_signalled(running, runtime, container_id, user, host.pid).await? {
+        Ok(finished) => Ok(Outcome::Finished(finished?)),
+        Err(signal) => Ok(Outcome::Signalled(signal)),
+    }
+}
 
-    let watch = |kind: SignalKind, name: &str| {
-        signal(kind).map_err(|e| anyhow::anyhow!("watch {name}: {e}"))
-    };
-    let mut interrupt = watch(SignalKind::interrupt(), "SIGINT")?;
-    let mut terminate = watch(SignalKind::terminate(), "SIGTERM")?;
-    let mut hangup = watch(SignalKind::hangup(), "SIGHUP")?;
+/// Where the exit signals a command watches for come from.
+pub(crate) trait SignalSource {
+    /// The number of the next signal to arrive. Dropping the future before it
+    /// resolves loses no signal.
+    fn next(&mut self) -> impl std::future::Future<Output = i32> + Send;
+}
 
-    let mut running = Box::pin(run_recorded(
-        runtime,
-        container_id,
-        cmd,
-        user,
-        workdir,
-        host,
-        secrets,
-    ));
+/// Signals that arrive at fixed instants. A `next` dropped before its
+/// instant keeps the signal for the following call, as tokio's own signal
+/// streams do.
+#[cfg(test)]
+pub(crate) struct ScriptedSignals(std::collections::VecDeque<(tokio::time::Instant, i32)>);
+
+#[cfg(test)]
+impl ScriptedSignals {
+    pub(crate) fn after(script: &[(std::time::Duration, i32)]) -> Self {
+        let start = tokio::time::Instant::now();
+        Self(script.iter().map(|&(at, sig)| (start + at, sig)).collect())
+    }
+}
+
+#[cfg(test)]
+impl SignalSource for ScriptedSignals {
+    async fn next(&mut self) -> i32 {
+        let Some(&(at, signal)) = self.0.front() else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep_until(at).await;
+        self.0.pop_front();
+        signal
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP, caught from the moment this is made. Tokio
+/// keeps a handler installed for the rest of the process once there is one,
+/// so a signal that lands before anything waits on these is held, not fatal.
+pub(crate) struct ExitSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl ExitSignals {
+    pub(crate) fn watch() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let watch = |kind: SignalKind, name: &str| {
+            signal(kind).map_err(|e| anyhow::anyhow!("watch {name}: {e}"))
+        };
+        Ok(Self {
+            interrupt: watch(SignalKind::interrupt(), "SIGINT")?,
+            terminate: watch(SignalKind::terminate(), "SIGTERM")?,
+            hangup: watch(SignalKind::hangup(), "SIGHUP")?,
+        })
+    }
+}
+
+impl SignalSource for ExitSignals {
+    async fn next(&mut self) -> i32 {
+        tokio::select! {
+            _ = self.interrupt.recv() => libc::SIGINT,
+            _ = self.terminate.recv() => libc::SIGTERM,
+            _ = self.hangup.recv() => libc::SIGHUP,
+        }
+    }
+}
+
+/// Run `work`, giving it up for the signal number if this process is told to
+/// go away first. On a signal, `work` is dropped and then the sessions this
+/// process recorded in the container are hung up, since the daemon would
+/// otherwise keep them running with nothing attached.
+pub(crate) async fn until_signalled<F: std::future::Future>(
+    work: F,
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: Option<&str>,
+    host_pid: u32,
+) -> anyhow::Result<Result<F::Output, i32>> {
+    let mut signals = ExitSignals::watch()?;
+    let mut work = Box::pin(work);
     let signalled = tokio::select! {
-        finished = &mut running => return Ok(Outcome::Finished(finished?)),
-        _ = interrupt.recv() => libc::SIGINT,
-        _ = terminate.recv() => libc::SIGTERM,
-        _ = hangup.recv() => libc::SIGHUP,
+        output = &mut work => return Ok(Ok(output)),
+        signal = signals.next() => signal,
     };
-
-    drop(running);
-    session::release_own_sessions(runtime, container_id, user, host.pid).await;
-    Ok(Outcome::Signalled(signalled))
+    drop(work);
+    session::release_own_sessions(runtime, container_id, user, host_pid).await;
+    Ok(Err(signalled))
 }
 
 /// Run the command so that it can be found again, falling back to running it

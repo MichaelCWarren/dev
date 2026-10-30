@@ -6,6 +6,7 @@ pub mod docker;
 pub(crate) mod fake_daemon;
 pub mod host_access;
 pub mod paste_bridge;
+pub mod piped;
 pub mod podman;
 pub mod terminal_input;
 pub mod terminal_relay;
@@ -13,6 +14,7 @@ pub mod terminal_relay;
 pub(crate) mod test_peer;
 
 pub use host_access::HostAccess;
+pub use piped::PipedStdio;
 
 use crate::error::DevError;
 use std::collections::{HashMap, HashSet};
@@ -411,6 +413,45 @@ pub trait ContainerRuntime: Send + Sync {
         user: Option<&str>,
     ) -> BoxFut<'_, AttachedExec>;
 
+    /// Run `cmd` as `user` without a TTY, wired to the caller's own streams.
+    ///
+    /// The process's stdout reaches `stdio.stdout` byte for byte, and its
+    /// stderr reaches only `stdio.stderr`. The caller's stdin EOF becomes the
+    /// process's stdin EOF without ending the call. The future resolves with
+    /// the exit code once the process has exited and its output has been
+    /// relayed, and it does not wait for the caller's stdin to reach EOF.
+    /// Nothing is printed to the host's stdout.
+    ///
+    /// The default declines, so runtimes without a raw exec stay honest.
+    fn exec_piped(
+        &self,
+        _id: &str,
+        _cmd: &[String],
+        _user: Option<&str>,
+        _env: &[(String, SecretValue)],
+        _stdio: PipedStdio,
+    ) -> BoxFut<'_, i32> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "piped exec is not supported by the {name} runtime"
+            )))
+        })
+    }
+
+    /// A container's create-time environment as `KEY=VALUE` entries, verbatim
+    /// and in the runtime's order.
+    ///
+    /// The default declines, so runtimes without an environment read stay honest.
+    fn container_env(&self, _id: &str) -> BoxFut<'_, Vec<String>> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Runtime(format!(
+                "reading a container's environment is not supported by the {name} runtime"
+            )))
+        })
+    }
+
     /// Read a container's log stream (stdout and stderr interleaved). `tail`
     /// limits output to the last N lines; `follow` keeps the stream open.
     ///
@@ -481,6 +522,21 @@ pub trait ContainerRuntime: Send + Sync {
     fn daemon_version(&self) -> Option<&str> {
         None
     }
+}
+
+/// This workspace's running container, if it has one. Never starts anything:
+/// a stopped container is the same answer as none.
+pub async fn find_running_container(
+    runtime: &dyn ContainerRuntime,
+    workspace: &Path,
+) -> Result<Option<ContainerInfo>, DevError> {
+    let labels = crate::util::workspace_labels(workspace, None);
+    let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    Ok(runtime
+        .list_containers(&filters)
+        .await?
+        .into_iter()
+        .find(|c| c.state == ContainerState::Running))
 }
 
 /// Resolve the effective remote user by checking the devcontainer config first,

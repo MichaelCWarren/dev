@@ -13,13 +13,14 @@ use apple_container::models::{
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::paste_bridge;
+use crate::runtime::piped::forward_stdin;
 use crate::runtime::terminal_relay::{
     HostTerminal, Pty, RawModeGuard, SessionPeer, StdinReader, UnitFut, drain_remaining_output,
     relay_terminal,
 };
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, WorkspaceMount, env_assignments,
+    ExecResult, ImageMetadata, PipedStdio, WorkspaceMount, env_assignments,
 };
 
 /// What a container's own processes run with.
@@ -90,6 +91,19 @@ impl AppleRuntime {
         let defaults = self.container_process_defaults(id).await;
         let proc_config = exec_process_config(cmd, user, false, &defaults, workdir, env);
         run_captured_process(&self.client, id, &proc_config).await
+    }
+
+    async fn exec_piped_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[String],
+        stdio: PipedStdio,
+    ) -> Result<i32, DevError> {
+        let defaults = self.container_process_defaults(id).await;
+        let proc_config = exec_process_config(cmd, user, false, &defaults, None, env);
+        run_piped_process(&self.client, id, &proc_config, stdio).await
     }
 
     /// The environment and working directory the container's own processes use.
@@ -1018,11 +1032,116 @@ async fn run_captured_process_with_input(
     proc_config: &ProcessConfiguration,
     stdin_payload: Vec<u8>,
 ) -> Result<ExecResult, DevError> {
+    let exec = ExecLabels {
+        what: "exec",
+        id_prefix: "exec",
+    };
+    let (exit_code, output) = run_process(daemon, id, proc_config, exec, |ends| {
+        ready_output_readers(ends, stdin_payload)
+    })
+    .await?;
+    let (stdout, stderr) = output.collected().await?;
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+/// Create, start, and wait for one process whose stdio is the caller's own.
+///
+/// Follows [`run_captured_process_with_input`], except stderr stays on its own
+/// descriptor all the way to `stdio.stderr`, and every pump is running before
+/// the start so a daemon that reads stdin during the start cannot deadlock.
+async fn run_piped_process(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    proc_config: &ProcessConfiguration,
+    stdio: PipedStdio,
+) -> Result<i32, DevError> {
+    let exec = ExecLabels {
+        what: "piped exec",
+        id_prefix: "exec-piped",
+    };
+    let (exit_code, tasks) = run_process(daemon, id, proc_config, exec, |ends| {
+        PipedTasks::spawn(stdio, ends)
+    })
+    .await?;
+    tasks.finished().await?;
+    Ok(exit_code)
+}
+
+/// How one kind of exec names itself in its errors and its process ids.
+struct ExecLabels {
+    what: &'static str,
+    id_prefix: &'static str,
+}
+
+/// The host's ends of one exec's stdio pipes, once the daemon holds its own.
+struct HostPipeEnds {
+    stdin_write: os_pipe::PipeWriter,
+    stdout_read: os_pipe::PipeReader,
+    stderr_read: os_pipe::PipeReader,
+}
+
+/// The tasks moving one exec's stdio, which a failed exec has to cancel.
+trait ExecPumps {
+    /// Cancel every task and wait for them to let go of the pipes.
+    fn released(self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// Create, start, and wait for one process, with `start_pumps` wiring its
+/// stdio before the start. Returns the exit code and the pumps, which the
+/// caller drains.
+async fn run_process<P: ExecPumps>(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    proc_config: &ProcessConfiguration,
+    exec: ExecLabels,
+    start_pumps: impl FnOnce(HostPipeEnds) -> Result<P, DevError>,
+) -> Result<(i32, P), DevError> {
+    let (process_id, ends) = create_process_with_pipes(daemon, id, proc_config, &exec).await?;
+    let pumps = start_pumps(ends)?;
+
+    let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+    let exit_wait = daemon.wait_process(id, &process_id, issued);
+    tokio::pin!(exit_wait);
+    let start = daemon.start_process(id, &process_id);
+    if let Err(e) = start_with_registered_exit_wait(
+        exec.what,
+        &proc_config.executable,
+        &mut exit_wait,
+        on_the_wire,
+        start,
+    )
+    .await
+    {
+        abandon_process(daemon, id, &process_id, pumps.released()).await;
+        return Err(e);
+    }
+
+    match exit_wait.await {
+        Ok(code) => Ok((code, pumps)),
+        Err(e) => {
+            abandon_process(daemon, id, &process_id, pumps.released()).await;
+            Err(DevError::Runtime(format!("{} wait failed: {e}", exec.what)))
+        }
+    }
+}
+
+/// Register one process with the daemon on three fresh pipes, returning its
+/// id and the ends the host keeps.
+async fn create_process_with_pipes(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    proc_config: &ProcessConfiguration,
+    exec: &ExecLabels,
+) -> Result<(String, HostPipeEnds), DevError> {
     let (stdin_read, stdin_write) = exec_pipe()?;
     let (stdout_read, stdout_write) = exec_pipe()?;
     let (stderr_read, stderr_write) = exec_pipe()?;
 
-    let process_id = next_process_id("exec");
+    let process_id = next_process_id(exec.id_prefix);
 
     daemon
         .create_process(
@@ -1034,51 +1153,84 @@ async fn run_captured_process_with_input(
             Some(stderr_write.as_raw_fd()),
         )
         .await
-        .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
+        .map_err(|e| DevError::Runtime(format!("{} failed: {e}", exec.what)))?;
 
     // The daemon holds its own copies of all three descriptors now. Closing
-    // ours lets the readers below see EOF once the process exits.
+    // ours lets the readers see EOF once the process exits.
+    drop(stdin_read);
     drop(stdout_write);
     drop(stderr_write);
-    let output = ready_output_readers(
-        stdin_read,
+    let ends = HostPipeEnds {
         stdin_write,
         stdout_read,
         stderr_read,
-        stdin_payload,
-    )?;
+    };
+    Ok((process_id, ends))
+}
 
-    let (issued, on_the_wire) = tokio::sync::oneshot::channel();
-    let exit_wait = daemon.wait_process(id, &process_id, issued);
-    tokio::pin!(exit_wait);
-    let start = daemon.start_process(id, &process_id);
-    if let Err(e) = start_with_registered_exit_wait(
-        "exec",
-        &proc_config.executable,
-        &mut exit_wait,
-        on_the_wire,
-        start,
-    )
-    .await
-    {
-        abandon_process(daemon, id, &process_id, output).await;
-        return Err(e);
+/// The three pumps of one piped exec: the caller's stdin into the process,
+/// and the process's stdout and stderr out to the caller.
+struct PipedTasks {
+    stdin: tokio::task::JoinHandle<std::io::Result<()>>,
+    stdout: tokio::task::JoinHandle<std::io::Result<()>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl PipedTasks {
+    fn spawn(stdio: PipedStdio, ends: HostPipeEnds) -> Result<Self, DevError> {
+        let PipedStdio {
+            stdin,
+            mut stdout,
+            mut stderr,
+        } = stdio;
+        let stdin_write = watch_write(ends.stdin_write)?;
+        let stdout_read = watch_read(ends.stdout_read, "stdout")?;
+        let stderr_read = watch_read(ends.stderr_read, "stderr")?;
+        Ok(Self {
+            stdin: tokio::spawn(forward_stdin(stdin, stdin_write)),
+            stdout: tokio::spawn(async move { relay_output(stdout_read, &mut stdout).await }),
+            stderr: tokio::spawn(async move { relay_output(stderr_read, &mut stderr).await }),
+        })
     }
 
-    let exit_code = match exit_wait.await {
-        Ok(code) => code,
-        Err(e) => {
-            abandon_process(daemon, id, &process_id, output).await;
-            return Err(DevError::Runtime(format!("exec wait failed: {e}")));
-        }
-    };
+    /// Both relays, once each has reached EOF. The stdin pump is aborted, not
+    /// awaited: the caller's stdin may never end.
+    async fn finished(self) -> Result<(), DevError> {
+        self.stdin.abort();
+        let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
+        finish_task(stdout, "relay", "stdout")?;
+        finish_task(stderr, "relay", "stderr")
+    }
+}
 
-    let (stdout, stderr) = output.collected().await?;
-    Ok(ExecResult {
-        exit_code,
-        stdout,
-        stderr,
-    })
+impl ExecPumps for PipedTasks {
+    async fn released(self) {
+        self.stdin.abort();
+        self.stdout.abort();
+        self.stderr.abort();
+        let _ = tokio::join!(self.stdin, self.stdout, self.stderr);
+    }
+}
+
+/// Copy `reader` into `writer` until EOF, flushing after every chunk.
+///
+/// The flush is the point: ssh is interactive, and a buffered writer would
+/// hold the handshake back until its buffer filled.
+async fn relay_output<R, W>(mut reader: R, writer: &mut W) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        writer.write_all(&chunk[..read]).await?;
+        writer.flush().await?;
+    }
 }
 
 /// Decide what happens to the stdin pipe and start draining the output pipes.
@@ -1089,18 +1241,19 @@ async fn run_captured_process_with_input(
 /// otherwise block forever. A non-empty payload keeps the write end alive in
 /// a task the caller can abort, so the start never races a truncated write.
 fn ready_output_readers(
-    stdin_read: os_pipe::PipeReader,
-    stdin_write: os_pipe::PipeWriter,
-    stdout_read: os_pipe::PipeReader,
-    stderr_read: os_pipe::PipeReader,
+    ends: HostPipeEnds,
     stdin_payload: Vec<u8>,
 ) -> Result<OutputReaders, DevError> {
-    drop(stdin_read);
     if stdin_payload.is_empty() {
-        drop(stdin_write);
-        OutputReaders::draining(stdout_read, stderr_read)
+        drop(ends.stdin_write);
+        OutputReaders::draining(ends.stdout_read, ends.stderr_read)
     } else {
-        OutputReaders::feeding(stdout_read, stderr_read, stdin_write, stdin_payload)
+        OutputReaders::feeding(
+            ends.stdout_read,
+            ends.stderr_read,
+            ends.stdin_write,
+            stdin_payload,
+        )
     }
 }
 
@@ -1116,10 +1269,10 @@ async fn abandon_process(
     daemon: &dyn ExecDaemon,
     id: &str,
     process_id: &str,
-    output: OutputReaders,
+    release_tasks: impl std::future::Future<Output = ()>,
 ) {
     let _ = daemon.kill_process(id, process_id, libc::SIGKILL).await;
-    output.released().await;
+    release_tasks.await;
 }
 
 /// The readers (and, when a payload is being fed, the writer) of one captured
@@ -1170,12 +1323,13 @@ impl OutputReaders {
         }
         let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
         Ok((
-            finish_read(stdout, "stdout")?,
-            finish_read(stderr, "stderr")?,
+            finish_task(stdout, "read", "stdout")?,
+            finish_task(stderr, "read", "stderr")?,
         ))
     }
+}
 
-    /// Cancel every task and wait for them to let go of the pipes.
+impl ExecPumps for OutputReaders {
     async fn released(self) {
         self.stdout.abort();
         self.stderr.abort();
@@ -1194,6 +1348,21 @@ fn exec_pipe() -> Result<(os_pipe::PipeReader, os_pipe::PipeWriter), DevError> {
     os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))
 }
 
+/// Hand a pipe's read end to the reactor.
+fn watch_read(
+    reader: os_pipe::PipeReader,
+    stream: &str,
+) -> Result<tokio::net::unix::pipe::Receiver, DevError> {
+    tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into())
+        .map_err(|e| DevError::Runtime(format!("watch {stream}: {e}")))
+}
+
+/// Hand a stdin pipe's write end to the reactor.
+fn watch_write(writer: os_pipe::PipeWriter) -> Result<tokio::net::unix::pipe::Sender, DevError> {
+    tokio::net::unix::pipe::Sender::from_owned_fd(writer.into())
+        .map_err(|e| DevError::Runtime(format!("watch stdin: {e}")))
+}
+
 /// Drain a pipe to a string in a task that can be cancelled.
 ///
 /// Read through the reactor rather than by parking a thread on the descriptor,
@@ -1207,8 +1376,7 @@ fn read_pipe(
     reader: os_pipe::PipeReader,
     stream: &str,
 ) -> Result<tokio::task::JoinHandle<std::io::Result<String>>, DevError> {
-    let mut reader = tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into())
-        .map_err(|e| DevError::Runtime(format!("watch {stream}: {e}")))?;
+    let mut reader = watch_read(reader, stream)?;
     Ok(tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
@@ -1230,22 +1398,23 @@ fn write_pipe(
     writer: os_pipe::PipeWriter,
     payload: Vec<u8>,
 ) -> Result<tokio::task::JoinHandle<std::io::Result<()>>, DevError> {
-    let mut writer = tokio::net::unix::pipe::Sender::from_owned_fd(writer.into())
-        .map_err(|e| DevError::Runtime(format!("watch stdin: {e}")))?;
+    let mut writer = watch_write(writer)?;
     Ok(tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         writer.write_all(&payload).await
     }))
 }
 
-/// Unwrap the two error layers a [`read_pipe`] task can fail with.
-fn finish_read(
-    joined: Result<std::io::Result<String>, tokio::task::JoinError>,
+/// Unwrap the two error layers a pipe task can fail with; `verb` is what the
+/// task does to `stream`.
+fn finish_task<T>(
+    joined: Result<std::io::Result<T>, tokio::task::JoinError>,
+    verb: &str,
     stream: &str,
-) -> Result<String, DevError> {
+) -> Result<T, DevError> {
     joined
-        .map_err(|e| DevError::Runtime(format!("{stream} reader join: {e}")))?
-        .map_err(|e| DevError::Runtime(format!("read {stream}: {e}")))
+        .map_err(|e| DevError::Runtime(format!("{stream} {verb} join: {e}")))?
+        .map_err(|e| DevError::Runtime(format!("{verb} {stream}: {e}")))
 }
 
 /// Convert our generic ContainerConfig to the Apple Containers configuration.
@@ -1784,6 +1953,36 @@ impl ContainerRuntime for AppleRuntime {
                 }),
                 Err(_) => Ok(ImageMetadata::default()),
             }
+        })
+    }
+
+    fn exec_piped(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[(String, SecretValue)],
+        stdio: PipedStdio,
+    ) -> BoxFut<'_, i32> {
+        let id = id.to_string();
+        let cmd = cmd.to_vec();
+        let user = user.map(|u| u.to_string());
+        let env = env_assignments(env);
+        Box::pin(async move {
+            self.exec_piped_impl(&id, &cmd, user.as_deref(), &env, stdio)
+                .await
+        })
+    }
+
+    fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let snapshot = self
+                .client
+                .get(&id)
+                .await
+                .map_err(|e| DevError::Runtime(format!("inspect failed: {e}")))?;
+            Ok(snapshot.configuration.init_process.environment)
         })
     }
 
@@ -2506,6 +2705,85 @@ mod tests {
             readers_released(&daemon),
             "a failed wait must release its output readers, not leave them on \
              the pipes of a process nothing has closed"
+        );
+    }
+
+    // ---- piped exec ----
+
+    type Stdin = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
+    /// Run one piped exec, turning a hang into a failure.
+    async fn bounded_piped_exec(
+        daemon: &FakeExecDaemon,
+        stdin: Stdin,
+    ) -> (Result<i32, DevError>, Vec<u8>, Vec<u8>) {
+        let config = exec_config();
+        crate::runtime::fake_daemon::run_captured_piped(
+            std::time::Duration::from_secs(30),
+            stdin,
+            |stdio| run_piped_process(daemon, "cid", &config, stdio),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_keeps_stderr_off_stdout() {
+        let daemon = FakeExecDaemon::producing("out", "err", 3);
+
+        let (result, stdout, stderr) =
+            bounded_piped_exec(&daemon, Box::new(tokio::io::empty())).await;
+
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
+        assert_eq!(result.unwrap(), 3);
+        assert!(daemon.created_stderr.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_forwards_stdin_through_to_eof() {
+        let daemon = FakeExecDaemon::fed_through_stdin(0);
+
+        let (result, _, _) = bounded_piped_exec(&daemon, Box::new(&b"hello"[..])).await;
+
+        result.unwrap();
+        assert_eq!(*daemon.stdin_received.lock().unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_registers_its_wait_before_the_start() {
+        let daemon = FakeExecDaemon::producing("", "", 0);
+
+        let (result, _, _) = bounded_piped_exec(&daemon, Box::new(tokio::io::empty())).await;
+
+        result.unwrap();
+        assert_eq!(daemon.calls(), vec!["create", "wait", "start"]);
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_does_not_wait_for_the_callers_stdin() {
+        let daemon = FakeExecDaemon::producing("x", "", 0);
+        let (never_ends, _held_open) = tokio::io::duplex(64);
+
+        let (result, stdout, _) = bounded_piped_exec(&daemon, Box::new(never_ends)).await;
+
+        assert_eq!(stdout, b"x");
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_piped_start_releases_everything() {
+        let daemon = FakeExecDaemon::failing_start();
+
+        let (result, _, _) = bounded_piped_exec(&daemon, Box::new(tokio::io::empty())).await;
+
+        let err = result.expect_err("a refused start must surface as an error");
+        assert!(
+            format!("{err}").contains("piped exec start failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            readers_released(&daemon),
+            "a refused start must release its relays, not leave them on pipes the daemon holds"
         );
     }
 
@@ -3827,6 +4105,35 @@ mod tests {
         let piped = bounded(&runtime, container_id, &["cat"]).await;
         assert_eq!(piped.exit_code, 0, "cat must exit once stdin reaches EOF");
         assert!(piped.stdout.is_empty());
+
+        // The piped exec keeps stderr off stdout, and a stdin that never ends
+        // does not hold the call open once the process has exited.
+        {
+            use crate::runtime::fake_daemon::run_captured_piped;
+            let run = |script: &'static str,
+                       stdin: Box<dyn tokio::io::AsyncRead + Send + Unpin>| {
+                let runtime = &runtime;
+                async move {
+                    let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+                    let (code, out, err) =
+                        run_captured_piped(std::time::Duration::from_secs(10), stdin, |stdio| {
+                            runtime.exec_piped(container_id, &cmd, None, &[], stdio)
+                        })
+                        .await;
+                    (code.expect("piped exec failed"), out, err)
+                }
+            };
+            let (code, out, err) = run("cat; echo err >&2; exit 3", Box::new(&b"hi"[..])).await;
+            assert_eq!((code, out, err), (3, b"hi".to_vec(), b"err\n".to_vec()));
+            let (never_ends, _held_open) = tokio::io::duplex(64);
+            let (code, out, _) = run("echo done", Box::new(never_ends)).await;
+            assert_eq!((code, out), (0, b"done\n".to_vec()));
+            let env = runtime
+                .container_env(container_id)
+                .await
+                .expect("container_env failed");
+            assert!(env.iter().any(|entry| entry.starts_with("PATH=")));
+        }
 
         // Live smoke for Apple's terminal exec contract: `terminal=true`
         // starts with stdin/stdout and no separate stderr fd, then reports its

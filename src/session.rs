@@ -63,6 +63,8 @@ pub enum SessionKind {
     Hook,
     /// One connection's netcat relay, started by `dev forward`.
     Forward,
+    /// One connection's `sshd -i`, started by `dev ssh-proxy`.
+    Ssh,
 }
 
 impl SessionKind {
@@ -72,6 +74,7 @@ impl SessionKind {
             SessionKind::Exec => "exec",
             SessionKind::Hook => "hook",
             SessionKind::Forward => "forward",
+            SessionKind::Ssh => "ssh",
         }
     }
 
@@ -81,6 +84,7 @@ impl SessionKind {
             "exec" => Some(SessionKind::Exec),
             "hook" => Some(SessionKind::Hook),
             "forward" => Some(SessionKind::Forward),
+            "ssh" => Some(SessionKind::Ssh),
             _ => None,
         }
     }
@@ -608,6 +612,13 @@ mod tests {
             kind: SessionKind::Shell,
             host_tty: "ttys016".to_string(),
         }
+    }
+
+    #[test]
+    fn an_ssh_session_marker_round_trips() {
+        let markers = parse_markers("720 720 4131 Tue_Aug__5_08:56:01_2026 ssh ttys016\n");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, SessionKind::Ssh);
     }
 
     #[test]

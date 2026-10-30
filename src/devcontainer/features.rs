@@ -154,15 +154,15 @@ pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeatu
 
 /// Every feature the config asks for, plus the ones `dev` supplies itself.
 ///
-/// `cmux.agent` and the SSH agent relay are each an opt-in for a capability,
-/// not a request for a particular image layer, so turning either on is what
-/// puts its feature in the build. Both ship inside this binary (see
-/// [`crate::cmux::agent::stage_feature_in`] and
-/// [`crate::ssh_agent::stage_feature_in`]) rather than in a registry or the
-/// repository, so nothing has to be fetched or copied for either key to
-/// work. They are independent keys and each gets its own condition here: a
-/// user who wants one capability must not have to carry the other's image
-/// layer to get it.
+/// `cmux.agent`, the SSH agent relay and `sshServer.enabled` are each an
+/// opt-in for a capability, not a request for a particular image layer, so
+/// turning one on is what puts its feature in the build. All three ship inside
+/// this binary (see [`crate::cmux::agent::stage_feature_in`],
+/// [`crate::ssh_agent::stage_feature_in`] and
+/// [`crate::ssh_server::stage_feature_in`]) rather than in a registry or the
+/// repository, so nothing has to be fetched or copied for any key to work.
+/// They are independent keys and each gets its own condition here: a user who
+/// wants one capability must not have to carry another's image layer to get it.
 ///
 /// This is the one choke point every build path calls, which is why the
 /// injection lives here rather than at each of `up` and `build`'s call sites.
@@ -183,30 +183,32 @@ pub fn resolve_features_in(
         .collect();
 
     if config.cmux_agent_enabled() {
-        let staged = crate::cmux::agent::stage_feature_in(home)?;
-        resolved.push(resolve_one(
-            &staged.to_string_lossy(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        ));
+        push_staged(&mut resolved, crate::cmux::agent::stage_feature_in(home)?);
     }
 
     if relay.is_on() {
-        let staged = crate::ssh_agent::stage_feature_in(home)?;
-        resolved.push(resolve_one(
-            &staged.to_string_lossy(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        ));
+        push_staged(&mut resolved, crate::ssh_agent::stage_feature_in(home)?);
+    }
+
+    if config.ssh_server_enabled() {
+        push_staged(&mut resolved, crate::ssh_server::stage_feature_in(home)?);
     }
 
     Ok(resolved)
 }
 
+fn push_staged(resolved: &mut Vec<ResolvedFeature>, staged: PathBuf) {
+    resolved.push(resolve_one(
+        &staged.to_string_lossy(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    ));
+}
+
 /// Write one of `dev`'s embedded features out under `home`'s staged features
 /// directory, and hand back the path a build can resolve it by.
 ///
-/// Shared by [`crate::cmux::agent::stage_feature_in`] and
-/// [`crate::ssh_agent::stage_feature_in`], the only two callers, so the
-/// staging loop and its mode-setting are not copied between them.
+/// Every embedded feature's own `stage_feature_in` goes through here, so the
+/// staging loop and its mode-setting are written once.
 ///
 /// Rewritten every run rather than written once, so an upgraded `dev`
 /// refreshes a shim staged by an older one. The content is identical between
@@ -1733,6 +1735,76 @@ mod tests {
                 "{json} added the SSH shim"
             );
         }
+    }
+
+    #[test]
+    fn ssh_server_adds_the_feature_dev_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let resolved = resolve_features_in(
+            &config_with(r#"{"sshServer": {"enabled": true}}"#),
+            &DevHome::at(tmp.path()),
+            RelayDecision::Off,
+        )
+        .unwrap();
+
+        let staged = tmp.path().join("features/ssh-server");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, staged.to_string_lossy());
+        assert!(staged.join("install.sh").is_file());
+    }
+
+    /// The relay and cmux rows prove the branch rides on neither of them.
+    #[test]
+    fn without_ssh_server_nothing_is_staged_for_it() {
+        for (json, relay) in [
+            (r#"{"image": "alpine"}"#, RelayDecision::Off),
+            (r#"{"sshServer": {}}"#, RelayDecision::Off),
+            (r#"{"sshServer": {"enabled": false}}"#, RelayDecision::Off),
+            (r#"{"sshAgent": {"relay": true}}"#, RelayDecision::On),
+            (r#"{"cmux": {"agent": true}}"#, RelayDecision::Off),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let resolved =
+                resolve_features_in(&config_with(json), &DevHome::at(tmp.path()), relay).unwrap();
+            assert!(
+                !tmp.path().join("features/ssh-server").exists(),
+                "{json} staged the ssh server"
+            );
+            assert!(
+                resolved
+                    .iter()
+                    .all(|f| !f.id.ends_with("features/ssh-server")),
+                "{json} added the ssh server"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_server_cmux_and_the_relay_are_separate_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolved = resolve_features_in(
+            &config_with(
+                r#"{"cmux": {"agent": true}, "sshServer": {"enabled": true},
+                    "features": {"ghcr.io/x/y:1": {}}}"#,
+            ),
+            &DevHome::at(tmp.path()),
+            RelayDecision::On,
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 4);
+
+        let ordered = order_features(&resolved);
+
+        let root = tmp.path().join("features");
+        let expected = [
+            root.join("cmux-agent").to_string_lossy().into_owned(),
+            root.join("ssh-agent-relay").to_string_lossy().into_owned(),
+            root.join("ssh-server").to_string_lossy().into_owned(),
+            "ghcr.io/x/y:1".to_string(),
+        ];
+        let ids: Vec<&str> = ordered.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, expected);
     }
 
     /// Reference form a local feature directory is named by in devcontainer.json.

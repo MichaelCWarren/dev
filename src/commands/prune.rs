@@ -575,6 +575,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_keeps_the_image_a_base_enabled_ssh_server_builds() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        std::fs::create_dir_all(dev_home.base_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            dev_home.base_config(),
+            r#"{"sshServer": {"enabled": true}}"#,
+        )
+        .unwrap();
+        let config_dir = workspace.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_json = r#"{
+            "image": "ubuntu:24.04",
+            "features": {"ghcr.io/devcontainers/features/node:1": {}}
+        }"#;
+        std::fs::write(config_dir.join("devcontainer.json"), config_json).unwrap();
+
+        let folder_image = container_name(workspace.path());
+        let config = effective_config_in(&dev_home, workspace.path(), "fake", true).unwrap();
+        let features = features_for(&config, &dev_home);
+        assert!(
+            features
+                .iter()
+                .any(|f| f.id.ends_with("features/ssh-server"))
+        );
+        let current = feature_image_tag(&folder_image, &config, &features);
+        let stale = format!("{folder_image}-features-aaaaaaaaaaaa");
+
+        let rt = PruneFakeRuntime::with_images(&[&folder_image, &current, &stale]);
+        run_with_runtime(workspace.path(), &rt, &dev_home, false)
+            .await
+            .unwrap();
+
+        assert_eq!(rt.removed(), vec![format!("{stale}:latest")]);
+    }
+
+    #[tokio::test]
     async fn prune_keeps_the_no_base_variant_of_the_current_tag() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();

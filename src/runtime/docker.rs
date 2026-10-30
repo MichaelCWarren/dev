@@ -8,18 +8,19 @@ use bollard::query_parameters::{
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::OnceLock;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::host_access::{DetectedDaemon, HostAccess};
 use crate::runtime::paste_bridge;
+use crate::runtime::piped::forward_stdin;
 use crate::runtime::terminal_relay::{
     HostTerminal, RawModeGuard, SessionPeer, StdinReader, UnitFut, relay_terminal,
 };
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageInfo, ImageMetadata, env_assignments,
+    ExecResult, ImageInfo, ImageMetadata, PipedStdio, env_assignments,
 };
 
 /// The raw stream half of a started exec, as bollard hands it back.
@@ -33,6 +34,42 @@ type ExecOutput = std::pin::Pin<
 
 /// The raw input half of a started exec, as bollard hands it back.
 type ExecInput = std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
+
+/// Route an exec's multiplexed output: stdout and raw console data to
+/// `stdout`, stderr to `stderr`, and echoed stdin nowhere.
+///
+/// Each chunk is flushed as it is written. A failed stderr write is ignored so
+/// a closed host stderr cannot end the session; a failed stdout write ends it.
+async fn demux_exec_output<S, O, E>(
+    mut output: S,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> std::io::Result<()>
+where
+    S: futures_util::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>>
+        + Unpin,
+    O: AsyncWrite + Unpin + ?Sized,
+    E: AsyncWrite + Unpin + ?Sized,
+{
+    use bollard::container::LogOutput;
+    use futures_util::StreamExt;
+
+    while let Some(frame) = output.next().await {
+        let frame = frame.map_err(std::io::Error::other)?;
+        match frame {
+            LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                stdout.write_all(&message).await?;
+                stdout.flush().await?;
+            }
+            LogOutput::StdErr { message } => {
+                let _ = stderr.write_all(&message).await;
+                let _ = stderr.flush().await;
+            }
+            LogOutput::StdIn { .. } => {}
+        }
+    }
+    Ok(())
+}
 
 /// Adapts bollard's `LogOutput` stream into an `AsyncRead` byte stream.
 struct LogOutputStream {
@@ -257,6 +294,40 @@ fn reports_missing_command(error: &DevError) -> bool {
 /// ended the session. A budget rather than an unbounded wait so a process that
 /// keeps running with no stdin cannot park `dev shell` forever.
 pub(crate) const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long output is still drained after the poll sees the process stopped.
+///
+/// Docker can keep an exec's stream open after the process exits while stdin
+/// is attached, so the stream's own end cannot be relied on. The last frames
+/// may still be in flight when the poll fires, so they get this long to land.
+const EXIT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The first and the longest wait between `wait_until_exec_stops` polls.
+const STOP_POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+const STOP_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often `wait_until_exec_stops` asks whether an exec has stopped.
+#[derive(Debug, Clone, Copy)]
+enum StopPoll {
+    /// Every `STOP_POLL_FIRST`: a shell's exit is waited on by a person at
+    /// the terminal, so a backed-off poll would be up to a second of lag.
+    Fixed,
+    /// Doubling up to `STOP_POLL_MAX`: a piped `sshd -i` lives as long as its
+    /// ssh session, so it is not inspected ten times a second for hours.
+    Backoff,
+}
+
+impl StopPoll {
+    fn next(self, delay: std::time::Duration) -> std::time::Duration {
+        match self {
+            Self::Fixed => delay,
+            Self::Backoff => (delay * 2).min(STOP_POLL_MAX),
+        }
+    }
+}
+
+const INTERACTIVE_STOP_POLL: StopPoll = StopPoll::Fixed;
+const PIPED_STOP_POLL: StopPoll = StopPoll::Backoff;
 
 /// The exit code an `inspect_exec` reply carries, if it carries a final one.
 ///
@@ -923,7 +994,7 @@ impl BollardRuntime {
             result = relay_terminal(&mut host, input, output, &peer) => {
                 result?;
             }
-            () = self.wait_until_exec_stops(&exec.id) => {}
+            () = self.wait_until_exec_stops(&exec.id, INTERACTIVE_STOP_POLL) => {}
         }
 
         let exit_code = self.recorded_exec_status(&exec.id).await?;
@@ -936,14 +1007,16 @@ impl BollardRuntime {
     /// when the shell exits while docker keeps the stream open (stdin still
     /// attached). Distinct from `recorded_exec_status`'s bounded wait below,
     /// which is the final status read once the session is already over.
-    async fn wait_until_exec_stops(&self, exec_id: &str) {
+    async fn wait_until_exec_stops(&self, exec_id: &str, poll: StopPoll) {
+        let mut delay = STOP_POLL_FIRST;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(delay).await;
             if let Ok(info) = self.client.inspect_exec(exec_id).await
                 && info.running == Some(false)
             {
                 return;
             }
+            delay = poll.next(delay);
         }
     }
 
@@ -966,8 +1039,7 @@ impl BollardRuntime {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(DevError::Runtime(format!(
-                    "the interactive session ended but docker reported no exit status for it \
-                     within {}s",
+                    "the exec ended but docker reported no exit status for it within {}s",
                     EXEC_STATUS_BUDGET.as_secs()
                 )));
             }
@@ -1062,6 +1134,77 @@ impl BollardRuntime {
                 .await?;
             Ok(())
         })
+    }
+
+    async fn exec_piped_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[String],
+        stdio: PipedStdio,
+    ) -> Result<i32, DevError> {
+        let exec = self
+            .client
+            .create_exec(
+                id,
+                Self::create_exec_options(
+                    cmd,
+                    user,
+                    None,
+                    env,
+                    ExecStreams {
+                        attach_stdin: true,
+                        attach_stdout: true,
+                        attach_stderr: true,
+                        tty: false,
+                    },
+                ),
+            )
+            .await?;
+        let start = self.client.start_exec(&exec.id, None).await?;
+        let (output, input) = Self::attached_streams(start)?;
+
+        let PipedStdio {
+            stdin,
+            mut stdout,
+            mut stderr,
+        } = stdio;
+        let pump = tokio::spawn(forward_stdin(stdin, input));
+        let attended = self
+            .attend_piped_exec(&exec.id, output, &mut stdout, &mut stderr)
+            .await;
+        // The caller's stdin may never end, so the pump is dropped, not awaited.
+        pump.abort();
+        attended?;
+
+        self.recorded_exec_status(&exec.id).await
+    }
+
+    /// Relay the exec's output until its stream ends or the process stops.
+    async fn attend_piped_exec(
+        &self,
+        exec_id: &str,
+        output: ExecOutput,
+        stdout: &mut (dyn AsyncWrite + Send + Unpin),
+        stderr: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> Result<(), DevError> {
+        let demux = demux_exec_output(output, stdout, stderr);
+        tokio::pin!(demux);
+        tokio::select! {
+            result = &mut demux => result?,
+            () = self.wait_until_exec_stops(exec_id, PIPED_STOP_POLL) => {
+                if let Ok(result) = tokio::time::timeout(EXIT_DRAIN_GRACE, &mut demux).await {
+                    result?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn container_env_impl(&self, id: &str) -> Result<Vec<String>, DevError> {
+        let resp = self.client.inspect_container(id, None).await?;
+        Ok(resp.config.and_then(|c| c.env).unwrap_or_default())
     }
 
     #[allow(dead_code)]
@@ -1210,6 +1353,29 @@ impl ContainerRuntime for BollardRuntime {
         target: &'a str,
     ) -> BoxFut<'a, ()> {
         Box::pin(self.copy_into_container(id, user, bytes, target))
+    }
+
+    fn exec_piped(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[(String, SecretValue)],
+        stdio: PipedStdio,
+    ) -> BoxFut<'_, i32> {
+        let id = id.to_string();
+        let cmd = cmd.to_vec();
+        let user = user.map(str::to_string);
+        let env = env_assignments(env);
+        Box::pin(async move {
+            self.exec_piped_impl(&id, &cmd, user.as_deref(), &env, stdio)
+                .await
+        })
+    }
+
+    fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
+        let id = id.to_string();
+        Box::pin(async move { self.container_env_impl(&id).await })
     }
 
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
@@ -1386,6 +1552,21 @@ impl ContainerRuntime for DockerRuntime {
         target: &'a str,
     ) -> BoxFut<'a, ()> {
         self.0.copy_in(id, user, bytes, target)
+    }
+
+    fn exec_piped(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: &[(String, SecretValue)],
+        stdio: PipedStdio,
+    ) -> BoxFut<'_, i32> {
+        self.0.exec_piped(id, cmd, user, env, stdio)
+    }
+
+    fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
+        self.0.container_env(id)
     }
 
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
@@ -2079,5 +2260,204 @@ mod tests {
                 "flavor={flavor}"
             );
         }
+    }
+
+    // ---- piped exec ----
+
+    use crate::runtime::fake_daemon::{ExecScript, ScriptedExecDaemon, run_captured_piped};
+
+    type Stdin = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
+    async fn run_piped(
+        runtime: &dyn ContainerRuntime,
+        user: Option<&str>,
+        stdin: Stdin,
+    ) -> (Result<i32, DevError>, Vec<u8>, Vec<u8>) {
+        let cmd = vec!["sshd".to_string(), "-i".to_string()];
+        run_captured_piped(std::time::Duration::from_secs(20), stdin, |stdio| {
+            runtime.exec_piped("c1", &cmd, user, &[], stdio)
+        })
+        .await
+    }
+
+    fn docker_over(daemon: &ScriptedExecDaemon) -> DockerRuntime {
+        DockerRuntime(
+            BollardRuntime::connect_to_socket(&daemon.socket())
+                .expect("building a docker client must not need a daemon"),
+        )
+    }
+
+    fn stop_poll_schedule(poll: StopPoll) -> Vec<u64> {
+        std::iter::successors(Some(STOP_POLL_FIRST), |d| Some(poll.next(*d)))
+            .take(7)
+            .map(|d| d.as_millis() as u64)
+            .collect()
+    }
+
+    #[test]
+    fn the_piped_stop_poll_backs_off_to_a_one_second_cap() {
+        assert_eq!(
+            stop_poll_schedule(PIPED_STOP_POLL),
+            [100, 200, 400, 800, 1000, 1000, 1000]
+        );
+    }
+
+    #[test]
+    fn the_interactive_stop_poll_stays_at_100ms() {
+        assert_eq!(stop_poll_schedule(INTERACTIVE_STOP_POLL), [100; 7]);
+    }
+
+    #[tokio::test]
+    async fn exec_output_keeps_stderr_off_stdout() {
+        use bollard::container::LogOutput;
+        use bytes::Bytes;
+
+        let frames = [
+            LogOutput::StdOut {
+                message: Bytes::from_static(b"a"),
+            },
+            LogOutput::StdErr {
+                message: Bytes::from_static(b"E1"),
+            },
+            LogOutput::StdOut {
+                message: Bytes::from_static(b"b"),
+            },
+            LogOutput::Console {
+                message: Bytes::from_static(b"c"),
+            },
+            LogOutput::StdIn {
+                message: Bytes::from_static(b"x"),
+            },
+        ];
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+
+        demux_exec_output(
+            futures_util::stream::iter(frames.into_iter().map(Ok)),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"abc");
+        assert_eq!(stderr, b"E1");
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_relays_each_stream_and_reports_the_exit_code() {
+        let daemon = ScriptedExecDaemon::start(ExecScript {
+            read_stdin_to_eof: true,
+            stdout: b"pong".to_vec(),
+            stderr: b"warn".to_vec(),
+            exit_code: 3,
+            ..ExecScript::default()
+        });
+        let runtime = docker_over(&daemon);
+
+        let (result, stdout, stderr) =
+            run_piped(&runtime, Some("vscode"), Box::new(&b"ping"[..])).await;
+
+        let body = daemon.create_body();
+        assert_eq!(body["User"], "vscode");
+        assert_eq!(body["AttachStdin"], true);
+        assert_eq!(body["AttachStdout"], true);
+        assert_eq!(body["AttachStderr"], true);
+        assert_eq!(body["Tty"], false);
+        assert_eq!(body["Cmd"], serde_json::json!(["sshd", "-i"]));
+        assert_eq!(daemon.stdin_received(), b"ping");
+        assert!(daemon.stdin_reached_eof());
+        assert_eq!(stdout, b"pong");
+        assert_eq!(stderr, b"warn");
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_does_not_wait_for_the_callers_stdin() {
+        let daemon = ScriptedExecDaemon::start(ExecScript {
+            stdout: b"done".to_vec(),
+            exit_code: 7,
+            ..ExecScript::default()
+        });
+        let runtime = docker_over(&daemon);
+        let (never_ends, _held_open) = tokio::io::duplex(64);
+
+        let (result, stdout, _) = run_piped(&runtime, None, Box::new(never_ends)).await;
+
+        assert_eq!(stdout, b"done");
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_piped_exec_ends_when_the_process_stops_but_the_stream_stays_open() {
+        let daemon = ScriptedExecDaemon::start(ExecScript {
+            stdout: b"early".to_vec(),
+            hold_open: true,
+            tail_after_stopped: Some(b"tail".to_vec()),
+            ..ExecScript::default()
+        });
+        let runtime = docker_over(&daemon);
+        let (never_ends, _held_open) = tokio::io::duplex(64);
+
+        let (result, stdout, _) = run_piped(&runtime, None, Box::new(never_ends)).await;
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("tail"),
+            "output written after the stop was seen must still be relayed, got {stdout:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_env_reads_the_create_time_env() {
+        let with_env = ScriptedExecDaemon::start(ExecScript {
+            container_body: r#"{"Id":"c1","Config":{"Env":["B=2","A=1"]}}"#.to_string(),
+            ..ExecScript::default()
+        });
+        let without_env = ScriptedExecDaemon::start(ExecScript {
+            container_body: r#"{"Id":"c1","Config":{}}"#.to_string(),
+            ..ExecScript::default()
+        });
+
+        let env = docker_over(&with_env).container_env("c1").await.unwrap();
+        let empty = docker_over(&without_env).container_env("c1").await.unwrap();
+
+        assert_eq!(env, vec!["B=2", "A=1"]);
+        assert!(empty.is_empty());
+    }
+
+    /// Live checks for what the scripted daemon cannot show: how a real
+    /// daemon ends an exec with stdin attached. Run once against docker's
+    /// socket and once against podman's.
+    #[tokio::test]
+    #[ignore = "requires a live docker-API daemon"]
+    async fn live_piped_exec_against_a_running_container() {
+        let socket = std::env::var("DEV_LIVE_SOCKET").expect("DEV_LIVE_SOCKET must be set");
+        let container =
+            std::env::var("DEV_LIVE_CONTAINER").expect("DEV_LIVE_CONTAINER must be set");
+        let runtime = DockerRuntime::connect_to_socket(&socket).unwrap();
+        let sh = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let run = |cmd: Vec<String>, stdin: Stdin| {
+            let runtime = &runtime;
+            let container = container.clone();
+            async move {
+                run_captured_piped(std::time::Duration::from_secs(10), stdin, |stdio| {
+                    runtime.exec_piped(&container, &cmd, None, &[], stdio)
+                })
+                .await
+            }
+        };
+
+        let (code, out, err) = run(sh("cat; echo err >&2; exit 3"), Box::new(&b"hi"[..])).await;
+        assert_eq!(
+            (out, err, code.unwrap()),
+            (b"hi".to_vec(), b"err\n".to_vec(), 3)
+        );
+
+        let (never_ends, _held_open) = tokio::io::duplex(64);
+        let (code, out, _) = run(sh("echo done"), Box::new(never_ends)).await;
+        assert_eq!((out, code.unwrap()), (b"done\n".to_vec(), 0));
+
+        let env = runtime.container_env(&container).await.unwrap();
+        assert!(env.iter().any(|entry| entry.starts_with("PATH=")));
     }
 }

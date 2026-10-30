@@ -3,17 +3,17 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
-use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
+use crate::devcontainer::compose::{compose_recipe_config_in, materialize_recipe_directory_in};
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::effective::{
-    LockfilePolicy, effective_config_from_parts, load_effective_config,
+    LockfilePolicy, effective_config_from_parts, load_effective_config_in,
 };
 use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, feature_image_tag, features_from_metadata,
     generate_feature_dockerfile_with_opts, order_features,
 };
 use crate::devcontainer::hooklog::HookLog;
-use crate::devcontainer::secrets::discovery::secrets_file_path;
+use crate::devcontainer::secrets::discovery::secrets_file_path_in;
 use crate::devcontainer::secrets::env_name_problem;
 use crate::devcontainer::secrets::validate::validate_secrets_at;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue, ValidatedSecrets};
@@ -29,9 +29,8 @@ use crate::runtime::{
     PortMapping, TmpfsMount, VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
 use crate::util::paths::DevHome;
-use crate::util::{
-    ConfigSource, container_name, find_config_source, workspace_folder_name, workspace_labels,
-};
+use crate::util::workspace::find_config_source_in;
+use crate::util::{ConfigSource, container_name, workspace_folder_name, workspace_labels};
 
 /// A `dev up` finishing under this looks instant enough that a notification
 /// would just be noise; every already-running and cache-hit run stays quiet.
@@ -95,6 +94,123 @@ fn register_caddy_routes(workspace: &Path, config: &DevcontainerConfig) {
     {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
+}
+
+/// What this `dev up` does with the workspace's ssh alias, decided once from
+/// the config it loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshAliasPlan {
+    Register,
+    /// Takes a stale alias away. A workspace that never enabled `sshServer`
+    /// never gets `~/.dev/ssh/`.
+    Remove,
+    /// `--no-base` loads the config without the base layer, where a
+    /// base-enabled `sshServer` reads as off; removing on that reading would
+    /// delete a working alias, its keys and its pin.
+    LeaveAlone,
+}
+
+impl SshAliasPlan {
+    /// Enabled is enabled with or without the base layer; only "off" is in
+    /// doubt under `--no-base`.
+    fn decide(config: &DevcontainerConfig, no_base: bool) -> Self {
+        if config.ssh_server_enabled() {
+            Self::Register
+        } else if no_base {
+            Self::LeaveAlone
+        } else {
+            Self::Remove
+        }
+    }
+}
+
+/// Like Caddy setup, a failure warns rather than failing `dev up`.
+async fn register_ssh_alias(
+    plan: SshAliasPlan,
+    dev_home: &DevHome,
+    workspace: &Path,
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: Option<&str>,
+) {
+    match plan {
+        SshAliasPlan::LeaveAlone => {}
+        SshAliasPlan::Remove => crate::ssh_server::remove_alias_or_warn(dev_home, workspace),
+        SshAliasPlan::Register => {
+            let registered =
+                write_ssh_alias(dev_home, workspace, runtime, container_id, user).await;
+            match registered {
+                Ok(Some(hint)) => println!("{hint}"),
+                Ok(None) => {}
+                Err(e) => eprintln!("Warning: ssh alias setup failed: {e}"),
+            }
+        }
+    }
+}
+
+async fn write_ssh_alias(
+    dev_home: &DevHome,
+    workspace: &Path,
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let login = ssh_login_name(runtime, container_id, user.unwrap_or("root")).await?;
+    let exe = std::env::current_exe()?;
+    crate::ssh_server::register_alias_in(dev_home, workspace, &login, runtime.runtime_name(), &exe)
+}
+
+/// `$0` of the login-name lookup exec.
+const LOGIN_LOOKUP_ARGV0: &str = "dev-login-name";
+
+/// Prints the login name for uid `$1`. Neither `id -nu` (busybox refuses a
+/// uid) nor `getent` (absent on some images) is everywhere, so `getent` goes
+/// first, for NSS sources beyond the file, and the passwd file is read with
+/// the shell alone after it. `$2` stands in for `/etc/passwd` in tests.
+const LOGIN_LOOKUP_SCRIPT: &str = r#"entry=$(getent passwd "$1" 2>/dev/null) && [ -n "$entry" ] && { printf '%s\n' "${entry%%:*}"; exit 0; }
+while IFS=: read -r name _ uid _ || [ -n "$name" ]; do
+  [ "$uid" = "$1" ] && { printf '%s\n' "$name"; exit 0; }
+done < "${2:-/etc/passwd}"
+echo "no passwd entry for uid $1" >&2
+exit 1"#;
+
+fn login_lookup_cmd(uid: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        LOGIN_LOOKUP_SCRIPT.to_string(),
+        LOGIN_LOOKUP_ARGV0.to_string(),
+        uid.to_string(),
+    ]
+}
+
+/// The name sshd will accept for `user`. An image `USER` can be `1000` or
+/// `1000:1000`; an ssh config cannot carry the group and sshd refuses a
+/// numeric login ("Invalid user 1000"), so a uid is looked up in the
+/// container's own passwd.
+async fn ssh_login_name(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    user: &str,
+) -> anyhow::Result<String> {
+    let name = user.split_once(':').map_or(user, |(name, _group)| name);
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(name.to_string());
+    }
+    let cmd = login_lookup_cmd(name);
+    let result = runtime
+        .exec(container_id, &cmd, None, None, &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("could not look up a login name for uid {name}: {e}"))?;
+    let login = result.stdout.trim();
+    if result.exit_code != 0 || login.is_empty() {
+        anyhow::bail!(
+            "uid {name} has no login name in the container, and sshd cannot log in a bare uid \
+             (passwd lookup: {})",
+            result.stderr.trim()
+        );
+    }
+    Ok(login.to_string())
 }
 
 /// Union of declared and live Caddy port entries, deduped by host port.
@@ -207,7 +323,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     cmux: &Cmux,
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
-        match find_config_source(workspace)? {
+        match find_config_source_in(dev_home, workspace)? {
             ConfigSource::Direct(path) => {
                 let project_declared_run_args = config_file_declares_run_args(&path)?;
                 (path, None, project_declared_run_args)
@@ -215,9 +331,14 @@ pub(crate) async fn run_with_runtime_with_providers(
             ConfigSource::Recipe(recipe_path) => {
                 let recipe = Recipe::from_path(&recipe_path)?;
                 let project_declared_run_args = project_declares_run_args(&recipe.customizations);
-                materialize_recipe_directory(&recipe_path, &recipe)?;
-                let composed =
-                    compose_recipe_config(&recipe_path, &recipe, runtime.runtime_name(), !no_base)?;
+                materialize_recipe_directory_in(dev_home, &recipe_path, &recipe)?;
+                let composed = compose_recipe_config_in(
+                    dev_home,
+                    &recipe_path,
+                    &recipe,
+                    runtime.runtime_name(),
+                    !no_base,
+                )?;
                 (
                     composed.config_path.clone(),
                     Some(composed),
@@ -232,11 +353,12 @@ pub(crate) async fn run_with_runtime_with_providers(
         Some(recipe_config) => {
             effective_config_from_parts(recipe_config.value, recipe_config.base_feature_ids)?
         }
-        None => load_effective_config(&config_path, !no_base)?,
+        None => load_effective_config_in(dev_home, &config_path, !no_base)?,
     };
     let lockfile = LockfilePolicy::new(&effective, frozen_lockfile);
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
+    let ssh_alias = SshAliasPlan::decide(&config, no_base);
 
     // Two files decide the relay and only one of them is the project's, so
     // resolve it once here: the image layer, the listener, and a reused
@@ -277,6 +399,7 @@ pub(crate) async fn run_with_runtime_with_providers(
             &lockfile,
             dev_home,
             relay.decision(),
+            ssh_alias,
             &mut pill,
         )
         .await;
@@ -353,7 +476,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         match container.state {
             ContainerState::Running if !rebuild && !has_port_overrides => {
                 return reuse_running_container(
-                    runtime, workspace, &config, &relay, container, dev_home, &mut pill,
+                    runtime, workspace, &config, &relay, container, dev_home, ssh_alias, &mut pill,
                 )
                 .await;
             }
@@ -405,6 +528,15 @@ pub(crate) async fn run_with_runtime_with_providers(
                 // A plain `dev down` deletes the Caddy fragment but leaves the
                 // container stopped, so restore the routes on restart (issue #52).
                 register_caddy_routes(workspace, &config);
+                register_ssh_alias(
+                    ssh_alias,
+                    dev_home,
+                    workspace,
+                    runtime,
+                    &container.id,
+                    user.as_deref(),
+                )
+                .await;
                 pill.succeeded(&format!("Container '{}' started", container.name));
                 println!("Container '{}' started.", container.name);
                 return Ok(());
@@ -807,6 +939,15 @@ pub(crate) async fn run_with_runtime_with_providers(
     {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
+    register_ssh_alias(
+        ssh_alias,
+        dev_home,
+        workspace,
+        runtime,
+        &container_id,
+        remote_user,
+    )
+    .await;
 
     Ok(())
 }
@@ -819,6 +960,7 @@ pub(crate) async fn run_with_runtime_with_providers(
 /// cannot exec into in the running state, so without the gate the first `dev
 /// up` fails honestly and every later one hands the user a green light for a
 /// container no command can run in.
+#[allow(clippy::too_many_arguments)]
 async fn reuse_running_container(
     runtime: &dyn ContainerRuntime,
     workspace: &Path,
@@ -826,6 +968,7 @@ async fn reuse_running_container(
     relay: &crate::ssh_agent::RelayConsent,
     container: &ContainerInfo,
     dev_home: &DevHome,
+    ssh_alias: SshAliasPlan,
     pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let user =
@@ -852,6 +995,15 @@ async fn reuse_running_container(
     // (renamed host, added port) has no other moment to reach Caddy, since a
     // running container never takes that path.
     register_caddy_routes(workspace, config);
+    register_ssh_alias(
+        ssh_alias,
+        dev_home,
+        workspace,
+        runtime,
+        &container.id,
+        user.as_deref(),
+    )
+    .await;
     pill.succeeded(&format!(
         "Container '{}' is already running",
         container.name
@@ -948,7 +1100,7 @@ fn validate_workspace_secrets(
     secrets_override: Option<&Path>,
     dev_home: &DevHome,
 ) -> anyhow::Result<ValidatedSecrets> {
-    let path = secrets_file_path(secrets_override, config_path)?;
+    let path = secrets_file_path_in(dev_home, secrets_override, config_path)?;
     Ok(validate_secrets_at(
         dev_home,
         path,
@@ -1688,6 +1840,7 @@ async fn run_compose(
     lockfile: &LockfilePolicy,
     dev_home: &DevHome,
     relay: crate::ssh_agent::RelayDecision,
+    ssh_alias: SshAliasPlan,
     pill: &mut StatusGuard,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
@@ -2071,6 +2224,15 @@ async fn run_compose(
     {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
+    register_ssh_alias(
+        ssh_alias,
+        dev_home,
+        workspace,
+        runtime,
+        &container_id,
+        remote_user,
+    )
+    .await;
 
     Ok(())
 }
@@ -3263,6 +3425,8 @@ mod tests {
         /// `printenv` reply — empty by default, since only the ssh-agent
         /// relay read-back cares what stdout says.
         exec_stdout: String,
+        /// The login-name lookup answers that the uid has no passwd entry.
+        login_lookup_fails: bool,
         /// Commands `exec` was asked to run, with the user each ran as, so the
         /// gate's probe is observable.
         execs: Arc<Mutex<Vec<ExecCall>>>,
@@ -3301,6 +3465,7 @@ mod tests {
                 exec_refusals_before_silence: None,
                 exec_exit_code: 0,
                 exec_stdout: String::new(),
+                login_lookup_fails: false,
                 execs: Arc::new(Mutex::new(Vec::new())),
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
@@ -3336,6 +3501,12 @@ mod tests {
         /// container environment.
         fn with_exec_stdout(mut self, stdout: impl Into<String>) -> Self {
             self.exec_stdout = stdout.into();
+            self
+        }
+
+        /// The `USER` the fake image reports, with no `remoteUser` over it.
+        fn with_image_user(self, user: &str) -> Self {
+            self.image_metadata.lock().unwrap().container_user = Some(user.to_string());
             self
         }
 
@@ -3631,6 +3802,7 @@ mod tests {
             let never_returns = self.exec_never_returns;
             let refusals_left = self.exec_refusals_before_silence.clone();
             let stdout = self.exec_stdout.clone();
+            let login_lookup_fails = self.login_lookup_fails && is_login_lookup(&cmd);
             let execs = self.execs.clone();
             Box::pin(async move {
                 // Session bookkeeping is `dev`'s own traffic. Recording it here
@@ -3669,6 +3841,13 @@ mod tests {
                     } else {
                         "exec failed (test-injected)".to_string()
                     }));
+                }
+                if login_lookup_fails {
+                    return Ok(ExecResult {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "no passwd entry for uid 1000".to_string(),
+                    });
                 }
                 Ok(ExecResult {
                     exit_code,
@@ -3937,6 +4116,34 @@ mod tests {
         .await
     }
 
+    /// [`run_up_in_dev_home`] with the base layer read from `dev_home`, or
+    /// skipped as `--no-base` skips it.
+    async fn run_up_with_base(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        dev_home: &DevHome,
+        no_base: bool,
+    ) -> anyhow::Result<()> {
+        let providers = ProviderRegistry::with_builtins(workspace.path());
+        super::run_with_runtime_with_providers(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* secrets_file */ None,
+            no_base,
+            /* secrets_override */ None,
+            &providers,
+            dev_home,
+            &Cmux::recording().0,
+        )
+        .await
+    }
+
     /// A `~/.dev/` whose base config grants the SSH agent relay, which is the
     /// only thing that lets a project's request take effect.
     fn dev_home_allowing_the_relay(dir: &TempDir) -> DevHome {
@@ -4146,6 +4353,7 @@ mod tests {
             &relay,
             &container,
             &dev_home,
+            super::SshAliasPlan::LeaveAlone,
             &mut pill,
         )
         .await
@@ -7212,5 +7420,278 @@ mod tests {
         assert!(!super::same_container("abc123", "xyz789"));
         assert!(!super::same_container("", "abc123"));
         assert!(!super::same_container("abc123", ""));
+    }
+
+    const SSH_ENABLED: &str = r#"{"image":"ubuntu:24.04","sshServer":{"enabled":true}}"#;
+    const SSH_DISABLED: &str = r#"{"image":"ubuntu:24.04"}"#;
+
+    /// `dev up` with the base layer read from `dev_home`.
+    async fn up_with_base(rt: &UpFakeRuntime, workspace: &TempDir, dev_home: &DevHome) {
+        run_up_with_base(rt, workspace, dev_home, false)
+            .await
+            .unwrap();
+    }
+
+    fn ssh_alias_text(dev_home: &DevHome, workspace: &TempDir) -> String {
+        let hash = crate::util::naming::workspace_hash(workspace.path());
+        fs::read_to_string(dev_home.ssh_alias_file(&hash)).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_writes_the_ssh_alias_when_enabled() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok()
+            .named_runtime("podman")
+            .already_running(workspace.path(), &config_path);
+
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        let alias = ssh_alias_text(&dev_home, &workspace);
+        assert!(alias.contains("\n  User root\n"), "{alias}");
+        let hash = crate::util::naming::workspace_hash(workspace.path());
+        let record = crate::ssh_server::read_workspace_record_in(&dev_home, &hash).unwrap();
+        assert_eq!(record.workspace, workspace.path());
+        assert_eq!(record.runtime.as_deref(), Some("podman"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_removes_a_stale_alias_when_disabled() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        up_with_base(&rt, &workspace, &dev_home).await;
+        let hash = crate::util::naming::workspace_hash(workspace.path());
+        assert!(dev_home.ssh_alias_file(&hash).exists());
+
+        write_project_config(&workspace, SSH_DISABLED);
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        assert!(!dev_home.ssh_alias_file(&hash).exists());
+        assert!(dev_home.ssh_workspace_record(&hash).exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_without_ssh_server_touches_nothing() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_DISABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        assert!(!dev_home.ssh_dir().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_no_base_leaves_a_base_enabled_alias_alone() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_DISABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        fs::create_dir_all(dev_home.base_config().parent().unwrap()).unwrap();
+        fs::write(dev_home.base_config(), r#"{"sshServer":{"enabled":true}}"#).unwrap();
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        up_with_base(&rt, &workspace, &dev_home).await;
+        let hash = crate::util::naming::workspace_hash(workspace.path());
+        let before = ssh_alias_text(&dev_home, &workspace);
+
+        run_up_with_base(&rt, &workspace, &dev_home, true)
+            .await
+            .unwrap();
+
+        assert_eq!(ssh_alias_text(&dev_home, &workspace), before);
+        assert!(dev_home.ssh_client_key(&hash).exists());
+        assert!(dev_home.ssh_host_key(&hash).exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_numeric_image_user_is_registered_by_its_login_name() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok()
+            .with_image_user("1000:1000")
+            .with_exec_stdout("node\n")
+            .already_running(workspace.path(), &config_path);
+
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        let alias = ssh_alias_text(&dev_home, &workspace);
+        assert!(alias.contains("\n  User node\n"), "{alias}");
+        let execs = rt.execs.lock().unwrap().clone();
+        assert!(
+            execs
+                .iter()
+                .any(|(cmd, ..)| *cmd == super::login_lookup_cmd("1000")),
+            "{execs:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_user_with_a_group_is_registered_without_a_lookup() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok()
+            .with_image_user("vscode:vscode")
+            .already_running(workspace.path(), &config_path);
+
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        let alias = ssh_alias_text(&dev_home, &workspace);
+        assert!(alias.contains("\n  User vscode\n"), "{alias}");
+        let execs = rt.execs.lock().unwrap().clone();
+        assert!(
+            execs.iter().all(|(cmd, ..)| !is_login_lookup(cmd)),
+            "{execs:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_uid_with_no_login_name_skips_the_alias_without_failing_up() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let mut rt = UpFakeRuntime::ok()
+            .with_image_user("1000")
+            .already_running(workspace.path(), &config_path);
+        rt.login_lookup_fails = true;
+
+        up_with_base(&rt, &workspace, &dev_home).await;
+
+        assert!(!dev_home.ssh_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_login_lookup_names_the_uid() {
+        let mut rt = UpFakeRuntime::ok();
+        rt.login_lookup_fails = true;
+
+        let err = super::ssh_login_name(&rt, "fake-id", "1000:1000")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "uid 1000 has no login name in the container, and sshd cannot log in a bare uid \
+             (passwd lookup: no passwd entry for uid 1000)"
+        );
+    }
+
+    /// The template lives only in the injected home, so reading the real
+    /// `~/.dev` would leave the recipe's build context unwritten.
+    #[tokio::test(start_paused = true)]
+    async fn up_materializes_a_recipe_from_the_injected_home() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("recipe.json"),
+            r#"{"globalTemplate": "dev-up-injected-only"}"#,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let template_dir = dev_home.global_template_dir("dev-up-injected-only");
+        fs::create_dir_all(&template_dir).unwrap();
+        fs::write(template_dir.join("devcontainer.json"), SSH_DISABLED).unwrap();
+        fs::write(template_dir.join("hello.sh"), "echo hello\n").unwrap();
+        let rt = UpFakeRuntime::ok();
+
+        run_up_with_base(&rt, &workspace, &dev_home, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(devcontainer_dir.join("hello.sh")).unwrap(),
+            "echo hello\n"
+        );
+    }
+
+    fn is_login_lookup(cmd: &[String]) -> bool {
+        cmd.get(3).is_some_and(|w| w == super::LOGIN_LOOKUP_ARGV0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_no_base_registers_an_alias_the_project_enables() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, SSH_ENABLED);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+
+        run_up_with_base(&rt, &workspace, &dev_home, true)
+            .await
+            .unwrap();
+
+        let alias = ssh_alias_text(&dev_home, &workspace);
+        assert!(alias.contains("\n  User root\n"), "{alias}");
+    }
+
+    /// Runs the lookup script in the host's own `sh`, with `PATH` holding
+    /// only `bin` and `passwd` standing in for `/etc/passwd`.
+    fn run_login_lookup(bin: &Path, passwd: &Path, uid: &str) -> std::process::Output {
+        let mut cmd = super::login_lookup_cmd(uid);
+        cmd.push(passwd.display().to_string());
+        std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .env("PATH", bin)
+            .output()
+            .unwrap()
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\nnode:x:1000:1000::/home/node:/bin/sh\nlast:x:1001:1001::/home/last:/bin/sh";
+
+    #[test]
+    fn the_login_lookup_reads_the_passwd_file_without_getent() {
+        let tmp = TempDir::new().unwrap();
+        let passwd = tmp.path().join("passwd");
+        fs::write(&passwd, PASSWD).unwrap();
+
+        let found = run_login_lookup(tmp.path(), &passwd, "1000");
+        assert_eq!(String::from_utf8_lossy(&found.stdout), "node\n");
+        // The last line has no newline, as a hand-edited file may not.
+        let last = run_login_lookup(tmp.path(), &passwd, "1001");
+        assert_eq!(String::from_utf8_lossy(&last.stdout), "last\n");
+
+        let missing = run_login_lookup(tmp.path(), &passwd, "4242");
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(missing.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&missing.stderr),
+            "no passwd entry for uid 4242\n"
+        );
+    }
+
+    #[test]
+    fn the_login_lookup_asks_getent_first() {
+        let tmp = TempDir::new().unwrap();
+        let passwd = tmp.path().join("passwd");
+        fs::write(&passwd, PASSWD).unwrap();
+        write_executable(
+            &tmp.path().join("getent"),
+            "#!/bin/sh\n[ \"$1 $2\" = 'passwd 1000' ] && echo 'ldapuser:*:1000:1000::/home/l:/bin/sh'\n",
+        );
+
+        let found = run_login_lookup(tmp.path(), &passwd, "1000");
+        assert_eq!(String::from_utf8_lossy(&found.stdout), "ldapuser\n");
+        // getent knowing nothing falls through to the file.
+        let fallback = run_login_lookup(tmp.path(), &passwd, "1001");
+        assert_eq!(String::from_utf8_lossy(&fallback.stdout), "last\n");
     }
 }

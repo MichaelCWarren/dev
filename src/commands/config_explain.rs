@@ -478,6 +478,35 @@ mod tests {
         assert_eq!(report.config["cmux"]["status"], true);
     }
 
+    #[test]
+    fn explain_reports_ssh_server_sub_key_origins() {
+        for (project, origin, enabled) in [
+            (
+                r#"{"image": "ubuntu:24.04", "sshServer": {"enabled": false}}"#,
+                LayerId::Project,
+                false,
+            ),
+            (r#"{"image": "ubuntu:24.04"}"#, LayerId::Base, true),
+        ] {
+            let home = TempDir::new().unwrap();
+            let workspace = TempDir::new().unwrap();
+            let dev_home = DevHome::at(home.path());
+            write(
+                &dev_home.base_config(),
+                r#"{"sshServer": {"enabled": true}}"#,
+            );
+            write(
+                &workspace.path().join(".devcontainer/devcontainer.json"),
+                project,
+            );
+
+            let report = explain(&dev_home, workspace.path(), "docker", true).unwrap();
+
+            assert_eq!(report.origins["sshServer.enabled"], origin, "{project}");
+            assert_eq!(report.config["sshServer"]["enabled"], enabled, "{project}");
+        }
+    }
+
     /// A base-layer selector losing to the project's is reported as dropped,
     /// not silently absent.
     #[test]

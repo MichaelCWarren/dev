@@ -1,0 +1,8 @@
+{
+  "id": "ssh-server",
+  "version": "1.0.0",
+  "name": "ssh server",
+  "description": "Installs OpenSSH's server for dev's per-connection sshd -i. Leaves no host key in the image and runs no daemon.",
+  "documentationURL": "https://github.com/squirrelsoft-dev/dev/blob/main/features/ssh-server/README.md",
+  "options": {}
+}

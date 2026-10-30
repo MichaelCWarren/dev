@@ -36,6 +36,30 @@
   cache-hit path by `features_from_metadata` (both `src/devcontainer/features.rs`). The label's
   Dockerfile escaping must be `\$` — `$$` is Compose syntax and Docker's builder strips the
   dollar, corrupting `${devcontainerId}` mounts.
+- The `ssh-server` feature deletes `/etc/ssh/ssh_host_*` inside its own `install.sh`, because a
+  separate `RUN` would leave the keys in a layer. `installsAfter` matches exact resolved ids,
+  which is why the embedded features declare none. Its OpenSSH 8.7 gate exists because session
+  env travels as `SetEnv`.
+- `sshServer` (`src/ssh_server.rs`, `src/ssh_server/`) is a `MAP_FIELDS` key the base layer may
+  enable, so do not copy `reject_base_relay_key`. `dev up` writes `~/.dev/ssh/config.d/<hash>`
+  (`ProxyCommand ... ssh-proxy --workspace-hash`); `workspace.json` survives `down --remove` so
+  the alias name stays stable, and so does the hint marker `~/.dev/ssh/hinted/<hash>` because
+  the T3 environment survives it too.
+- sshd builds a fresh environment, so ssh-proxy carries the session env as one `SetEnv` line in
+  its `/dev/shm` sshd config (`sshd_config.rs`); env on the exec never reaches the session.
+  `StrictModes no` is needed because `/dev/shm` is 1777. Keep sshd's stderr out of the raw exec's
+  stdout or the protocol corrupts. ssh-proxy never starts a container (exit 255 at once).
+- The `/dev/shm` session dir (host key, secrets) is removed only by the container shell's own
+  trap, never from the host: an exec outlives the host process that started it, so host-side
+  `rm` races setup however it is timed. Three review rounds proved that. sshd runs backgrounded
+  plus `wait` because a trapped signal does not interrupt a foreground child. The traps go in
+  before `mkdir` (dash and busybox ash die of an untrapped signal without running the EXIT trap),
+  with a `made` flag so a pre-existing dir is never removed, and `stop` kills `$!`, never a pid
+  assigned after the fork. When ssh-proxy
+  dies the runtime closes the exec's stdin and sshd's EOF ends the session.
+- The `ssh server` row of `dev status` runs host `ssh -F <alias file>`, never the user's
+  `~/.ssh/config`, so it does not prove the `Include` line exists. It is the last row, after
+  cmux relay. T3's `dev-t3-${devcontainerId}` volume lives in the user's base config, not `dev`.
 - `merge_layer_tracked`/`Provenance` in `src/devcontainer/merge.rs` IS the production merge
   (`dev config explain` records origins through it); the untracked `merge_layer(s)` wrappers are
   `#[cfg(test)]` reference implementations. Instrument new merge strategies there or explain drifts.
