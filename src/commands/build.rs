@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux};
-use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
+use crate::devcontainer::compose::{compose_recipe_config_in, materialize_recipe_directory_in};
 use crate::devcontainer::effective::{
-    LockfilePolicy, effective_config_from_parts, load_effective_config,
+    LockfilePolicy, effective_config_from_parts, load_effective_config_in,
 };
 use crate::devcontainer::features::{
     feature_image_tag, generate_feature_dockerfile_with_opts, order_features,
@@ -13,7 +13,8 @@ use crate::devcontainer::uid;
 use crate::devcontainer::{Recipe, download_features, resolve_features_in, stage_feature_context};
 use crate::runtime::{detect_runtime, resolve_remote_user};
 use crate::util::paths::DevHome;
-use crate::util::{ConfigSource, container_name, find_config_source, workspace_folder_name};
+use crate::util::workspace::find_config_source_in;
+use crate::util::{ConfigSource, container_name, workspace_folder_name};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -39,6 +40,7 @@ pub async fn run(
         update_remote_user_uid_default,
         no_base,
         &cmux,
+        &DevHome::current(),
     )
     .await
 }
@@ -57,15 +59,21 @@ pub(crate) async fn run_with_runtime(
     update_remote_user_uid_default: &str,
     no_base: bool,
     cmux: &Cmux,
+    dev_home: &DevHome,
 ) -> anyhow::Result<()> {
     let host_access = runtime.host_access();
-    let (config_path, recipe_config) = match find_config_source(workspace)? {
+    let (config_path, recipe_config) = match find_config_source_in(dev_home, workspace)? {
         ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            materialize_recipe_directory(&recipe_path, &recipe)?;
-            let composed =
-                compose_recipe_config(&recipe_path, &recipe, runtime.runtime_name(), !no_base)?;
+            materialize_recipe_directory_in(dev_home, &recipe_path, &recipe)?;
+            let composed = compose_recipe_config_in(
+                dev_home,
+                &recipe_path,
+                &recipe,
+                runtime.runtime_name(),
+                !no_base,
+            )?;
             (composed.config_path.clone(), Some(composed))
         }
     };
@@ -76,7 +84,7 @@ pub(crate) async fn run_with_runtime(
         Some(recipe_config) => {
             effective_config_from_parts(recipe_config.value, recipe_config.base_feature_ids)?
         }
-        None => load_effective_config(&config_path, !no_base)?,
+        None => load_effective_config_in(dev_home, &config_path, !no_base)?,
     };
     let lockfile = LockfilePolicy::new(&effective, frozen_lockfile);
     let config = effective.config;
@@ -84,12 +92,11 @@ pub(crate) async fn run_with_runtime(
 
     // The relay's shim is an image layer, so the permission decides what gets
     // built here as much as it decides whether a daemon runs in `dev up`.
-    let dev_home = DevHome::current();
-    let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, &dev_home);
+    let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, dev_home);
     relay.report();
 
     let folder_image = container_name(workspace);
-    let features = resolve_features_in(&config, &dev_home, relay.decision())?;
+    let features = resolve_features_in(&config, dev_home, relay.decision())?;
     let has_features = !features.is_empty();
     let default_tag = if has_features {
         feature_image_tag(&folder_image, &config, &features)
@@ -593,6 +600,7 @@ mod tests {
             update_remote_user_uid_default,
             /* no_base */ true,
             cmux,
+            &crate::util::paths::DevHome::at(workspace.path().join("dev-home")),
         )
         .await
     }

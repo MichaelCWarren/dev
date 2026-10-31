@@ -19,6 +19,7 @@ pub mod file;
 pub mod provider;
 pub mod providers;
 pub mod reference;
+pub mod up_store;
 pub mod validate;
 
 #[allow(unused_imports)]
@@ -33,7 +34,7 @@ pub use provider::{
     SecretProvider,
 };
 #[allow(unused_imports)]
-pub use reference::SecretRef;
+pub use reference::{ResolveTime, SecretRef};
 #[allow(unused_imports)]
 pub use validate::{ValidatedSecrets, validate_secrets_at, validate_secrets_for_config};
 
@@ -91,6 +92,30 @@ impl std::fmt::Display for SecretValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(REDACTED)
     }
+}
+
+/// Exposing inside a test double is the only way to prove a value arrived.
+#[cfg(test)]
+pub(crate) fn expose(env: &[(String, SecretValue)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(key, value)| (key.clone(), value.expose().to_string()))
+        .collect()
+}
+
+/// A `secrets.json` declaring each `(key, resolve)` pair against the `fake`
+/// provider.
+#[cfg(test)]
+pub(crate) fn secrets_json(entries: &[(&str, &str)]) -> String {
+    let body: Vec<String> = entries
+        .iter()
+        .map(|(key, time)| {
+            format!(
+                r#""{key}":{{"provider":"fake","ref":"{}","resolve":"{time}"}}"#,
+                key.to_lowercase()
+            )
+        })
+        .collect();
+    format!(r#"{{"version":1,"secrets":{{{}}}}}"#, body.join(","))
 }
 
 #[cfg(test)]

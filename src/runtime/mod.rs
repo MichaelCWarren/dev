@@ -446,7 +446,7 @@ pub trait ContainerRuntime: Send + Sync {
     fn container_env(&self, _id: &str) -> BoxFut<'_, Vec<String>> {
         let name = self.runtime_name();
         Box::pin(async move {
-            Err(DevError::Runtime(format!(
+            Err(DevError::Unsupported(format!(
                 "reading a container's environment is not supported by the {name} runtime"
             )))
         })

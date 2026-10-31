@@ -99,7 +99,10 @@ mod tests {
 
     #[test]
     fn test_find_config_missing() {
-        let result = find_config_source(Path::new("/nonexistent/path"));
+        let result = find_config_source_in(
+            &DevHome::at("/nonexistent/dev-home"),
+            Path::new("/nonexistent/path"),
+        );
         assert!(result.is_err());
     }
 
@@ -115,7 +118,12 @@ mod tests {
         )
         .unwrap();
 
-        match find_config_source(workspace.path()).unwrap() {
+        match find_config_source_in(
+            &DevHome::at(workspace.path().join("dev-home")),
+            workspace.path(),
+        )
+        .unwrap()
+        {
             ConfigSource::Recipe(path) => assert_eq!(path, recipe_path),
             other => panic!("expected workspace recipe source, got {other:?}"),
         }
@@ -129,7 +137,11 @@ mod tests {
         fs::write(devcontainer_dir.join("recipe.json"), "{}").unwrap();
         fs::write(devcontainer_dir.join("devcontainer.json"), "{}").unwrap();
 
-        let err = find_config_source(workspace.path()).unwrap_err();
+        let err = find_config_source_in(
+            &DevHome::at(workspace.path().join("dev-home")),
+            workspace.path(),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("both"),
@@ -145,7 +157,12 @@ mod tests {
         let direct = devcontainer_dir.join("devcontainer.json");
         fs::write(&direct, "{}").unwrap();
 
-        match find_config_source(workspace.path()).unwrap() {
+        match find_config_source_in(
+            &DevHome::at(workspace.path().join("dev-home")),
+            workspace.path(),
+        )
+        .unwrap()
+        {
             ConfigSource::Direct(path) => assert_eq!(path, direct),
             other => panic!("expected direct source, got {other:?}"),
         }

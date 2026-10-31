@@ -449,9 +449,10 @@ Compose implementation supports them.
 ## Secrets
 
 `dev` can fetch secret values itself and inject them into the container. A
-`secrets.json` beside your devcontainer config holds *references* — a provider
-name and a locator — and never values, so nothing has to be exported in your
-shell and `dev` never writes a resolved value to disk.
+`secrets.json` beside your devcontainer config holds *references*, a provider name
+and a locator, and never values, so nothing has to be exported in your shell. `dev`
+never writes a resolved value to the host's disk. An `up` value sits in a tmpfs
+inside the container, which is memory, not disk.
 
 ```json
 {
@@ -469,14 +470,22 @@ Five providers are built in: `env`, `file`, `op` (1Password), `keychain`
 Two `dev up` flags. `--secrets <path>` reads references from somewhere else
 instead of the sidecar; it replaces the sidecar and never merges with it.
 `--secrets-file <path>` takes a flat JSON map of literal values, for
-`devcontainers/cli` compatibility. `dev exec` and `dev shell` re-resolve the
-sidecar on every invocation, so a rotated secret reaches the next command with
-no rebuild.
+`devcontainers/cli` compatibility. `dev exec`, `dev shell` and ssh sessions
+re-resolve the sidecar's `exec` entries on every invocation, so a rotated one
+reaches the next command with no rebuild.
 
-Create-time secret values are readable through `docker inspect` — that is
-inherent to environment variables, and `createTime: false` is the way out. It is
-also what Docker Compose projects use: Compose creates containers through
-`docker compose up`, so it takes exec-time secrets and refuses create-time ones.
+Each secret has a resolve time, set with `"resolve"`:
+
+- `create` values go in the container's environment when `dev up` creates the
+  container. They are readable through `docker inspect`.
+- `up` values are resolved on each `dev up` and kept in a root-only tmpfs store
+  in the container, one per workspace. They stay out of `docker inspect`. A
+  `dev up` that declares no `up` values clears the workspace's store.
+- `exec` values are resolved for each `dev exec`, `dev shell` or ssh session.
+
+Docker Compose takes `up` and `exec` values. It refuses a project `create` value,
+because Compose creates containers through `docker compose up`. A base `create`
+value becomes `up` with a warning.
 
 See [docs/secrets.md](docs/secrets.md) for the full reference.
 

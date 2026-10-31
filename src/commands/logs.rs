@@ -16,8 +16,9 @@ pub async fn run(
     follow: bool,
     tail: Option<u32>,
 ) -> anyhow::Result<()> {
+    let dev_home = DevHome::current();
     let mut out = tokio::io::stdout();
-    print_hook_log(&DevHome::current(), workspace, &mut out).await?;
+    print_hook_log(&dev_home, workspace, &mut out).await?;
     if hooks_only {
         return Ok(());
     }
@@ -25,7 +26,7 @@ pub async fn run(
     let runtime = detect_runtime(runtime_override).await?;
 
     if let Some((config_path, config)) =
-        load_workspace_config_or_warn(workspace, runtime.runtime_name())
+        load_workspace_config_or_warn(&dev_home, workspace, runtime.runtime_name())
         && config.is_compose()
     {
         return run_compose_logs(

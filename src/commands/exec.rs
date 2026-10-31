@@ -1,13 +1,18 @@
 use std::path::Path;
 
 use crate::devcontainer::compose::load_workspace_config_or_warn;
+use crate::devcontainer::config::DevcontainerConfig;
+use crate::devcontainer::secrets::up_store::read_up_store;
 use crate::devcontainer::secrets::validate::validate_secrets_for_config;
-use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
+use crate::devcontainer::secrets::{
+    ProviderRegistry, ResolveTime, SecretRef, SecretValue, ValidatedSecrets,
+};
 use crate::error::DevError;
 use crate::runtime::{
     ContainerRuntime, ExecResult, detect_runtime, find_running_container, resolve_remote_user,
 };
 use crate::session::{self, SessionKind};
+use crate::util::naming::workspace_hash;
 use crate::util::paths::DevHome;
 use crate::util::workspace_folder_name;
 
@@ -46,7 +51,7 @@ pub(crate) async fn run_with_runtime(
 
     // Use explicit --user flag, falling back to remoteUser from config or image metadata
     let (config_path, config) =
-        load_workspace_config_or_warn(workspace, runtime.runtime_name()).unzip();
+        load_workspace_config_or_warn(dev_home, workspace, runtime.runtime_name()).unzip();
 
     let resolved_user = if user.is_some() {
         user.map(|u| u.to_string())
@@ -66,10 +71,12 @@ pub(crate) async fn run_with_runtime(
     // Before the sweep, so a bad reference leaves the container exactly as it
     // was found, and after the container lookup, so a workspace with nothing
     // running never costs a provider prompt.
-    let secrets = resolve_exec_secrets(
+    let secrets = session_secrets(
+        runtime,
+        &container.id,
         config_path.as_deref(),
+        config.as_ref(),
         workspace,
-        config.as_ref().and_then(|c| c.remote_user.as_deref()),
         registry,
         dev_home,
     )
@@ -117,28 +124,102 @@ pub(crate) async fn run_with_runtime(
     Ok(())
 }
 
-/// Resolve this workspace's secrets for one exec.
+/// The secrets one exec, shell or ssh session carries, by when they resolve.
 ///
-/// Every `dev exec` and `dev shell` pays one provider round trip. Dev keeps no
-/// cache of its own, so a rotated secret reaches the next command without a
-/// recreate. Providers cache their own sessions, which is what makes that
-/// affordable. Values live for the length of this command and are dropped.
-///
-/// `createTime` is not read here. It governs create-time injection only, so a
-/// secret kept out of `docker inspect` still reaches an exec.
-pub(crate) async fn resolve_exec_secrets(
+/// `exec` values go through their providers every time, so a rotated secret
+/// reaches the next command without a recreate. `up` values are read from the
+/// in-container store the latest `dev up` wrote, with no provider call.
+/// `create` values are already in the container env and are not touched.
+/// Values live for the length of this command and are dropped.
+pub(crate) async fn session_secrets(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
     config_path: Option<&Path>,
+    config: Option<&DevcontainerConfig>,
     workspace: &Path,
-    remote_user: Option<&str>,
     registry: &ProviderRegistry,
     dev_home: &DevHome,
 ) -> Result<Vec<(String, SecretValue)>, DevError> {
-    let Some(config_path) = config_path else {
+    let (Some(config_path), Some(config)) = (config_path, config) else {
         return Ok(Vec::new());
     };
-    let secrets =
-        validate_secrets_for_config(dev_home, config_path, workspace, remote_user, registry)?;
-    registry.resolve_all(secrets.entries()).await
+    let secrets = validate_secrets_for_config(
+        dev_home,
+        config_path,
+        workspace,
+        config.remote_user.as_deref(),
+        config.is_compose(),
+        registry,
+    )?;
+    // The store is checked first so a missing `up` key costs no provider prompt.
+    let store_key = workspace_hash(workspace);
+    let up = read_up_values(runtime, container_id, &store_key, &secrets).await?;
+    crate::commands::print_warnings(&mut std::io::stderr(), up.warning);
+    let mut values = up.values;
+    values.extend(resolve_exec_values(registry, &secrets).await?);
+    Ok(values)
+}
+
+/// The `up` values a session read, and the warning it owes the user, if any.
+struct UpValues {
+    values: Vec<(String, SecretValue)>,
+    warning: Option<String>,
+}
+
+/// A store that cannot be read at all only fails the command when a required
+/// key was wanted from it; optional keys are left out with a warning for the
+/// caller to print.
+async fn read_up_values(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    store_key: &str,
+    secrets: &ValidatedSecrets,
+) -> Result<UpValues, DevError> {
+    let keys: Vec<String> = secrets
+        .entries_at(ResolveTime::Up)
+        .map(|r| r.key().to_string())
+        .collect();
+    let read = match read_up_store(runtime, container_id, store_key, &keys).await {
+        Ok(read) => read,
+        Err(e) if secrets.entries_at(ResolveTime::Up).all(|r| r.optional()) => {
+            return Ok(UpValues {
+                values: Vec::new(),
+                warning: Some(unreadable_store_warning(&keys, &e)),
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let required_missing: Vec<&str> = secrets
+        .entries_at(ResolveTime::Up)
+        .filter(|r| !r.optional() && read.missing.iter().any(|m| m == r.key()))
+        .map(|r| r.key())
+        .collect();
+    if !required_missing.is_empty() {
+        return Err(DevError::UpSecretsNotStored(format!(
+            "secret(s) {} resolve at `dev up` but are not stored in this container; \
+             run `dev up` to store them",
+            required_missing.join(", ")
+        )));
+    }
+    Ok(UpValues {
+        values: read.found,
+        warning: None,
+    })
+}
+
+fn unreadable_store_warning(keys: &[String], error: &DevError) -> String {
+    format!(
+        "Warning: could not read the `up` secret store, so optional secret(s) {} are left out: {error}",
+        keys.join(", ")
+    )
+}
+
+async fn resolve_exec_values(
+    registry: &ProviderRegistry,
+    secrets: &ValidatedSecrets,
+) -> Result<Vec<(String, SecretValue)>, DevError> {
+    let entries: Vec<SecretRef> = secrets.entries_at(ResolveTime::Exec).cloned().collect();
+    registry.resolve_all(&entries).await
 }
 
 /// How a `dev exec` ended.
@@ -330,8 +411,10 @@ fn reports_missing_shell(result: &ExecResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::run_with_runtime;
-    use crate::devcontainer::secrets::SecretValue;
     use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
+    use crate::devcontainer::secrets::up_store::{FakeUpStore, is_up_store_exec, up_store_key};
+    use crate::devcontainer::secrets::validate::with_base;
+    use crate::devcontainer::secrets::{SecretValue, expose, secrets_json};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
@@ -364,6 +447,7 @@ mod tests {
         /// Which of the two shapes that takes: an API error, or an accepted
         /// exec reporting the start failure as status 127.
         shell_missing_as_status: bool,
+        store: FakeUpStore,
     }
 
     impl ExecFakeRuntime {
@@ -381,7 +465,18 @@ mod tests {
                 execs: Arc::new(Mutex::new(Vec::new())),
                 without_a_shell: false,
                 shell_missing_as_status: false,
+                store: FakeUpStore::default(),
             }
+        }
+
+        fn storing(mut self, pairs: &[(&str, &str)]) -> Self {
+            self.store = FakeUpStore::storing(pairs);
+            self
+        }
+
+        fn with_an_unreadable_store(mut self) -> Self {
+            self.store = FakeUpStore::unreadable();
+            self
         }
 
         fn without_a_shell(mut self) -> Self {
@@ -400,9 +495,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(cmd, ..)| !crate::session::is_session_machinery(cmd))
+                .filter(|(cmd, ..)| {
+                    !crate::session::is_session_machinery(cmd) && !is_up_store_exec(cmd)
+                })
                 .cloned()
                 .collect()
+        }
+
+        /// Reads of the in-container up store, which are not the user's command.
+        fn store_reads(&self) -> Vec<ExecCall> {
+            FakeUpStore::reads(&self.execs.lock().unwrap(), |call| &call.0)
         }
 
         /// `dev`'s own bookkeeping execs, which must carry no secret.
@@ -475,12 +577,11 @@ mod tests {
                 cmd.to_vec(),
                 user.map(str::to_string),
                 workdir.map(str::to_string),
-                // Exposing inside a test double is the only way to prove the
-                // value arrived. Production code never does this.
-                env.iter()
-                    .map(|(key, value)| (key.clone(), value.expose().to_string()))
-                    .collect(),
+                expose(env),
             ));
+            if let Some(reply) = self.store.answer(cmd) {
+                return Box::pin(async move { Ok(reply) });
+            }
             let no_shell = self.without_a_shell && cmd.first().is_some_and(|arg| arg == "/bin/sh");
             let as_status = self.shell_missing_as_status;
             Box::pin(async move {
@@ -780,8 +881,10 @@ mod tests {
         assert_eq!(execs[1].0, words(&["cargo", "test"]));
     }
 
-    const TWO_SECRETS: &str =
-        r#"{"version":1,"secrets":{"TOKEN":"fake://token","API_KEY":"fake://api"}}"#;
+    const TWO_SECRETS: &str = r#"{"version":1,"secrets":{
+        "TOKEN":{"provider":"fake","ref":"token","resolve":"exec"},
+        "API_KEY":{"provider":"fake","ref":"api","resolve":"exec"}
+    }}"#;
 
     fn answers() -> FakeProvider {
         FakeProvider::answering(&[("TOKEN", "hunter2"), ("API_KEY", "s3cret")])
@@ -841,10 +944,10 @@ mod tests {
         assert_eq!(provider.calls(), 1);
     }
 
-    /// `createTime` governs the create path only. A secret marked false is
-    /// exec-time only, which is how it stays out of `docker inspect`.
+    /// Legacy `createTime: false` means `exec`: fetched for each command, which
+    /// is how it stays out of `docker inspect`.
     #[tokio::test]
-    async fn a_secret_marked_create_time_false_still_reaches_an_exec() {
+    async fn a_secret_marked_create_time_false_resolves_at_exec() {
         let (workspace, config_path) = workspace_with_secrets(
             r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"token","createTime":false}}}"#,
         );
@@ -915,8 +1018,8 @@ mod tests {
     async fn an_optional_secret_that_fails_is_omitted() {
         let (workspace, config_path) = workspace_with_secrets(
             r#"{"version":1,"secrets":{
-                "TOKEN":{"provider":"fake","ref":"token","optional":true},
-                "API_KEY":"fake://api"
+                "TOKEN":{"provider":"fake","ref":"token","optional":true,"resolve":"exec"},
+                "API_KEY":{"provider":"fake","ref":"api","resolve":"exec"}
             }}"#,
         );
         let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
@@ -990,8 +1093,8 @@ mod tests {
         }
     }
 
-    /// Dev keeps no cache of its own, which is what lets a rotated secret reach
-    /// the next command without a recreate.
+    /// Dev keeps no cache of its own for `exec` secrets, which is what lets a
+    /// rotated one reach the next command without a recreate.
     #[tokio::test]
     async fn nothing_is_remembered_between_invocations() {
         let (workspace, config_path) = workspace_with_secrets(TWO_SECRETS);
@@ -1013,6 +1116,286 @@ mod tests {
         }
 
         assert_eq!(provider.calls(), 2);
+    }
+
+    async fn run_command(
+        workspace: &Path,
+        runtime: &ExecFakeRuntime,
+        provider: &FakeProvider,
+    ) -> anyhow::Result<()> {
+        run_with_runtime(
+            workspace,
+            runtime,
+            None,
+            &words(&["cargo", "test"]),
+            &registry_with(workspace, provider.clone()),
+            &DevHome::at(workspace.join("dev-home")),
+        )
+        .await
+    }
+
+    fn from_provider() -> FakeProvider {
+        FakeProvider::answering(&[("TOKEN", "from-provider")])
+    }
+
+    fn pair(key: &str, value: &str) -> (String, String) {
+        (key.to_string(), value.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_create_secret_is_neither_resolved_nor_read() {
+        let (workspace, config_path) =
+            workspace_with_secrets(&secrets_json(&[("TOKEN", "create")]));
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(provider.calls(), 0);
+        assert!(runtime.store_reads().is_empty());
+        assert!(runtime.execs()[0].3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_up_secret_is_read_from_the_store_not_resolved() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[("TOKEN", "up")]));
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "from-store")]);
+        let provider = from_provider();
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(provider.calls(), 0);
+        let reads = runtime.store_reads();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].1.as_deref(), Some("root"));
+        assert!(reads[0].3.is_empty());
+        assert_eq!(runtime.execs()[0].3, vec![pair("TOKEN", "from-store")]);
+    }
+
+    #[tokio::test]
+    async fn an_exec_secret_is_resolved_for_this_command() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[("TOKEN", "exec")]));
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(provider.calls(), 1);
+        assert!(runtime.store_reads().is_empty());
+        assert_eq!(runtime.execs()[0].3, vec![pair("TOKEN", "from-provider")]);
+    }
+
+    #[tokio::test]
+    async fn one_workspace_with_all_three_times_resolves_only_the_exec_key() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[
+            ("C", "create"),
+            ("U", "up"),
+            ("E", "exec"),
+        ]));
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("U", "from-store")]);
+        let provider = FakeProvider::answering(&[
+            ("C", "c-provider"),
+            ("U", "u-provider"),
+            ("E", "e-provider"),
+        ]);
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(provider.batch_keys(), vec![vec!["E".to_string()]]);
+        assert_eq!(runtime.store_reads().len(), 1);
+        assert_eq!(
+            runtime.execs()[0].3,
+            vec![pair("U", "from-store"), pair("E", "e-provider")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_up_secret_missing_from_the_store_stops_the_command() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[
+            ("TOKEN", "up"),
+            ("API_KEY", "up"),
+            ("E", "exec"),
+        ]));
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path).storing(&[]);
+        let provider = FakeProvider::answering(&[("E", "e-provider")]);
+
+        let err = run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect_err("a required up secret that is not stored fails the command");
+
+        let message = err.to_string();
+        assert!(message.contains("TOKEN, API_KEY"), "{message}");
+        assert!(message.contains("dev up"), "{message}");
+        assert_eq!(provider.calls(), 0);
+        assert!(runtime.execs().is_empty());
+        assert!(!runtime.was_swept());
+    }
+
+    #[tokio::test]
+    async fn an_optional_up_secret_missing_from_the_store_is_omitted() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{
+                "TOKEN":{"provider":"fake","ref":"token","resolve":"up","optional":true},
+                "API_KEY":{"provider":"fake","ref":"api_key","resolve":"up"}
+            }}"#,
+        );
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("API_KEY", "from-store")]);
+
+        run_command(workspace.path(), &runtime, &from_provider())
+            .await
+            .expect("an optional up secret that is not stored is not fatal");
+
+        assert_eq!(runtime.execs()[0].3, vec![pair("API_KEY", "from-store")]);
+    }
+
+    #[tokio::test]
+    async fn a_stored_key_the_config_does_not_declare_as_up_is_not_injected() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[("TOKEN", "up")]));
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "from-store"), ("OTHER", "leaked")]);
+
+        run_command(workspace.path(), &runtime, &from_provider())
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(runtime.execs()[0].3, vec![pair("TOKEN", "from-store")]);
+    }
+
+    #[tokio::test]
+    async fn the_store_is_read_under_the_workspaces_own_key() {
+        let (workspace, config_path) = workspace_with_secrets(&secrets_json(&[("TOKEN", "up")]));
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "from-store")]);
+
+        run_command(workspace.path(), &runtime, &from_provider())
+            .await
+            .expect("dev exec should run the command");
+
+        let reads = runtime.store_reads();
+        let expected = crate::util::naming::workspace_hash(workspace.path());
+        assert_eq!(up_store_key(&reads[0].0), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_leaves_out_optional_up_keys() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{
+                "TOKEN":{"provider":"fake","ref":"token","resolve":"up","optional":true},
+                "E":{"provider":"fake","ref":"e","resolve":"exec"}
+            }}"#,
+        );
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).with_an_unreadable_store();
+        let provider = FakeProvider::answering(&[("E", "e-provider")]);
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("an unreadable store costs only optional up keys");
+
+        assert_eq!(runtime.store_reads().len(), 1);
+        assert_eq!(runtime.execs()[0].3, vec![pair("E", "e-provider")]);
+    }
+
+    #[tokio::test]
+    async fn the_unreadable_store_warning_carries_the_read_error() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{
+                "TOKEN":{"provider":"fake","ref":"token","resolve":"up","optional":true}
+            }}"#,
+        );
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).with_an_unreadable_store();
+        let secrets = crate::devcontainer::secrets::validate::validate_secrets_for_config(
+            &DevHome::at(workspace.path().join("dev-home")),
+            &config_path,
+            workspace.path(),
+            None,
+            false,
+            &registry_with(workspace.path(), from_provider()),
+        )
+        .unwrap();
+
+        let up = super::read_up_values(&runtime, "container-id", "ab12", &secrets)
+            .await
+            .expect("only an optional key was wanted");
+
+        assert!(up.values.is_empty());
+        let warning = up.warning.expect("a warning");
+        assert!(
+            warning.starts_with("Warning: could not read the `up` secret store"),
+            "{warning}"
+        );
+        assert!(warning.contains("TOKEN"), "{warning}");
+        assert!(
+            warning.contains("(exit 1): od is missing in this container"),
+            "the read's own error, verbatim: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_fails_a_required_up_key() {
+        let (workspace, config_path) = workspace_with_secrets(
+            r#"{"version":1,"secrets":{
+                "TOKEN":{"provider":"fake","ref":"token","resolve":"up","optional":true},
+                "API_KEY":{"provider":"fake","ref":"api_key","resolve":"up"}
+            }}"#,
+        );
+        let runtime =
+            ExecFakeRuntime::running_for(workspace.path(), &config_path).with_an_unreadable_store();
+
+        let err = run_command(workspace.path(), &runtime, &from_provider())
+            .await
+            .expect_err("a required up key needs a readable store");
+
+        assert!(err.to_string().contains("od is missing"), "{err}");
+        assert!(runtime.execs().is_empty());
+    }
+
+    /// A Compose workspace with no `secrets.json` of its own, under a base file
+    /// declaring `TOKEN` at `create`.
+    fn compose_workspace_with_base_create_token() -> (TempDir, std::path::PathBuf) {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+        let config_path = devcontainer_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","workspaceFolder":"/app"}"#,
+        )
+        .unwrap();
+        with_base(workspace.path(), &secrets_json(&[("TOKEN", "create")]));
+        (workspace, config_path)
+    }
+
+    /// `dev up` stores a base `create` key for Compose, so the reader has to
+    /// look for it there too and not in an env Compose never set.
+    #[tokio::test]
+    async fn a_compose_base_create_secret_is_read_from_the_store() {
+        let (workspace, config_path) = compose_workspace_with_base_create_token();
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "from-store")]);
+        let provider = from_provider();
+
+        run_command(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev exec should run the command");
+
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(runtime.store_reads().len(), 1);
+        assert_eq!(runtime.execs()[0].3, vec![pair("TOKEN", "from-store")]);
     }
 
     /// Falling back runs the command again, so the only thing that may trigger

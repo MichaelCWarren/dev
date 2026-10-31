@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stands in for a secret provider's CLI while the stop hook runs tests, so a test that
+# leaks to the developer's real ~/.dev fails instead of raising a Touch ID prompt.
+echo "$(basename "$0"): blocked in tests by .claude/hooks/no-provider-bin" >&2
+exit 1

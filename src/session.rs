@@ -599,6 +599,16 @@ for pid in $leaders; do [ -d "/proc/$pid" ] || rm -f "/tmp/.dev-session-$pid"; d
 echo "reaped=$reaped"
 "#;
 
+/// A shell line that stops a script unless the mount table at `$mounts` shows
+/// `/dev/shm` as a tmpfs, exiting `exit_code` with `refusal` after the reason.
+/// Whatever follows writes keys or secrets there, which must never reach a disk.
+/// `refusal` goes inside single quotes, so it must not hold one.
+pub(crate) fn shm_tmpfs_guard(refusal: &str, exit_code: i32) -> String {
+    format!(
+        r#"grep -q ' /dev/shm tmpfs ' "$mounts" || {{ echo '/dev/shm is not a tmpfs in this container; {refusal}' >&2; exit {exit_code}; }}"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

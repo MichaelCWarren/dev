@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::cmux::agent;
 use crate::cmux::{Cmux, SESSION_PILL_STYLE, SHELL_KEY, StatusGuard};
-use crate::commands::exec::resolve_exec_secrets;
+use crate::commands::exec::session_secrets;
 use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
@@ -49,7 +49,7 @@ pub(crate) async fn run_with_runtime(
     let container = running_container(runtime, workspace).await?;
 
     // Resolve remoteUser and workspaceFolder from config or image metadata
-    let loaded = load_workspace_config_or_warn(workspace, runtime.runtime_name());
+    let loaded = load_workspace_config_or_warn(dev_home, workspace, runtime.runtime_name());
     let config_path = loaded.as_ref().map(|(path, _)| path.as_path());
     let config = loaded.as_ref().map(|(_, config)| config);
     let config_user = config.and_then(|c| c.remote_user.as_deref());
@@ -62,12 +62,18 @@ pub(crate) async fn run_with_runtime(
 
     let workdir = resolve_workdir(config, workspace, user.as_deref())?;
 
-    // Fresh every session, so a secret rotated since `dev up` reaches this shell
-    // without a recreate. A compose container is not re-checked: `dev up`
-    // rejects a compose project that declares secrets, and refusing a shell too
-    // would leave a running container with no way in.
-    let mut secrets =
-        resolve_exec_secrets(config_path, workspace, config_user, registry, dev_home).await?;
+    // `exec` values are fetched each session, `up` values come from what `dev up`
+    // stored, and `create` values are already in the container env.
+    let mut secrets = session_secrets(
+        runtime,
+        &container.id,
+        config_path,
+        config,
+        workspace,
+        registry,
+        dev_home,
+    )
+    .await?;
 
     // Held across the session: dropping it aborts the listener, and
     // `attend_session` returns on both its own exit and a signal, so there is
@@ -406,8 +412,9 @@ mod tests {
         session_pill_action, single_quoted,
     };
     use crate::cmux::Cmux;
-    use crate::devcontainer::secrets::SecretValue;
     use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
+    use crate::devcontainer::secrets::up_store::FakeUpStore;
+    use crate::devcontainer::secrets::{SecretValue, expose, secrets_json};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
@@ -456,6 +463,7 @@ mod tests {
         /// reads nothing and the exit paint reads cleanly.
         machinery_fails_before_session: bool,
         session_started: Arc<AtomicBool>,
+        store: FakeUpStore,
     }
 
     impl ShellFakeRuntime {
@@ -476,7 +484,18 @@ mod tests {
                 machinery_fails_after_session: false,
                 machinery_fails_before_session: false,
                 session_started: Arc::new(AtomicBool::new(false)),
+                store: FakeUpStore::default(),
             }
+        }
+
+        fn storing(mut self, pairs: &[(&str, &str)]) -> Self {
+            self.store = FakeUpStore::storing(pairs);
+            self
+        }
+
+        /// Reads of the in-container up store.
+        fn store_reads(&self) -> Vec<ExecCall> {
+            FakeUpStore::reads(&self.execs.lock().unwrap(), |call| &call.0)
         }
 
         fn answering_machinery_with(mut self, reply: &str) -> Self {
@@ -565,10 +584,11 @@ mod tests {
                 cmd.to_vec(),
                 user.map(str::to_string),
                 workdir.map(str::to_string),
-                env.iter()
-                    .map(|(key, value)| (key.clone(), value.expose().to_string()))
-                    .collect(),
+                expose(env),
             ));
+            if let Some(reply) = self.store.answer(cmd) {
+                return Box::pin(async move { Ok(reply) });
+            }
             let machinery = crate::session::is_session_machinery(cmd);
             let started = self.session_started.load(Ordering::SeqCst);
             if machinery
@@ -604,11 +624,7 @@ mod tests {
                 cmd.to_vec(),
                 user.map(str::to_string),
                 workdir.map(str::to_string),
-                // Exposing inside a test double is the only way to prove the
-                // value arrived. Production code never does this.
-                env.iter()
-                    .map(|(key, value)| (key.clone(), value.expose().to_string()))
-                    .collect(),
+                expose(env),
             ));
             Box::pin(async { Ok(0) })
         }
@@ -694,14 +710,15 @@ mod tests {
         registry
     }
 
-    const ONE_SECRET: &str = r#"{"version":1,"secrets":{"TOKEN":"fake://token"}}"#;
+    const ONE_SECRET: &str =
+        r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"token","resolve":"exec"}}}"#;
     const VALUE: &str = "hunter2-DO-NOT-INTERPOLATE";
 
     fn answers() -> FakeProvider {
         FakeProvider::answering(&[("TOKEN", VALUE)])
     }
 
-    /// The point of the command: the shell the user lands in holds values
+    /// The point of the command: the shell the user lands in holds `exec` values
     /// fetched now, not whatever was baked in when the container was created.
     #[tokio::test]
     async fn a_session_carries_the_resolved_secrets_in_its_own_env() {
@@ -794,10 +811,9 @@ mod tests {
         assert!(runtime.sessions().is_empty());
     }
 
-    /// `createTime` governs the `dev up` create path only, so an exec-time-only
-    /// secret still reaches the session.
+    /// Legacy `createTime: false` means `exec`, so it is fetched for the session.
     #[tokio::test]
-    async fn create_time_false_still_reaches_the_session() {
+    async fn create_time_false_resolves_at_the_session() {
         let (workspace, config_path) = workspace_with(Some(
             r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"token","createTime":false}}}"#,
         ));
@@ -820,10 +836,10 @@ mod tests {
         );
     }
 
-    /// Dev builds no cache, which is what makes a rotated secret current in the
-    /// next shell.
+    /// Dev builds no cache for `exec` secrets, which is what makes a rotated one
+    /// current in the next shell.
     #[tokio::test]
-    async fn each_session_resolves_again() {
+    async fn each_session_resolves_exec_secrets_again() {
         let (workspace, config_path) = workspace_with(Some(ONE_SECRET));
         let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path);
         let provider = answers();
@@ -843,6 +859,99 @@ mod tests {
         }
 
         assert_eq!(provider.calls(), 2);
+    }
+
+    fn from_provider() -> FakeProvider {
+        FakeProvider::answering(&[("TOKEN", "from-provider")])
+    }
+
+    async fn open_session(
+        workspace: &Path,
+        runtime: &ShellFakeRuntime,
+        provider: &FakeProvider,
+    ) -> anyhow::Result<i32> {
+        run_with_runtime(
+            workspace,
+            runtime,
+            None,
+            &registry_with(workspace, provider.clone()),
+            &Cmux::recording().0,
+            &DevHome::at(workspace.join("dev-home")),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_create_secret_is_neither_resolved_nor_read() {
+        let (workspace, config_path) = workspace_with(Some(&secrets_json(&[("TOKEN", "create")])));
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        open_session(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev shell should open a session");
+
+        assert_eq!(provider.calls(), 0);
+        assert!(runtime.store_reads().is_empty());
+        assert!(runtime.sessions()[0].3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_up_secret_is_read_from_the_store_not_resolved() {
+        let (workspace, config_path) = workspace_with(Some(&secrets_json(&[("TOKEN", "up")])));
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "from-store")]);
+        let provider = from_provider();
+
+        open_session(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev shell should open a session");
+
+        assert_eq!(provider.calls(), 0);
+        let reads = runtime.store_reads();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].1.as_deref(), Some("root"));
+        assert!(reads[0].3.is_empty());
+        assert_eq!(
+            runtime.sessions()[0].3,
+            vec![("TOKEN".to_string(), "from-store".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exec_secret_is_resolved_for_this_session() {
+        let (workspace, config_path) = workspace_with(Some(&secrets_json(&[("TOKEN", "exec")])));
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path)
+            .storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        open_session(workspace.path(), &runtime, &provider)
+            .await
+            .expect("dev shell should open a session");
+
+        assert_eq!(provider.calls(), 1);
+        assert!(runtime.store_reads().is_empty());
+        assert_eq!(
+            runtime.sessions()[0].3,
+            vec![("TOKEN".to_string(), "from-provider".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_up_secret_missing_from_the_store_opens_no_session() {
+        let (workspace, config_path) = workspace_with(Some(&secrets_json(&[("TOKEN", "up")])));
+        let runtime = ShellFakeRuntime::running_for(workspace.path(), &config_path).storing(&[]);
+        let provider = from_provider();
+
+        let err = open_session(workspace.path(), &runtime, &provider)
+            .await
+            .expect_err("a required up secret that is not stored fails the session");
+
+        let message = err.to_string();
+        assert!(message.contains("TOKEN"), "{message}");
+        assert!(message.contains("dev up"), "{message}");
+        assert!(runtime.sessions().is_empty());
     }
 
     fn host() -> HostIdentity {

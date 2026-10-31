@@ -35,7 +35,16 @@ pub struct DevHome {
 
 impl DevHome {
     /// The real `~/.dev/`.
+    ///
+    /// Panics under test: a test that reads the developer's own `~/.dev` can
+    /// validate their base `secrets.json` and resolve it against real
+    /// providers, prompting them while the suite runs.
     pub fn current() -> Self {
+        #[cfg(test)]
+        panic!(
+            "tests must use DevHome::at(<tempdir>); DevHome::current() reads the developer's real ~/.dev"
+        );
+        #[cfg(not(test))]
         DevHome { root: dev_home() }
     }
 

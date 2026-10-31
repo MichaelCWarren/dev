@@ -158,13 +158,6 @@ fn inject_feature_origin(prov: &mut Provenance, feature_ref: &str) {
 /// alone yields nothing and callers silently fall back to the image's defaults.
 /// Composing here keeps `remoteUser` and `workspaceFolder` identical to the ones
 /// `dev up` built the container with.
-pub(crate) fn load_workspace_config(
-    workspace: &Path,
-    runtime_name: &str,
-) -> anyhow::Result<(PathBuf, DevcontainerConfig)> {
-    load_workspace_config_in(&DevHome::current(), workspace, runtime_name)
-}
-
 pub(crate) fn load_workspace_config_in(
     dev_home: &DevHome,
     workspace: &Path,
@@ -193,10 +186,11 @@ pub(crate) fn load_workspace_config_in(
 /// the only thing that explains why the command behaved as if there were no
 /// config — a session on the wrong user, or a teardown that skipped `compose down`.
 pub(crate) fn load_workspace_config_or_warn(
+    dev_home: &DevHome,
     workspace: &Path,
     runtime_name: &str,
 ) -> Option<(PathBuf, DevcontainerConfig)> {
-    match load_workspace_config(workspace, runtime_name) {
+    match load_workspace_config_in(dev_home, workspace, runtime_name) {
         Ok(loaded) => Some(loaded),
         Err(err) => {
             if !matches!(err.downcast_ref::<DevError>(), Some(DevError::NoConfig(_))) {
@@ -226,13 +220,6 @@ fn recipe_dir_of(recipe_path: &Path) -> anyhow::Result<&Path> {
 /// clone where it was never committed, or from a template that gained a file after
 /// the project was made — therefore stays unrecorded, and a later `dev new` that
 /// wants to replace it refuses and says so rather than assuming it is clean.
-pub(crate) fn materialize_recipe_directory(
-    recipe_path: &Path,
-    recipe: &Recipe,
-) -> anyhow::Result<()> {
-    materialize_recipe_directory_in(&DevHome::current(), recipe_path, recipe)
-}
-
 pub(crate) fn materialize_recipe_directory_in(
     dev_home: &DevHome,
     recipe_path: &Path,

@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::cmux::{BUILD_KEY, BUILD_STYLE, Cmux, StatusGuard};
+use crate::commands::print_warnings;
 use crate::devcontainer::compose::{compose_recipe_config_in, materialize_recipe_directory_in};
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::effective::{
@@ -15,19 +17,23 @@ use crate::devcontainer::features::{
 use crate::devcontainer::hooklog::HookLog;
 use crate::devcontainer::secrets::discovery::secrets_file_path_in;
 use crate::devcontainer::secrets::env_name_problem;
-use crate::devcontainer::secrets::validate::validate_secrets_at;
-use crate::devcontainer::secrets::{ProviderRegistry, SecretValue, ValidatedSecrets};
+use crate::devcontainer::secrets::up_store::{clear_up_store, write_up_store};
+use crate::devcontainer::secrets::validate::{SecretOrigin, validate_secrets_at};
+use crate::devcontainer::secrets::{
+    ProviderRegistry, ResolveTime, SecretValue, ValidatedSecrets, validate_secrets_for_config,
+};
 use crate::devcontainer::uid;
 use crate::devcontainer::{
-    DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features_in,
-    run_create_hooks, run_start_hooks, stage_feature_context, substitute_variables,
-    substitute_variables_with_user,
+    DevcontainerConfig, HookTarget, Recipe, download_features, merge_feature_capabilities,
+    resolve_features_in, run_create_hooks, run_start_hooks, stage_feature_context,
+    substitute_variables, substitute_variables_with_user,
 };
 use crate::error::DevError;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState, ExecResult,
     PortMapping, TmpfsMount, VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
+use crate::util::naming::workspace_hash;
 use crate::util::paths::DevHome;
 use crate::util::workspace::find_config_source_in;
 use crate::util::{ConfigSource, container_name, workspace_folder_name, workspace_labels};
@@ -88,9 +94,13 @@ pub async fn run(
 fn register_caddy_routes(workspace: &Path, config: &DevcontainerConfig) {
     let declared = caddy_ports_from_config(config);
     let active = crate::commands::forward::active_entries_for_workspace(workspace);
-    let ports = merge_caddy_ports(declared, active);
+    register_routes(workspace, &merge_caddy_ports(declared, active));
+}
+
+/// Like ssh alias setup, a failure warns rather than failing `dev up`.
+fn register_routes(workspace: &Path, ports: &[crate::caddy::PortEntry]) {
     if !ports.is_empty()
-        && let Err(e) = crate::caddy::register_site(workspace, &ports)
+        && let Err(e) = crate::caddy::register_site(workspace, ports)
     {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
@@ -297,6 +307,7 @@ pub(crate) async fn run_with_runtime(
         &providers,
         &DevHome::current(),
         cmux,
+        &mut std::io::stderr(),
     )
     .await
 }
@@ -304,7 +315,7 @@ pub(crate) async fn run_with_runtime(
 /// [`run_with_runtime`] with the secret providers supplied, so a test can put a
 /// fake in front of both validation and resolution. One registry serves both:
 /// two would let a fake satisfy validation and then resolve against the real
-/// built-ins.
+/// built-ins. Secret warnings go to `warnings_out`, so a test can read them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_runtime_with_providers(
     workspace: &Path,
@@ -321,6 +332,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     providers: &ProviderRegistry,
     dev_home: &DevHome,
     cmux: &Cmux,
+    warnings_out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
         match find_config_source_in(dev_home, workspace)? {
@@ -387,6 +399,16 @@ pub(crate) async fn run_with_runtime_with_providers(
             dev_home,
         )?;
         reject_secrets_for_compose(&config, &secrets)?;
+        let downgraded = secrets.downgraded_to_up();
+        if !downgraded.is_empty() {
+            print_warnings(
+                warnings_out,
+                [base_create_downgrade_warning(
+                    downgraded,
+                    &dev_home.base_secrets(),
+                )],
+            );
+        }
         return run_compose(
             workspace,
             &config,
@@ -401,6 +423,9 @@ pub(crate) async fn run_with_runtime_with_providers(
             relay.decision(),
             ssh_alias,
             &mut pill,
+            &secrets,
+            providers,
+            warnings_out,
         )
         .await;
     }
@@ -434,7 +459,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     // Parse every secret reference, reject unknown providers, and expand
     // devcontainer variables in the reference bodies and option values with the
     // same workspace and user the runArgs substitution above uses. No provider
-    // is asked for a value yet: resolution is on the create path only.
+    // is asked for a value yet.
     let secrets = validate_workspace_secrets(
         &config,
         &config_path,
@@ -443,6 +468,18 @@ pub(crate) async fn run_with_runtime_with_providers(
         secrets_override,
         dev_home,
     )?;
+    print_warnings(
+        warnings_out,
+        override_up_key_warnings_for(
+            &config,
+            &config_path,
+            workspace,
+            providers,
+            secrets_override,
+            dev_home,
+            &secrets,
+        ),
+    );
 
     // Run initializeCommand on the host before anything else (Gap 9).
     if let Some(ref init_cmd) = config.initialize_command {
@@ -474,72 +511,21 @@ pub(crate) async fn run_with_runtime_with_providers(
     let has_port_overrides = !port_overrides.is_empty();
     if let Some(container) = existing.first() {
         match container.state {
-            ContainerState::Running if !rebuild && !has_port_overrides => {
-                return reuse_running_container(
-                    runtime, workspace, &config, &relay, container, dev_home, ssh_alias, &mut pill,
-                )
-                .await;
-            }
-            ContainerState::Stopped if !rebuild && !has_port_overrides => {
-                pill.phase("up: starting container", BUILD_STYLE);
-                println!("Starting existing container '{}'...", container.name);
-                runtime.start_container(&container.id).await?;
-                // Resolved before the gate, not just for the hooks: the probe
-                // certifies the user every later command actually runs as.
-                let user =
-                    resolve_remote_user(runtime, &container.image, config.remote_user.as_deref())
-                        .await?;
-                let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
-                verify_container_usable(
+            ContainerState::Running | ContainerState::Stopped
+                if !rebuild && !has_port_overrides =>
+            {
+                let ctx = ReuseContext {
                     runtime,
-                    &container.id,
                     workspace,
-                    user.as_deref(),
-                    Some(&workspace_folder),
-                )
-                .await?;
-                crate::ssh_agent::reconcile_relay(
-                    &relay,
-                    runtime,
-                    &container.id,
-                    user.as_deref(),
+                    config: &config,
+                    config_path: &config_path,
+                    relay: &relay,
                     dev_home,
-                    workspace,
-                )
-                .await;
-                // Only the start-time hooks: the create-time ones ran when this
-                // container was created, and `postCreateCommand` is where
-                // toolchains get installed and databases get seeded.
-                let features =
-                    restart_feature_hooks(&config, &config_path, dev_home, relay.decision())
-                        .await?;
-                let hook_log = begin_hook_log(dev_home, workspace, "start");
-                pill.phase("up: running hooks", BUILD_STYLE);
-                run_start_hooks(
-                    runtime,
-                    &container.id,
-                    &config,
-                    user.as_deref(),
-                    Some(&workspace_folder),
-                    Some(&features),
-                    hook_log.as_ref(),
-                )
-                .await?;
-                // A plain `dev down` deletes the Caddy fragment but leaves the
-                // container stopped, so restore the routes on restart (issue #52).
-                register_caddy_routes(workspace, &config);
-                register_ssh_alias(
                     ssh_alias,
-                    dev_home,
-                    workspace,
-                    runtime,
-                    &container.id,
-                    user.as_deref(),
-                )
-                .await;
-                pill.succeeded(&format!("Container '{}' started", container.name));
-                println!("Container '{}' started.", container.name);
-                return Ok(());
+                    secrets: &secrets,
+                    providers,
+                };
+                return reuse_container(&ctx, container, &mut pill, warnings_out).await;
             }
             _ => {
                 // Rebuild or port override: remove existing
@@ -727,10 +713,10 @@ pub(crate) async fn run_with_runtime_with_providers(
         labels.insert(k.clone(), v.clone());
     }
 
-    // Resolve only here, and only on the create path. Env reaches a container at
-    // create, so a `dev up` that reuses a running container gains nothing from
-    // resolving and costs a provider prompt every time.
-    let resolved_secrets = resolve_create_time_secrets(&secrets, providers).await?;
+    // `create` and `up` entries resolve here in one call, so there is one
+    // prompt per `dev up`. `create` values reach the container env; `up` values
+    // go to the in-container store and the hooks.
+    let resolved_secrets = resolve_create_and_up_secrets(&secrets, providers).await?;
 
     // Substitute devcontainer variables in env values
     let mut env = HashMap::new();
@@ -841,7 +827,7 @@ pub(crate) async fn run_with_runtime_with_providers(
     // `runArgs` env tiers. Nothing may be inserted into `env` below this line.
     apply_secrets_to_env(
         &mut env,
-        resolved_secrets.iter().map(|(k, v)| (k.as_str(), v)),
+        resolved_secrets.create.iter().map(|(k, v)| (k.as_str(), v)),
     );
 
     let workspace_folder = config.workspace_folder_path(workspace, remote_user)?;
@@ -906,50 +892,99 @@ pub(crate) async fn run_with_runtime_with_providers(
         relay.announce(port);
     }
 
-    // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
-    let feature_hooks = if ordered_features.is_empty() {
-        None
-    } else {
-        Some(ordered_features.as_slice())
-    };
-    let hook_log = begin_hook_log(dev_home, workspace, "create");
-    pill.phase("up: running hooks", BUILD_STYLE);
-    run_create_hooks(
-        runtime,
-        &container_id,
-        &config,
-        remote_user,
-        Some(&workspace_folder),
-        feature_hooks,
-        hook_log.as_ref(),
-    )
-    .await?;
-
-    // Clone dotfiles if configured (Gap 15).
-    if let Some(ref dotfiles) = config.dotfiles {
-        pill.phase("up: installing dotfiles", BUILD_STYLE);
-        install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
-    }
-
-    pill.succeeded(&format!("Container '{name}' is ready"));
-    println!("Container '{name}' is ready.");
-
-    if !caddy_host_ports.is_empty()
-        && let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports)
-    {
-        eprintln!("Warning: Caddy setup failed: {e}");
-    }
-    register_ssh_alias(
-        ssh_alias,
-        dev_home,
-        workspace,
-        runtime,
-        &container_id,
-        remote_user,
+    let store = HeldStoreWrite::attempt(
+        &UpStoreTarget {
+            runtime,
+            container_id: &container_id,
+            container_name: &name,
+            workspace,
+        },
+        &secrets,
+        &resolved_secrets.up,
     )
     .await;
 
-    Ok(())
+    let steps = async {
+        // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
+        let feature_hooks = (!ordered_features.is_empty()).then_some(ordered_features.as_slice());
+        let hook_log = begin_hook_log(dev_home, workspace, "create");
+        pill.phase("up: running hooks", BUILD_STYLE);
+        run_create_hooks(
+            &HookTarget {
+                runtime,
+                container_id: &container_id,
+                user: remote_user,
+                workdir: Some(&workspace_folder),
+                log: hook_log.as_ref(),
+                env: &resolved_secrets.up,
+                host: &crate::session::host_identity().await,
+            },
+            &config,
+            feature_hooks,
+        )
+        .await?;
+
+        // Clone dotfiles if configured (Gap 15).
+        if let Some(ref dotfiles) = config.dotfiles {
+            pill.phase("up: installing dotfiles", BUILD_STYLE);
+            install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
+        }
+
+        register_routes(workspace, &caddy_host_ports);
+        register_ssh_alias(
+            ssh_alias,
+            dev_home,
+            workspace,
+            runtime,
+            &container_id,
+            remote_user,
+        )
+        .await;
+        anyhow::Ok(())
+    }
+    .await;
+
+    let ready = format!("Container '{name}' is ready");
+    store.finish(steps, &mut pill, warnings_out, &ready, None)
+}
+
+/// What both reuse paths borrow from the `dev up` that found the container.
+struct ReuseContext<'a> {
+    runtime: &'a dyn ContainerRuntime,
+    workspace: &'a Path,
+    config: &'a DevcontainerConfig,
+    config_path: &'a Path,
+    relay: &'a crate::ssh_agent::RelayConsent,
+    dev_home: &'a DevHome,
+    ssh_alias: SshAliasPlan,
+    secrets: &'a ValidatedSecrets,
+    providers: &'a ProviderRegistry,
+}
+
+impl ReuseContext<'_> {
+    fn store_target<'a>(&'a self, container: &'a ContainerInfo) -> UpStoreTarget<'a> {
+        UpStoreTarget {
+            runtime: self.runtime,
+            container_id: &container.id,
+            container_name: &container.name,
+            workspace: self.workspace,
+        }
+    }
+}
+
+/// Take the container `dev up` found: as it is if running, started if stopped.
+async fn reuse_container(
+    ctx: &ReuseContext<'_>,
+    container: &ContainerInfo,
+    pill: &mut StatusGuard,
+    warnings_out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match container.state {
+        ContainerState::Running => {
+            reuse_running_container(ctx, container, pill, warnings_out).await
+        }
+        _ => restart_stopped_container(ctx, container, pill, warnings_out).await,
+    }
 }
 
 /// Take an already-running container as it is.
@@ -960,60 +995,163 @@ pub(crate) async fn run_with_runtime_with_providers(
 /// cannot exec into in the running state, so without the gate the first `dev
 /// up` fails honestly and every later one hands the user a green light for a
 /// container no command can run in.
-#[allow(clippy::too_many_arguments)]
 async fn reuse_running_container(
-    runtime: &dyn ContainerRuntime,
-    workspace: &Path,
-    config: &DevcontainerConfig,
-    relay: &crate::ssh_agent::RelayConsent,
+    ctx: &ReuseContext<'_>,
     container: &ContainerInfo,
-    dev_home: &DevHome,
-    ssh_alias: SshAliasPlan,
     pill: &mut StatusGuard,
+    warnings_out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let user =
-        resolve_remote_user(runtime, &container.image, config.remote_user.as_deref()).await?;
-    let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
+    let (user, _) = settle_container(ctx, container).await?;
+    print_warnings(
+        warnings_out,
+        create_keys_warning(ctx.runtime, container, ctx.secrets).await,
+    );
+    let up = resolve_up_secrets(ctx.secrets, ctx.providers).await?;
+    let store = HeldStoreWrite::attempt_or_clear(
+        &ctx.store_target(container),
+        ctx.secrets,
+        &up,
+        warnings_out,
+    )
+    .await;
+    let steps = async {
+        // Same self-healing as the restart path: a route set edited in config
+        // (renamed host, added port) has no other moment to reach Caddy, since a
+        // running container never takes that path.
+        register_caddy_routes(ctx.workspace, ctx.config);
+        register_container_alias(ctx, container, user.as_deref()).await;
+        anyhow::Ok(())
+    }
+    .await;
+    let ready = format!("Container '{}' is already running", container.name);
+    store.finish(steps, pill, warnings_out, &ready, None)
+}
+
+/// Start a stopped container and run the hooks it owes a restart.
+///
+/// `up` secrets resolve before the container starts, so a required one that
+/// fails leaves it stopped rather than half-started.
+async fn restart_stopped_container(
+    ctx: &ReuseContext<'_>,
+    container: &ContainerInfo,
+    pill: &mut StatusGuard,
+    warnings_out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    pill.phase("up: starting container", BUILD_STYLE);
+    println!("Starting existing container '{}'...", container.name);
+    let up = resolve_up_secrets(ctx.secrets, ctx.providers).await?;
+    ctx.runtime.start_container(&container.id).await?;
+    let (user, workspace_folder) = settle_container(ctx, container).await?;
+    print_warnings(
+        warnings_out,
+        create_keys_warning(ctx.runtime, container, ctx.secrets).await,
+    );
+    let store = HeldStoreWrite::attempt(&ctx.store_target(container), ctx.secrets, &up).await;
+    let steps = async {
+        pill.phase("up: running hooks", BUILD_STYLE);
+        run_restart_hooks(ctx, container, user.as_deref(), &workspace_folder, &up).await?;
+        // A plain `dev down` deletes the Caddy fragment but leaves the
+        // container stopped, so restore the routes on restart (issue #52).
+        register_caddy_routes(ctx.workspace, ctx.config);
+        register_container_alias(ctx, container, user.as_deref()).await;
+        anyhow::Ok(())
+    }
+    .await;
+    let ready = format!("Container '{}' started", container.name);
+    store.finish(steps, pill, warnings_out, &ready, None)
+}
+
+/// Only the start-time hooks: the create-time ones ran when this container was
+/// created, and `postCreateCommand` is where toolchains get installed and
+/// databases get seeded.
+async fn run_restart_hooks(
+    ctx: &ReuseContext<'_>,
+    container: &ContainerInfo,
+    user: Option<&str>,
+    workspace_folder: &str,
+    up: &[(String, SecretValue)],
+) -> anyhow::Result<()> {
+    let features = restart_feature_hooks(
+        ctx.config,
+        ctx.config_path,
+        ctx.dev_home,
+        ctx.relay.decision(),
+    )
+    .await?;
+    let hook_log = begin_hook_log(ctx.dev_home, ctx.workspace, "start");
+    run_start_hooks(
+        &HookTarget {
+            runtime: ctx.runtime,
+            container_id: &container.id,
+            user,
+            workdir: Some(workspace_folder),
+            log: hook_log.as_ref(),
+            env: up,
+            host: &crate::session::host_identity().await,
+        },
+        ctx.config,
+        Some(&features),
+    )
+    .await?;
+    Ok(())
+}
+
+/// What a reused container needs before anything is stored in it or run in it:
+/// its user, its workspace folder, the readiness gate, and the relay.
+///
+/// The user is resolved before the gate, not just for the hooks: the probe
+/// certifies the user every later command actually runs as.
+async fn settle_container(
+    ctx: &ReuseContext<'_>,
+    container: &ContainerInfo,
+) -> anyhow::Result<(Option<String>, String)> {
+    let user = resolve_remote_user(
+        ctx.runtime,
+        &container.image,
+        ctx.config.remote_user.as_deref(),
+    )
+    .await?;
+    let workspace_folder = ctx
+        .config
+        .workspace_folder_path(ctx.workspace, user.as_deref())?;
     verify_container_usable(
-        runtime,
+        ctx.runtime,
         &container.id,
-        workspace,
+        ctx.workspace,
         user.as_deref(),
         Some(&workspace_folder),
     )
     .await?;
     crate::ssh_agent::reconcile_relay(
-        relay,
-        runtime,
+        ctx.relay,
+        ctx.runtime,
         &container.id,
         user.as_deref(),
-        dev_home,
-        workspace,
+        ctx.dev_home,
+        ctx.workspace,
     )
     .await;
-    // Same self-healing as the restart path: a route set edited in config
-    // (renamed host, added port) has no other moment to reach Caddy, since a
-    // running container never takes that path.
-    register_caddy_routes(workspace, config);
+    Ok((user, workspace_folder))
+}
+
+async fn register_container_alias(
+    ctx: &ReuseContext<'_>,
+    container: &ContainerInfo,
+    user: Option<&str>,
+) {
     register_ssh_alias(
-        ssh_alias,
-        dev_home,
-        workspace,
-        runtime,
+        ctx.ssh_alias,
+        ctx.dev_home,
+        ctx.workspace,
+        ctx.runtime,
         &container.id,
-        user.as_deref(),
+        user,
     )
     .await;
-    pill.succeeded(&format!(
-        "Container '{}' is already running",
-        container.name
-    ));
-    println!("Container '{}' is already running.", container.name);
-    Ok(())
 }
 
 /// Which lifecycle hooks a compose service is owed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeHooks {
     /// The container is new: the create-time hooks, then postStart.
     Create,
@@ -1106,28 +1244,319 @@ fn validate_workspace_secrets(
         path,
         workspace,
         config.remote_user.as_deref(),
+        config.is_compose(),
         providers,
     )?)
 }
 
-/// Resolve the create-time secrets for this `dev up`.
-///
-/// Create-path only. Env reaches a container at create, so resolving during a
-/// `dev up` that reuses a running container buys nothing and costs a biometric
-/// prompt every time. `createTime: false` entries are exec-time only and are
-/// filtered out by `create_time_entries`.
-///
-/// The empty case returns before the registry is touched, so "no secrets means
-/// no provider call" holds by construction.
-async fn resolve_create_time_secrets(
+/// The values a creating `dev up` resolved, split by where each one goes.
+struct CreateAndUpSecrets {
+    /// Baked into the container env at create.
+    create: Vec<(String, SecretValue)>,
+    /// Stored in the container and handed to the hooks, never put in its env.
+    up: Vec<(String, SecretValue)>,
+}
+
+/// Resolve every `create` and `up` entry in one provider call, so a creating
+/// `dev up` prompts once. `exec` entries are left for the command that needs them.
+/// With nothing declared at either time, no provider is called.
+async fn resolve_create_and_up_secrets(
+    secrets: &ValidatedSecrets,
+    providers: &ProviderRegistry,
+) -> anyhow::Result<CreateAndUpSecrets> {
+    let refs: Vec<_> = secrets
+        .entries_at(ResolveTime::Create)
+        .chain(secrets.entries_at(ResolveTime::Up))
+        .cloned()
+        .collect();
+    let up_keys: HashSet<&str> = secrets
+        .entries_at(ResolveTime::Up)
+        .map(|r| r.key())
+        .collect();
+    let (up, create) = providers
+        .resolve_all(&refs)
+        .await?
+        .into_iter()
+        .partition(|(key, _)| up_keys.contains(key.as_str()));
+    Ok(CreateAndUpSecrets { create, up })
+}
+
+/// Resolve only the `up` entries, for a `dev up` that reuses a container and so
+/// has no env to put a `create` value in. With none declared, no provider is
+/// called.
+async fn resolve_up_secrets(
     secrets: &ValidatedSecrets,
     providers: &ProviderRegistry,
 ) -> anyhow::Result<Vec<(String, SecretValue)>> {
-    let refs: Vec<_> = secrets.create_time_entries().cloned().collect();
-    if refs.is_empty() {
-        return Ok(Vec::new());
-    }
+    let refs: Vec<_> = secrets.entries_at(ResolveTime::Up).cloned().collect();
     Ok(providers.resolve_all(&refs).await?)
+}
+
+/// The container an `up` store goes into.
+struct UpStoreTarget<'a> {
+    runtime: &'a dyn ContainerRuntime,
+    container_id: &'a str,
+    container_name: &'a str,
+    workspace: &'a Path,
+}
+
+/// Write this workspace's `up` store in a container.
+///
+/// Gated on what `secrets` declares, not on what resolved, so an optional key
+/// that did not resolve still replaces its stale value.
+async fn store_up_secrets(
+    target: &UpStoreTarget<'_>,
+    secrets: &ValidatedSecrets,
+    up: &[(String, SecretValue)],
+) -> anyhow::Result<()> {
+    if secrets.entries_at(ResolveTime::Up).next().is_none() {
+        return Ok(());
+    }
+    let store_key = workspace_hash(target.workspace);
+    write_up_store(target.runtime, target.container_id, &store_key, up)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not store `up` secrets in container `{}`: {e}",
+                target.container_name
+            )
+        })
+}
+
+/// [`store_up_secrets`] for a container whose `/dev/shm` may hold a store from
+/// an earlier `dev up` (see [`HeldStoreWrite::attempt_or_clear`]). With no `up` entries declared
+/// that store is cleared instead, and a failed clear only warns, since nothing
+/// depends on it.
+async fn store_or_clear_up_secrets(
+    target: &UpStoreTarget<'_>,
+    secrets: &ValidatedSecrets,
+    up: &[(String, SecretValue)],
+    warnings_out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    if secrets.entries_at(ResolveTime::Up).next().is_some() {
+        return store_up_secrets(target, secrets, up).await;
+    }
+    let store_key = workspace_hash(target.workspace);
+    match clear_up_store(target.runtime, target.container_id, &store_key).await {
+        Err(e) if !target.runtime.exec_reports_missing_command(&e) => print_warnings(
+            warnings_out,
+            [up_store_clear_warning(target.container_name, &e)],
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn up_store_clear_warning(container_name: &str, error: &DevError) -> String {
+    format!("Warning: could not clear stale `up` secrets in container `{container_name}`: {error}")
+}
+
+use held_store::HeldStoreWrite;
+
+/// Its own module so the held result can only be reached through
+/// [`HeldStoreWrite::finish`].
+mod held_store {
+    use super::{
+        SecretValue, StatusGuard, UpStoreTarget, ValidatedSecrets, Write, print_warnings,
+        store_or_clear_up_secrets, store_up_secrets,
+    };
+
+    /// `dev up` attempts the `up` store write before the hooks, so sessions opened
+    /// during a long hook already find it, but a write failure is reported only
+    /// after everything else `dev up` does (hooks, dotfiles, routes, ssh alias).
+    /// Hooks take `up` values from their exec env, never the store. A failure
+    /// therefore leaves a fully set-up container, and the next `dev up` writes the
+    /// store again. No container is ever discarded for a store failure.
+    ///
+    /// Every path runs its post-store steps as one block and hands that block's
+    /// result to [`Self::finish`], the one place the two are combined, so no `?`
+    /// inside the steps can return past the held failure.
+    #[must_use]
+    pub(super) struct HeldStoreWrite(anyhow::Result<()>);
+
+    impl HeldStoreWrite {
+        /// For a plain-image container this `dev up` created or restarted; see
+        /// [`Self::attempt_or_clear`] for why it needs no clear.
+        pub(super) async fn attempt(
+            target: &UpStoreTarget<'_>,
+            secrets: &ValidatedSecrets,
+            up: &[(String, SecretValue)],
+        ) -> Self {
+            Self(store_up_secrets(target, secrets, up).await)
+        }
+
+        /// The store can outlive a container's own run only where its /dev/shm
+        /// does: a running container on any runtime, or any Compose service,
+        /// because `ipc:` sharing (host, service:, container:, Podman pods) is
+        /// outside dev's control. So `dev up` clears on running reuse and on
+        /// every Compose path, including create and --rebuild, and skips the
+        /// clear only on a plain-image create or restart, whose /dev/shm dev
+        /// made private (runArgs rejects --ipc).
+        pub(super) async fn attempt_or_clear(
+            target: &UpStoreTarget<'_>,
+            secrets: &ValidatedSecrets,
+            up: &[(String, SecretValue)],
+            warnings_out: &mut (dyn Write + Send),
+        ) -> Self {
+            Self(store_or_clear_up_secrets(target, secrets, up, warnings_out).await)
+        }
+
+        /// When `steps` failed, `dev up` ends with its error and the held store
+        /// failure is printed so it is not lost. Otherwise print the ready
+        /// message (`summary`, then `detail`), then return the held failure.
+        /// Only a `dev up` whose store was written counts as a success for the
+        /// pill.
+        pub(super) fn finish(
+            self,
+            steps: anyhow::Result<()>,
+            pill: &mut StatusGuard,
+            warnings_out: &mut (dyn Write + Send),
+            summary: &str,
+            detail: Option<&str>,
+        ) -> anyhow::Result<()> {
+            if steps.is_err()
+                && let Err(e) = &self.0
+            {
+                print_warnings(warnings_out, [format!("Error: {e:#}")]);
+            }
+            steps?;
+            match detail {
+                Some(detail) => println!("{summary} {detail}."),
+                None => println!("{summary}."),
+            }
+            self.0?;
+            pill.succeeded(summary);
+            Ok(())
+        }
+    }
+}
+
+/// The declared required `create` keys `env` (as `NAME=value` lines) does not
+/// set, in entry order. An optional key is left out: unresolved, it is
+/// legitimately absent, and `--rebuild` would not add it.
+fn create_keys_missing_from(secrets: &ValidatedSecrets, env: &[String]) -> Vec<String> {
+    secrets
+        .entries_at(ResolveTime::Create)
+        .filter(|r| !r.optional())
+        .map(|r| r.key())
+        .filter(|key| {
+            !env.iter()
+                .any(|line| line.split_once('=').is_some_and(|(name, _)| name == *key))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// A reused container keeps the env it was created with, so a `create` key
+/// added since is not in it. Advisory only. A runtime with no env read says
+/// nothing, and with no required `create` entries the env is never read.
+async fn create_keys_warning(
+    runtime: &dyn ContainerRuntime,
+    container: &ContainerInfo,
+    secrets: &ValidatedSecrets,
+) -> Option<String> {
+    secrets
+        .entries_at(ResolveTime::Create)
+        .find(|r| !r.optional())?;
+    let env = match runtime.container_env(&container.id).await {
+        Ok(env) => env,
+        Err(DevError::Unsupported(_)) => return None,
+        // Only the error's class: its text can quote the env it failed on,
+        // and that env holds the `create` values.
+        Err(e) => {
+            return Some(format!(
+                "Warning: could not read the env of container '{}', so the check for missing create-time secrets was skipped: the runtime returned an error ({})",
+                container.name,
+                e.content_free_class()
+            ));
+        }
+    };
+    let missing = create_keys_missing_from(secrets, &env);
+    (!missing.is_empty()).then(|| {
+        format!(
+            "Warning: create-time secret(s) {} are not in container '{}', which was created without them. Run `dev up --rebuild` to recreate it with them.",
+            missing.join(", "),
+            container.name
+        )
+    })
+}
+
+/// The keys `declaring` declares `up` that `other` does not, sorted. Compared
+/// by resolve time, so a key `other` declares `exec` still counts.
+fn up_keys_missing_from(declaring: &ValidatedSecrets, other: &ValidatedSecrets) -> Vec<String> {
+    let mut keys: Vec<String> = declaring
+        .entries_at(ResolveTime::Up)
+        .map(|r| r.key().to_string())
+        .filter(|key| !other.entries_at(ResolveTime::Up).any(|r| r.key() == key))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// `--secrets` replaces the workspace's `secrets.json` for this `dev up` only.
+/// `dev exec`, `dev shell` and ssh sessions read the workspace file, so the two
+/// can disagree about `up` keys either way: one only the override declares is
+/// stored but never injected, and one only the workspace file declares is never
+/// stored, so sessions fail asking for a `dev up` that already ran.
+fn override_up_key_warnings_for(
+    config: &DevcontainerConfig,
+    config_path: &Path,
+    workspace: &Path,
+    providers: &ProviderRegistry,
+    secrets_override: Option<&Path>,
+    dev_home: &DevHome,
+    secrets: &ValidatedSecrets,
+) -> Vec<String> {
+    if secrets_override.is_none() {
+        return Vec::new();
+    }
+    let sidecar = validate_secrets_for_config(
+        dev_home,
+        config_path,
+        workspace,
+        config.remote_user.as_deref(),
+        config.is_compose(),
+        providers,
+    );
+    // A sidecar that does not validate is not this invocation's file, so it
+    // declares nothing here and must not fail `dev up`.
+    let unreadable = sidecar.is_err();
+    let sidecar = sidecar.unwrap_or_default();
+    override_up_key_warnings(secrets, &sidecar, unreadable)
+}
+
+/// One warning per direction in which `overriding` and `sidecar` disagree
+/// about `up` keys, none when they agree.
+fn override_up_key_warnings(
+    overriding: &ValidatedSecrets,
+    sidecar: &ValidatedSecrets,
+    sidecar_unreadable: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let only_override = up_keys_missing_from(overriding, sidecar);
+    if !only_override.is_empty() {
+        let unreadable_note = if sidecar_unreadable {
+            " (the workspace's secrets.json could not be read)"
+        } else {
+            ""
+        };
+        warnings.push(format!(
+            "Warning: --secrets declares `up` secrets the workspace's secrets.json does not: {}. \
+             `dev exec`, `dev shell` and ssh sessions read only the workspace's secrets.json, \
+             so they will not inject them{unreadable_note}.",
+            only_override.join(", ")
+        ));
+    }
+    let only_sidecar = up_keys_missing_from(sidecar, overriding);
+    if !only_sidecar.is_empty() {
+        warnings.push(format!(
+            "Warning: the workspace's secrets.json declares `up` secrets --secrets does not: {}. \
+             This `dev up` does not store them, so `dev exec`, `dev shell` and ssh sessions \
+             will report them as not stored until a `dev up` without --secrets runs.",
+            only_sidecar.join(", ")
+        ));
+    }
+    warnings
 }
 
 /// Apply resolved secrets on top of the create-time env map.
@@ -1236,14 +1665,15 @@ fn reject_secrets_file_for_compose(secrets_file: Option<&Path>) -> anyhow::Resul
     Ok(())
 }
 
-/// Compose creates its containers through `docker compose up`, so nothing on
-/// that path injects create-time secrets. Say so instead of leaving a container
-/// that comes up green and misbehaves later with the secrets missing.
+/// Compose creates its containers through `docker compose up`, so `dev` cannot
+/// put a `create` secret in their environment. A project file's `create` entry
+/// is refused here, before any side effect, with the two times Compose does
+/// support. A base file's `create` entry is not refused; Compose validation
+/// downgrades it to `up` instead, so one base `create` entry does not break
+/// every Compose project.
 ///
-/// `createTime: false` entries pass. They are never injected at create on any
-/// runtime; `dev exec` and `dev shell` resolve them per invocation and pass them
-/// on the exec itself, which is a path Compose shares. The generated override
-/// file never sees them, so the "no secret value reaches disk" rule holds.
+/// `up` and `exec` entries pass. The generated override file never sees a
+/// secret value, so the "no secret value reaches disk" rule holds.
 ///
 /// Non-compose configs pass, so this is safe to call without a caller-side
 /// `is_compose()` guard. An empty `secrets` map declares nothing and passes too,
@@ -1255,20 +1685,31 @@ fn reject_secrets_for_compose(
     if !config.is_compose() {
         return Ok(());
     }
-    let create_time: Vec<&str> = secrets.create_time_entries().map(|r| r.key()).collect();
-    if create_time.is_empty() {
+    let project_create: Vec<&str> = secrets
+        .entries_at_from(ResolveTime::Create, SecretOrigin::Project)
+        .map(|r| r.key())
+        .collect();
+    if project_create.is_empty() {
         return Ok(());
     }
+    let project_file = secrets
+        .source_from(SecretOrigin::Project)
+        .expect("a project-origin entry has a project file");
     anyhow::bail!(
-        "create-time secrets are not supported for Docker Compose devcontainers in `dev`; they are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. In {}, either add `\"createTime\": false` to {} so the value is injected on `dev exec` and `dev shell` instead, or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
-        secrets
-            .sources()
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" or "),
-        create_time.join(", ")
+        "create-time secrets are not supported for Docker Compose devcontainers in `dev`; they are injected as container environment when `dev` creates the container, and the Compose path creates containers through `docker compose up` instead. In {}, set `\"resolve\": \"up\"` on {} so `dev up` resolves them after the container starts, or `\"resolve\": \"exec\"` so each `dev exec`, `dev shell` and ssh session resolves them, or put the equivalent values on the configured Compose service definition (`environment:` or `env_file:`).",
+        project_file.display(),
+        project_create.join(", ")
     );
+}
+
+/// The one line printed when base-file `create` entries are moved to `up` for a
+/// Compose project.
+fn base_create_downgrade_warning(keys: &[String], base_file: &Path) -> String {
+    format!(
+        "Warning: {} cannot be injected at container creation by Docker Compose, so `dev up` resolves them as `up` instead. Set `\"resolve\": \"up\"` in {} to silence this.",
+        keys.join(", "),
+        base_file.display()
+    )
 }
 
 /// `--secrets` replaces the sidecar for one `dev up`, and the Compose path has
@@ -1826,7 +2267,8 @@ async fn install_dotfiles(
 ///
 /// Full pipeline: build the service, layer features on top, UID-remap,
 /// generate a compose override injecting labels/env/mounts/ports/image,
-/// start services, run lifecycle hooks, install dotfiles.
+/// start services, resolve `up` secrets, run lifecycle hooks, install
+/// dotfiles, write the `up` store.
 #[allow(clippy::too_many_arguments)]
 async fn run_compose(
     workspace: &Path,
@@ -1842,6 +2284,9 @@ async fn run_compose(
     relay: crate::ssh_agent::RelayDecision,
     ssh_alias: SshAliasPlan,
     pill: &mut StatusGuard,
+    secrets: &ValidatedSecrets,
+    providers: &ProviderRegistry,
+    warnings_out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -2162,78 +2607,123 @@ async fn run_compose(
     //     lifecycle hooks or success reporting can race ahead of Compose.
     verify_compose_service_ready(runtime, workspace, service, &container_id, remote_user).await?;
 
-    // 13. Run lifecycle hooks with feature hooks and correct remote_user.
-    let feature_hooks = if ordered_features.is_empty() {
-        None
-    } else {
-        Some(ordered_features.as_slice())
-    };
-    if owed != ComposeHooks::None {
-        pill.phase("up: running hooks", BUILD_STYLE);
-    }
-    match owed {
-        ComposeHooks::Create => {
-            let hook_log = begin_hook_log(dev_home, workspace, "create");
-            run_create_hooks(
-                runtime,
-                &container_id,
-                config,
-                remote_user,
-                None,
-                feature_hooks,
-                hook_log.as_ref(),
-            )
-            .await?;
-        }
-        ComposeHooks::Start => {
-            let hook_log = begin_hook_log(dev_home, workspace, "start");
-            run_start_hooks(
-                runtime,
-                &container_id,
-                config,
-                remote_user,
-                None,
-                feature_hooks,
-                hook_log.as_ref(),
-            )
-            .await?;
-        }
-        ComposeHooks::None => {}
-    }
-
-    // 14. Install dotfiles.
-    if let Some(ref dotfiles) = config.dotfiles {
-        pill.phase("up: installing dotfiles", BUILD_STYLE);
-        install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
-    }
-
-    // Cleanup temp files.
+    // Compose has read the generated files for the last time.
     let _ = std::fs::remove_file(&override_path);
     for p in &rewritten_paths {
         let _ = std::fs::remove_file(p);
     }
 
-    pill.succeeded(&format!("Compose service '{service}' is ready"));
-    println!(
-        "Compose service '{service}' is ready (container {}).",
-        &container_id[..12.min(container_id.len())]
-    );
-
-    if !caddy_host_ports_compose.is_empty()
-        && let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports_compose)
-    {
-        eprintln!("Warning: Caddy setup failed: {e}");
-    }
-    register_ssh_alias(
-        ssh_alias,
-        dev_home,
-        workspace,
+    // 13. The `up` store, hooks, dotfiles, routes and the ssh alias.
+    let setup = ComposeSetup {
         runtime,
-        &container_id,
+        container_id: &container_id,
+        service,
+        workspace,
+        config,
+        features: &ordered_features,
         remote_user,
-    )
-    .await;
+        dev_home,
+        secrets,
+        providers,
+        ssh_alias,
+        caddy_ports: &caddy_host_ports_compose,
+    };
+    set_up_compose_container(&setup, owed, pill, warnings_out).await
+}
 
+/// What [`set_up_compose_container`] needs from `run_compose`.
+struct ComposeSetup<'a> {
+    runtime: &'a dyn ContainerRuntime,
+    container_id: &'a str,
+    service: &'a str,
+    workspace: &'a Path,
+    config: &'a DevcontainerConfig,
+    features: &'a [ResolvedFeature],
+    remote_user: Option<&'a str>,
+    dev_home: &'a DevHome,
+    secrets: &'a ValidatedSecrets,
+    providers: &'a ProviderRegistry,
+    ssh_alias: SshAliasPlan,
+    caddy_ports: &'a [crate::caddy::PortEntry],
+}
+
+/// Everything after the Compose service container is ready: resolve `up`,
+/// attempt the store, run the hooks it is owed, install dotfiles, and register
+/// routes and the ssh alias before reporting the store's outcome.
+async fn set_up_compose_container(
+    setup: &ComposeSetup<'_>,
+    owed: ComposeHooks,
+    pill: &mut StatusGuard,
+    warnings_out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let up_env = resolve_up_secrets(setup.secrets, setup.providers).await?;
+    let target = UpStoreTarget {
+        runtime: setup.runtime,
+        container_id: setup.container_id,
+        container_name: setup.service,
+        workspace: setup.workspace,
+    };
+    let store =
+        HeldStoreWrite::attempt_or_clear(&target, setup.secrets, &up_env, warnings_out).await;
+    let steps = async {
+        run_compose_hooks(setup, owed, &up_env, pill).await?;
+        if let Some(ref dotfiles) = setup.config.dotfiles {
+            pill.phase("up: installing dotfiles", BUILD_STYLE);
+            install_dotfiles(
+                setup.runtime,
+                setup.container_id,
+                dotfiles,
+                setup.remote_user,
+            )
+            .await?;
+        }
+        register_routes(setup.workspace, setup.caddy_ports);
+        register_ssh_alias(
+            setup.ssh_alias,
+            setup.dev_home,
+            setup.workspace,
+            setup.runtime,
+            setup.container_id,
+            setup.remote_user,
+        )
+        .await;
+        anyhow::Ok(())
+    }
+    .await;
+    let ready = format!("Compose service '{}' is ready", setup.service);
+    let short_id = &setup.container_id[..12.min(setup.container_id.len())];
+    let detail = format!("(container {short_id})");
+    store.finish(steps, pill, warnings_out, &ready, Some(&detail))
+}
+
+async fn run_compose_hooks(
+    setup: &ComposeSetup<'_>,
+    owed: ComposeHooks,
+    up_env: &[(String, SecretValue)],
+    pill: &mut StatusGuard,
+) -> anyhow::Result<()> {
+    let run_kind = match owed {
+        ComposeHooks::None => return Ok(()),
+        ComposeHooks::Create => "create",
+        ComposeHooks::Start => "start",
+    };
+    pill.phase("up: running hooks", BUILD_STYLE);
+    let hook_log = begin_hook_log(setup.dev_home, setup.workspace, run_kind);
+    let target = HookTarget {
+        runtime: setup.runtime,
+        container_id: setup.container_id,
+        user: setup.remote_user,
+        workdir: None,
+        log: hook_log.as_ref(),
+        env: up_env,
+        host: &crate::session::host_identity().await,
+    };
+    let features = (!setup.features.is_empty()).then_some(setup.features);
+    if owed == ComposeHooks::Create {
+        run_create_hooks(&target, setup.config, features).await?;
+    } else {
+        run_start_hooks(&target, setup.config, features).await?;
+    }
     Ok(())
 }
 
@@ -2690,12 +3180,16 @@ mod tests {
         reject_secrets_override_for_compose, substitute_mounts,
     };
     use crate::cmux::{BUILD_KEY, Cmux};
+    use crate::devcontainer::HookTarget;
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
     use crate::devcontainer::features::MergedCapabilities;
     use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath, ProviderRegistry};
-    use crate::devcontainer::secrets::validate::validate_secrets_for_config;
-    use crate::devcontainer::secrets::{SecretValue, ValidatedSecrets};
+    use crate::devcontainer::secrets::up_store::{
+        is_up_store_clear, is_up_store_exec, is_up_store_write, up_store_key,
+    };
+    use crate::devcontainer::secrets::validate::{validate_secrets_for_config, with_base};
+    use crate::devcontainer::secrets::{SecretValue, ValidatedSecrets, expose, secrets_json};
     use crate::error::DevError;
     use crate::runtime::docker::DockerFlavor;
     use crate::runtime::{
@@ -2922,6 +3416,10 @@ mod tests {
     /// Parse a `secrets.json` into the value the compose guard inspects, the
     /// same way `run_with_runtime_with_providers` does.
     fn validated_secrets(workspace: &TempDir, content: &str) -> ValidatedSecrets {
+        validated_secrets_as(workspace, content, false)
+    }
+
+    fn validated_secrets_as(workspace: &TempDir, content: &str, compose: bool) -> ValidatedSecrets {
         let config_path = write_project_config(workspace, r#"{"image":"ubuntu:24.04"}"#);
         write_secrets_json(workspace, content);
         let fake = FakeProvider::answers_everything();
@@ -2930,6 +3428,7 @@ mod tests {
             &config_path,
             workspace.path(),
             None,
+            compose,
             &registry_with(workspace, &fake),
         )
         .expect("the fixture must parse and name a known provider")
@@ -2957,10 +3456,9 @@ mod tests {
             "error should name the discovered file: {msg}"
         );
         assert!(msg.contains("Compose"), "{msg}");
-        assert!(
-            msg.contains("createTime"),
-            "error should point at the way out: {msg}"
-        );
+        assert!(msg.contains(r#""resolve": "up""#), "{msg}");
+        assert!(msg.contains(r#""resolve": "exec""#), "{msg}");
+        assert!(!msg.contains("createTime"), "{msg}");
         assert!(
             !msg.contains("distinctive-reference"),
             "no reference body may reach the message: {msg}"
@@ -2982,6 +3480,13 @@ mod tests {
 
         reject_secrets_for_compose(&config, &secrets)
             .expect("an exec-time-only secret is injected on a path Compose shares");
+
+        let explicit = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","resolve":"exec"}}}"#,
+        );
+        reject_secrets_for_compose(&config, &explicit)
+            .expect("an explicit exec secret is injected on a path Compose shares");
     }
 
     /// A file mixing both is refused, and the message names only the entries
@@ -2994,7 +3499,8 @@ mod tests {
             &workspace,
             r#"{"version":1,"secrets":{
                 "AT_CREATE":"fake://one",
-                "AT_EXEC":{"provider":"fake","ref":"two","createTime":false}
+                "AT_EXEC":{"provider":"fake","ref":"two","createTime":false},
+                "AT_UP":{"provider":"fake","ref":"three","resolve":"up"}
             }}"#,
         );
 
@@ -3008,6 +3514,330 @@ mod tests {
             !msg.contains("AT_EXEC"),
             "an exec-time key is not what is being refused: {msg}"
         );
+        assert!(
+            !msg.contains("AT_UP"),
+            "an up-time key is not what is being refused: {msg}"
+        );
+    }
+
+    #[test]
+    fn compose_rejection_names_the_project_file_not_the_base() {
+        let config = compose_config();
+        let workspace = TempDir::new().unwrap();
+        let home = with_base(
+            workspace.path(),
+            r#"{"version":1,"secrets":{"BASE_KEY":"fake://one"}}"#,
+        );
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{"PROJ_KEY":"fake://two"}}"#,
+        );
+
+        let msg = format!(
+            "{}",
+            reject_secrets_for_compose(&config, &secrets).unwrap_err()
+        );
+
+        assert!(msg.contains("PROJ_KEY"), "{msg}");
+        assert!(msg.contains("secrets.json"), "{msg}");
+        assert!(!msg.contains("BASE_KEY"), "{msg}");
+        assert!(
+            !msg.contains(&home.base_secrets().display().to_string()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn compose_base_create_is_not_refused() {
+        let config = compose_config();
+        let workspace = TempDir::new().unwrap();
+        with_base(
+            workspace.path(),
+            r#"{"version":1,"secrets":{"BASE_KEY":"fake://one"}}"#,
+        );
+        let secrets = validated_secrets(&workspace, r#"{"version":1,"secrets":{}}"#);
+
+        reject_secrets_for_compose(&config, &secrets)
+            .expect("a base create entry is downgraded, not refused");
+    }
+
+    #[test]
+    fn base_create_downgrade_warning_names_keys_and_base_file() {
+        let line = super::base_create_downgrade_warning(
+            &["ONE".to_string(), "TWO".to_string()],
+            Path::new("/h/base/secrets.json"),
+        );
+
+        assert!(line.starts_with("Warning: "), "{line}");
+        assert!(line.contains("ONE") && line.contains("TWO"), "{line}");
+        assert!(line.contains("/h/base/secrets.json"), "{line}");
+        assert!(line.contains(r#""resolve": "up""#), "{line}");
+    }
+
+    /// Drives `set_up_compose_container` the way `run_compose` does, after a
+    /// Compose validation, for a container `owed` says is new or existing.
+    async fn compose_set_up_with(
+        rt: &UpFakeRuntime,
+        fake: &FakeProvider,
+        workspace: &TempDir,
+        secrets: (&str, &str),
+        config: &str,
+        owed: super::ComposeHooks,
+    ) -> anyhow::Result<()> {
+        let dev_home = DevHome::at(workspace.path().join("dev-home"));
+        let (result, _) = compose_set_up_in(
+            rt,
+            fake,
+            workspace,
+            secrets,
+            config,
+            owed,
+            (&dev_home, super::SshAliasPlan::LeaveAlone),
+        )
+        .await;
+        result
+    }
+
+    /// [`compose_set_up_with`] in `dev_home` with an alias plan, returning
+    /// every warning it printed.
+    async fn compose_set_up_in(
+        rt: &UpFakeRuntime,
+        fake: &FakeProvider,
+        workspace: &TempDir,
+        (base, project): (&str, &str),
+        config: &str,
+        owed: super::ComposeHooks,
+        (dev_home, ssh_alias): (&DevHome, super::SshAliasPlan),
+    ) -> (anyhow::Result<()>, String) {
+        with_base(workspace.path(), base);
+        let secrets = validated_secrets_as(workspace, project, true);
+        let config: DevcontainerConfig = serde_json::from_str(config).unwrap();
+        let providers = registry_with(workspace, fake);
+        let setup = super::ComposeSetup {
+            runtime: rt,
+            container_id: "fake-id",
+            service: "app",
+            workspace: workspace.path(),
+            config: &config,
+            features: &[],
+            remote_user: None,
+            dev_home,
+            secrets: &secrets,
+            providers: &providers,
+            ssh_alias,
+            caddy_ports: &[],
+        };
+        let mut pill = Cmux::recording().0.guard(BUILD_KEY, false);
+        let mut out = Vec::new();
+        let result = super::set_up_compose_container(&setup, owed, &mut pill, &mut out).await;
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    /// [`compose_set_up_with`] for a running container that is owed no hooks.
+    async fn compose_up_with(
+        rt: &UpFakeRuntime,
+        fake: &FakeProvider,
+        workspace: &TempDir,
+        base: &str,
+        project: &str,
+    ) {
+        compose_set_up_with(
+            rt,
+            fake,
+            workspace,
+            (base, project),
+            r#"{"image":"ubuntu:24.04"}"#,
+            super::ComposeHooks::None,
+        )
+        .await
+        .expect("resolving and storing must succeed");
+    }
+
+    fn assert_stored_once(rt: &UpFakeRuntime, fake: &FakeProvider) {
+        assert_eq!(fake.calls(), 1);
+        let stores: Vec<_> = rt
+            .execs()
+            .into_iter()
+            .filter(|c| is_up_store_write(&c.0))
+            .collect();
+        assert_eq!(stores.len(), 1, "exactly one store write");
+        assert!(stores[0].3.iter().any(|(_, v)| v == "v"));
+    }
+
+    #[tokio::test]
+    async fn compose_base_up_secret_is_resolved_and_stored() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        let fake = FakeProvider::answering(&[("TOKEN", "v")]);
+        compose_up_with(
+            &rt,
+            &fake,
+            &workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://item"}}"#,
+            r#"{"version":1,"secrets":{}}"#,
+        )
+        .await;
+        assert_stored_once(&rt, &fake);
+    }
+
+    #[tokio::test]
+    async fn compose_project_up_secret_is_stored() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        let fake = FakeProvider::answering(&[("TOKEN", "v")]);
+        compose_up_with(
+            &rt,
+            &fake,
+            &workspace,
+            r#"{"version":1,"secrets":{}}"#,
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","resolve":"up"}}}"#,
+        )
+        .await;
+        assert_stored_once(&rt, &fake);
+    }
+
+    #[tokio::test]
+    async fn compose_exec_secrets_are_not_resolved_at_up() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        let fake = FakeProvider::answering(&[("TOKEN", "v")]);
+        compose_up_with(
+            &rt,
+            &fake,
+            &workspace,
+            r#"{"version":1,"secrets":{}}"#,
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","resolve":"exec"}}}"#,
+        )
+        .await;
+        assert_eq!(fake.calls(), 0);
+        let store_execs: Vec<_> = rt
+            .execs()
+            .into_iter()
+            .filter(|c| is_up_store_exec(&c.0))
+            .collect();
+        assert_eq!(store_execs.len(), 1, "one clear and no write");
+        assert!(is_up_store_clear(&store_execs[0].0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compose_writes_the_up_store_before_the_create_hooks() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        let fake = FakeProvider::answering(&[("TOKEN", "v")]);
+        compose_set_up_with(
+            &rt,
+            &fake,
+            &workspace,
+            (
+                r#"{"version":1,"secrets":{}}"#,
+                r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","resolve":"up"}}}"#,
+            ),
+            r#"{"image":"ubuntu:24.04","postCreateCommand":"echo hook-ran"}"#,
+            super::ComposeHooks::Create,
+        )
+        .await
+        .unwrap();
+        let execs = rt.execs();
+        let hook = execs.iter().position(is_hook_exec).expect("the hook ran");
+        assert!(carries(&execs[hook], "TOKEN", "v"), "hooks get up from env");
+        let store = execs
+            .iter()
+            .position(|c| is_up_store_write(&c.0))
+            .expect("a store write");
+        assert!(store < hook, "the store is written before the hooks");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_compose_store_failure_is_reported_after_the_hooks_and_alias() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::up_store_write_fails(1);
+        let fake = FakeProvider::answering(&[(UP_KEY, UP_VALUE)]);
+        let (result, _) = compose_set_up_in(
+            &rt,
+            &fake,
+            &workspace,
+            (
+                r#"{"version":1,"secrets":{}}"#,
+                &secrets_json(&[(UP_KEY, "up")]),
+            ),
+            r#"{"image":"ubuntu:24.04","postCreateCommand":"echo hook-ran"}"#,
+            super::ComposeHooks::Create,
+            (&dev_home, super::SshAliasPlan::Register),
+        )
+        .await;
+        assert_store_failure_came_last(&rt, result, &dev_home, &workspace, true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compose_warns_through_the_real_path_when_the_clear_fails() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::up_store_clear_fails(1);
+        let (result, warnings) = compose_set_up_in(
+            &rt,
+            &FakeProvider::answering(&[]),
+            &workspace,
+            (
+                r#"{"version":1,"secrets":{}}"#,
+                r#"{"version":1,"secrets":{}}"#,
+            ),
+            r#"{"image":"ubuntu:24.04"}"#,
+            super::ComposeHooks::None,
+            (&DevHome::at(home.path()), super::SshAliasPlan::LeaveAlone),
+        )
+        .await;
+        result.expect("a failed clear must not fail dev up");
+        assert!(
+            warnings
+                .starts_with("Warning: could not clear stale `up` secrets in container `app`: "),
+            "{warnings}"
+        );
+    }
+
+    /// The single exec [`compose_set_up_with`] runs for a project with no
+    /// `up` entries, owed `owed`, and no hooks.
+    async fn compose_store_execs_without_up_secrets(owed: super::ComposeHooks) -> Vec<ExecCall> {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        compose_set_up_with(
+            &rt,
+            &FakeProvider::answering(&[]),
+            &workspace,
+            (
+                r#"{"version":1,"secrets":{}}"#,
+                r#"{"version":1,"secrets":{}}"#,
+            ),
+            r#"{"image":"ubuntu:24.04"}"#,
+            owed,
+        )
+        .await
+        .unwrap();
+        rt.execs()
+    }
+
+    /// A Compose service may share `/dev/shm` (`ipc: host`, `ipc: service:x`),
+    /// so starting it does not empty an earlier store, and it is cleared.
+    #[tokio::test(start_paused = true)]
+    async fn compose_clears_the_store_in_a_started_container_without_up_secrets() {
+        let execs = compose_store_execs_without_up_secrets(super::ComposeHooks::Start).await;
+        assert_eq!(execs.len(), 1, "{execs:?}");
+        assert!(is_up_store_clear(&execs[0].0));
+    }
+
+    /// A service Compose just created, or recreated for `--rebuild`, can join
+    /// a `/dev/shm` that outlives it (`ipc: host`, `ipc: service:x`), so it is
+    /// cleared too.
+    #[tokio::test(start_paused = true)]
+    async fn compose_clears_the_store_in_a_created_container_without_up_secrets() {
+        let fresh = super::compose_hooks_owed(false, false, false);
+        let rebuilt = super::compose_hooks_owed(true, true, true);
+        for owed in [fresh, rebuilt] {
+            let execs = compose_store_execs_without_up_secrets(owed).await;
+            assert_eq!(execs.len(), 1, "{owed:?}: {execs:?}");
+            assert!(is_up_store_clear(&execs[0].0), "{owed:?}");
+        }
     }
 
     #[test]
@@ -3366,7 +4196,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// One command `exec` was asked to run, and the user it ran as.
-    type ExecCall = (Vec<String>, Option<String>, Option<String>);
+    type ExecCall = (
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+    );
 
     /// Stand-in runtime for `run_with_runtime`, modelling a daemon: created
     /// containers land in `containers`, `start_container` marks them running,
@@ -3421,6 +4256,22 @@ mod tests {
         /// `exec` answers, but with a non-zero status for a command that
         /// cannot fail on its own.
         exec_exit_code: i32,
+        /// Exit code only for the `up` store write, so the readiness probe
+        /// still passes while the write fails.
+        up_store_exit_code: i32,
+        /// Exit code only for the `up` store clear.
+        up_store_clear_exit_code: i32,
+        /// Exit code only for lifecycle hooks.
+        hook_exit_code: i32,
+        /// What `container_env` reports; `None` declines the way a runtime
+        /// without an env read does.
+        container_env: Option<Vec<String>>,
+        /// `container_env` fails the way a runtime that has the read can.
+        container_env_fails: bool,
+        container_env_calls: Arc<AtomicUsize>,
+        /// Ids passed to `stop_container` and `remove_container`, in order.
+        stopped: Arc<Mutex<Vec<String>>>,
+        removed: Arc<Mutex<Vec<String>>>,
         /// `exec`'s stdout for every call, standing in for a container's
         /// `printenv` reply — empty by default, since only the ssh-agent
         /// relay read-back cares what stdout says.
@@ -3464,6 +4315,14 @@ mod tests {
                 exec_never_returns: false,
                 exec_refusals_before_silence: None,
                 exec_exit_code: 0,
+                up_store_exit_code: 0,
+                up_store_clear_exit_code: 0,
+                hook_exit_code: 0,
+                container_env: None,
+                container_env_fails: false,
+                container_env_calls: Arc::new(AtomicUsize::new(0)),
+                stopped: Arc::new(Mutex::new(Vec::new())),
+                removed: Arc::new(Mutex::new(Vec::new())),
                 exec_stdout: String::new(),
                 login_lookup_fails: false,
                 execs: Arc::new(Mutex::new(Vec::new())),
@@ -3528,6 +4387,53 @@ mod tests {
             }
         }
 
+        /// Everything works except the root exec that writes the `up` store.
+        fn up_store_write_fails(exit_code: i32) -> Self {
+            Self {
+                up_store_exit_code: exit_code,
+                ..Self::ok()
+            }
+        }
+
+        /// Everything works except the root exec that clears the `up` store.
+        fn up_store_clear_fails(exit_code: i32) -> Self {
+            Self {
+                up_store_clear_exit_code: exit_code,
+                ..Self::ok()
+            }
+        }
+
+        /// Lifecycle hooks exit with `exit_code`; every other exec succeeds.
+        fn hooks_fail(mut self, exit_code: i32) -> Self {
+            self.hook_exit_code = exit_code;
+            self
+        }
+
+        /// `container_env` answers with these `NAME=value` lines.
+        fn with_container_env(mut self, env: &[&str]) -> Self {
+            self.container_env = Some(env.iter().map(|line| line.to_string()).collect());
+            self
+        }
+
+        /// `container_env` fails with an error that quotes
+        /// [`ENV_READ_SENTINEL`], the way a decode error can quote the env.
+        fn container_env_failing(mut self) -> Self {
+            self.container_env_fails = true;
+            self
+        }
+
+        fn container_env_calls(&self) -> usize {
+            self.container_env_calls.load(Ordering::Relaxed)
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
+        }
+
+        fn stopped(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
+        }
+
         /// The exec path works, but the runtime reports the image has no such
         /// executable, the way docker declines to start one.
         fn has_no_shell() -> Self {
@@ -3567,6 +4473,15 @@ mod tests {
 
         fn execs(&self) -> Vec<ExecCall> {
             self.execs.lock().unwrap().clone()
+        }
+
+        /// [`Self::execs`] without the `up` store's own, which every reuse
+        /// runs once. Create-path counts use [`Self::execs`].
+        fn execs_besides_the_store(&self) -> Vec<ExecCall> {
+            self.execs()
+                .into_iter()
+                .filter(|c| !is_up_store_exec(&c.0))
+                .collect()
         }
 
         fn failing(create: bool, start: bool) -> Self {
@@ -3776,12 +4691,28 @@ mod tests {
             })
         }
 
-        fn stop_container(&self, _id: &str) -> BoxFut<'_, ()> {
-            unused()
+        fn stop_container(&self, id: &str) -> BoxFut<'_, ()> {
+            self.stopped.lock().unwrap().push(id.to_string());
+            Box::pin(async { Ok(()) })
         }
 
-        fn remove_container(&self, _id: &str) -> BoxFut<'_, ()> {
-            unused()
+        fn remove_container(&self, id: &str) -> BoxFut<'_, ()> {
+            self.removed.lock().unwrap().push(id.to_string());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn container_env(&self, _id: &str) -> BoxFut<'_, Vec<String>> {
+            self.container_env_calls.fetch_add(1, Ordering::Relaxed);
+            let env = self.container_env.clone();
+            let fails = self.container_env_fails;
+            Box::pin(async move {
+                if fails {
+                    return Err(DevError::Runtime(format!(
+                        "inspect failed (test-injected): invalid value {ENV_READ_SENTINEL}"
+                    )));
+                }
+                env.ok_or_else(|| DevError::Unsupported("container_env (test-declined)".into()))
+            })
         }
 
         fn exec(
@@ -3790,14 +4721,23 @@ mod tests {
             cmd: &[String],
             user: Option<&str>,
             workdir: Option<&str>,
-            _env: &[(String, SecretValue)],
+            env: &[(String, SecretValue)],
         ) -> BoxFut<'_, ExecResult> {
             let cmd = cmd.to_vec();
             let user = user.map(str::to_string);
             let workdir = workdir.map(str::to_string);
+            let env = expose(env);
             let exec_fails = self.exec_fails;
             let command_missing = self.exec_command_missing;
-            let exit_code = self.exec_exit_code;
+            let exit_code = if is_up_store_write(&cmd) && self.up_store_exit_code != 0 {
+                self.up_store_exit_code
+            } else if is_up_store_clear(&cmd) && self.up_store_clear_exit_code != 0 {
+                self.up_store_clear_exit_code
+            } else if is_hook_command(&cmd) && self.hook_exit_code != 0 {
+                self.hook_exit_code
+            } else {
+                self.exec_exit_code
+            };
             let settling = self.exec_errors_before_success.clone();
             let never_returns = self.exec_never_returns;
             let refusals_left = self.exec_refusals_before_silence.clone();
@@ -3809,7 +4749,7 @@ mod tests {
                 // would make every count in these tests — of probes, of hooks —
                 // depend on how often sessions happen to be swept.
                 if !crate::session::is_session_machinery(&cmd) {
-                    execs.lock().unwrap().push((cmd, user, workdir));
+                    execs.lock().unwrap().push((cmd, user, workdir, env));
                 }
                 // A real exec talks to a daemon, so it is Pending on its first
                 // poll. Answering synchronously would let this fake succeed
@@ -4004,7 +4944,10 @@ mod tests {
         secrets_file: Option<&Path>,
         secrets_override: Option<&Path>,
     ) -> anyhow::Result<()> {
-        super::run_with_runtime(
+        // A `~/.dev/` the test owns, or the developer's own base secrets would
+        // be validated and resolved against the real providers.
+        let dev_home_dir = TempDir::new().unwrap();
+        super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
             /* rebuild */ false,
@@ -4016,7 +4959,10 @@ mod tests {
             /* secrets_file */ secrets_file,
             /* no_base */ true,
             /* secrets_override */ secrets_override,
+            &registry_with(workspace, &FakeProvider::answers_everything()),
+            &DevHome::at(dev_home_dir.path()),
             &Cmux::recording().0,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4083,6 +5029,7 @@ mod tests {
             providers,
             &DevHome::at(dev_home_dir.path()),
             &Cmux::recording().0,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4096,7 +5043,7 @@ mod tests {
         workspace: &TempDir,
         dev_home: &DevHome,
     ) -> anyhow::Result<()> {
-        let providers = ProviderRegistry::with_builtins(workspace.path());
+        let providers = registry_with(workspace, &FakeProvider::answers_everything());
         super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
@@ -4112,6 +5059,7 @@ mod tests {
             &providers,
             dev_home,
             &Cmux::recording().0,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4124,7 +5072,7 @@ mod tests {
         dev_home: &DevHome,
         no_base: bool,
     ) -> anyhow::Result<()> {
-        let providers = ProviderRegistry::with_builtins(workspace.path());
+        let providers = registry_with(workspace, &FakeProvider::answers_everything());
         super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
@@ -4140,6 +5088,7 @@ mod tests {
             &providers,
             dev_home,
             &Cmux::recording().0,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4162,7 +5111,7 @@ mod tests {
         cmux: &Cmux,
     ) -> anyhow::Result<()> {
         let dev_home_dir = TempDir::new().unwrap();
-        let providers = ProviderRegistry::with_builtins(workspace.path());
+        let providers = registry_with(workspace, &FakeProvider::answers_everything());
         super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
@@ -4178,6 +5127,7 @@ mod tests {
             &providers,
             &DevHome::at(dev_home_dir.path()),
             cmux,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4346,18 +5296,22 @@ mod tests {
         let dev_home = DevHome::at(dev_home_dir.path());
         let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, &dev_home);
 
-        super::reuse_running_container(
-            &rt,
-            workspace.path(),
-            &config,
-            &relay,
-            &container,
-            &dev_home,
-            super::SshAliasPlan::LeaveAlone,
-            &mut pill,
-        )
-        .await
-        .expect("a running container that runs commands must be reused");
+        let secrets = ValidatedSecrets::default();
+        let providers = ProviderRegistry::empty(workspace.path(), PluginPath::default());
+        let ctx = super::ReuseContext {
+            runtime: &rt,
+            workspace: workspace.path(),
+            config: &config,
+            config_path: &config_path,
+            relay: &relay,
+            dev_home: &dev_home,
+            ssh_alias: super::SshAliasPlan::LeaveAlone,
+            secrets: &secrets,
+            providers: &providers,
+        };
+        super::reuse_running_container(&ctx, &container, &mut pill, &mut Vec::new())
+            .await
+            .expect("a running container that runs commands must be reused");
         drop(pill);
 
         assert_eq!(
@@ -4370,6 +5324,50 @@ mod tests {
                 "Container 'already-running' is already running".to_string(),
             ])
         );
+    }
+
+    /// A store failure is reported after the rest, but it is still a failure,
+    /// so the notification must not say the container is ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_failure_is_not_recorded_as_a_success() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt =
+            UpFakeRuntime::up_store_write_fails(1).already_running(workspace.path(), &config_path);
+        let container = rt.containers.lock().unwrap()[0].clone();
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let (cmux, recorder) = Cmux::recording();
+        let mut pill = cmux
+            .guard(BUILD_KEY, true)
+            .notify_after("dev up", std::time::Duration::ZERO);
+        let dev_home_dir = TempDir::new().unwrap();
+        let dev_home = DevHome::at(dev_home_dir.path());
+        let relay = crate::ssh_agent::RelayConsent::resolve_in(&config, &config_path, &dev_home);
+        let secrets = secrets_from(&workspace, &[(UP_KEY, "up")]);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let ctx = super::ReuseContext {
+            runtime: &rt,
+            workspace: workspace.path(),
+            config: &config,
+            config_path: &config_path,
+            relay: &relay,
+            dev_home: &dev_home,
+            ssh_alias: super::SshAliasPlan::LeaveAlone,
+            secrets: &secrets,
+            providers: &providers,
+        };
+        super::reuse_container(&ctx, &container, &mut pill, &mut Vec::new())
+            .await
+            .expect_err("the store write failed");
+        drop(pill);
+
+        let notify = recorder
+            .calls()
+            .into_iter()
+            .find(|c| c.first().map(String::as_str) == Some("notify"))
+            .expect("a notification");
+        assert_eq!(notify.last().map(String::as_str), Some("failed"));
     }
 
     /// A run that finishes well under `NOTIFY_AFTER` sends no notification.
@@ -4725,7 +5723,7 @@ mod tests {
             .await
             .expect("up should succeed with a cooperating fake runtime");
 
-        let (_, user, _) = rt.execs().first().cloned().expect("the gate must probe");
+        let (_, user, _, _) = rt.execs().first().cloned().expect("the gate must probe");
         assert_eq!(
             user.as_deref(),
             Some("vscode"),
@@ -4917,7 +5915,8 @@ mod tests {
         workspace: &TempDir,
         update_remote_user_uid_default: &str,
     ) -> anyhow::Result<()> {
-        super::run_with_runtime(
+        let dev_home_dir = TempDir::new().unwrap();
+        super::run_with_runtime_with_providers(
             workspace.path(),
             rt,
             /* rebuild */ false,
@@ -4929,7 +5928,10 @@ mod tests {
             /* secrets_file */ None,
             /* no_base */ true,
             /* secrets_override */ None,
+            &registry_with(workspace, &FakeProvider::answers_everything()),
+            &DevHome::at(dev_home_dir.path()),
             &Cmux::recording().0,
+            &mut std::io::stderr(),
         )
         .await
     }
@@ -4983,7 +5985,7 @@ mod tests {
             .await
             .expect("a running container that runs commands must be reused");
         assert_eq!(
-            rt.execs().len(),
+            rt.execs_besides_the_store().len(),
             1,
             "a project that did not ask for the ssh agent relay pays only the readiness probe"
         );
@@ -5011,7 +6013,7 @@ mod tests {
             .await
             .expect("a running container that runs commands must be reused");
 
-        let execs = rt.execs();
+        let execs = rt.execs_besides_the_store();
         assert_eq!(
             execs.len(),
             2,
@@ -5039,10 +6041,10 @@ mod tests {
             .expect("a refused relay must not fail the run, only stay off");
 
         assert_eq!(
-            rt.execs().len(),
+            rt.execs_besides_the_store().len(),
             1,
             "a project the base has not allowed pays only the readiness probe, got: {:?}",
-            rt.execs()
+            rt.execs_besides_the_store()
         );
     }
 
@@ -5084,7 +6086,7 @@ mod tests {
             .await
             .expect("a running reusable container should stay reusable");
 
-        let (_, _, workdir) = rt.execs().first().cloned().expect("the gate must probe");
+        let (_, _, workdir, _) = rt.execs().first().cloned().expect("the gate must probe");
         assert_eq!(workdir.as_deref(), Some("/srv/app/packages/api"));
         assert!(
             rt.created_config.lock().unwrap().is_none(),
@@ -5111,7 +6113,7 @@ mod tests {
             .await
             .expect("a running reusable container should stay reusable");
 
-        let (_, _, workdir) = rt.execs().first().cloned().expect("the gate must probe");
+        let (_, _, workdir, _) = rt.execs().first().cloned().expect("the gate must probe");
         assert_eq!(workdir.as_deref(), Some("/srv/app"));
     }
 
@@ -5135,7 +6137,7 @@ mod tests {
             .await
             .expect("a stopped reusable container should be started in place");
 
-        let execs = rt.execs();
+        let execs = rt.execs_besides_the_store();
         assert_eq!(
             execs.len(),
             2,
@@ -5144,7 +6146,7 @@ mod tests {
         assert!(
             execs
                 .iter()
-                .all(|(_, _, workdir)| workdir.as_deref() == Some("/srv/app/packages/api")),
+                .all(|(_, _, workdir, _)| workdir.as_deref() == Some("/srv/app/packages/api")),
             "every workspace-scoped exec must use workspaceFolder, got: {execs:?}"
         );
         assert!(
@@ -5175,7 +6177,7 @@ mod tests {
             .await
             .expect("a stopped reusable container should be started in place");
 
-        let execs = rt.execs();
+        let execs = rt.execs_besides_the_store();
         assert_eq!(
             execs.len(),
             3,
@@ -5212,7 +6214,7 @@ mod tests {
     fn hook_bodies(execs: &[ExecCall]) -> Vec<String> {
         execs
             .iter()
-            .filter_map(|(cmd, _, _)| {
+            .filter_map(|(cmd, _, _, _)| {
                 // `recorded_script` is what wraps a hook body, and only hooks
                 // go through it — the readiness probe execs a bare script.
                 let (before_status, _) = cmd.get(2)?.split_once("\n__dev_rc=$?")?;
@@ -6277,7 +7279,11 @@ mod tests {
             r#"{"version":1,"secrets":{"TOKEN":"file://${localWorkspaceFolder}/token"}}"#,
         );
         let rt = UpFakeRuntime::ok();
-        run_up_with_fake(&rt, &workspace)
+        let mut providers = ProviderRegistry::empty(workspace.path(), PluginPath::default());
+        providers.register(Box::new(
+            crate::devcontainer::secrets::providers::FileProvider::new(workspace.path()),
+        ));
+        run_up_with_providers(&rt, &workspace, &providers)
             .await
             .expect("a valid secrets.json must not fail the command");
         assert!(rt.create_was_attempted());
@@ -6496,8 +7502,8 @@ mod tests {
     // ---- up-path secret invariants ----
     //
     // Four guarantees that a tidy-up of `run_with_runtime` would otherwise
-    // break silently: resolution stays on the create path, no `Debug` prints a
-    // value, an optional failure is survivable, and a resolved secret outranks
+    // break silently: `create` resolution stays on the create path, no `Debug`
+    // prints a value, an optional failure is survivable, and a resolved secret outranks
     // every other env tier.
 
     /// Hoisting the resolve call above the existing-container lookup costs a
@@ -6519,10 +7525,926 @@ mod tests {
             "a zero call count proves nothing if the run never reached either branch"
         );
         assert_eq!(
-            rt.execs().len(),
+            rt.execs_besides_the_store().len(),
             1,
             "the reuse arm must still run through the readiness probe"
         );
+    }
+
+    const CREATE_KEY: &str = "CREATE_KEY";
+    const UP_KEY: &str = "UP_KEY";
+    const EXEC_KEY: &str = "EXEC_KEY";
+    const UP_VALUE: &str = "up-value-sentinel";
+    const CREATE_VALUE: &str = "create-value-sentinel";
+    const EXEC_VALUE: &str = "exec-value-sentinel";
+    /// What a failed env read quotes, standing in for a `create` value.
+    const ENV_READ_SENTINEL: &str = "CREATE_KEY=env-read-sentinel";
+
+    /// [`run_up_with_providers`] in `dev_home`, returning the run's outcome and
+    /// every warning it printed.
+    async fn run_up_capturing_warnings(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+        dev_home: &DevHome,
+    ) -> (anyhow::Result<()>, String) {
+        run_up_capturing_warnings_with(rt, workspace, providers, dev_home, None).await
+    }
+
+    /// [`run_up_capturing_warnings`] with a `--secrets` path.
+    async fn run_up_capturing_warnings_with(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        providers: &ProviderRegistry,
+        dev_home: &DevHome,
+        secrets_override: Option<&Path>,
+    ) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let result = super::run_with_runtime_with_providers(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* secrets_file */ None,
+            /* no_base */ true,
+            secrets_override,
+            providers,
+            dev_home,
+            &Cmux::recording().0,
+            &mut out,
+        )
+        .await;
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    fn all_values_fake() -> FakeProvider {
+        FakeProvider::answering(&[
+            (CREATE_KEY, CREATE_VALUE),
+            (UP_KEY, UP_VALUE),
+            (EXEC_KEY, EXEC_VALUE),
+        ])
+    }
+
+    fn is_hook_exec(call: &ExecCall) -> bool {
+        is_hook_command(&call.0)
+    }
+
+    fn is_hook_command(cmd: &[String]) -> bool {
+        cmd.get(2)
+            .is_some_and(|script| script.contains("\n__dev_rc=$?"))
+    }
+
+    fn carries(call: &ExecCall, key: &str, value: &str) -> bool {
+        call.3.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    /// The store write names its env slots by index, so only the value says
+    /// what it carries.
+    fn carries_value(call: &ExecCall, value: &str) -> bool {
+        call.3.iter().any(|(_, v)| v == value)
+    }
+
+    #[tokio::test]
+    async fn up_resolves_create_and_up_secrets_in_one_call() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            &secrets_json(&[(CREATE_KEY, "create"), (UP_KEY, "up")]),
+        );
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect("create and up secrets must resolve");
+        assert_eq!(fake.calls(), 1, "one prompt per dev up");
+        let mut batches = fake.batch_keys();
+        assert_eq!(batches.len(), 1);
+        batches[0].sort();
+        assert_eq!(batches[0], vec![CREATE_KEY, UP_KEY]);
+    }
+
+    #[tokio::test]
+    async fn up_keeps_up_secrets_out_of_the_container_env() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            &secrets_json(&[(CREATE_KEY, "create"), (UP_KEY, "up")]),
+        );
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let env = rt.created_config().env;
+        assert_eq!(env.get(CREATE_KEY), Some(&CREATE_VALUE.to_string()));
+        assert!(
+            !env.contains_key(UP_KEY),
+            "an up value must not be baked in"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_writes_up_secrets_to_the_store_as_root_before_the_hooks() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postCreateCommand":"echo hook-ran"}"#,
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let execs = rt.execs();
+        let store = execs
+            .iter()
+            .position(|c| is_up_store_write(&c.0) && carries_value(c, UP_VALUE))
+            .expect("a store write carrying the value");
+        assert_eq!(execs[store].1.as_deref(), Some("root"));
+        assert!(
+            !execs[store].0.iter().any(|arg| arg.contains(UP_VALUE)),
+            "the value must travel in env, never argv"
+        );
+        let hook = execs.iter().position(is_hook_exec).expect("the hook ran");
+        assert!(
+            carries(&execs[hook], UP_KEY, UP_VALUE),
+            "hooks get up from env"
+        );
+        assert!(store < hook, "the store is written before the hooks");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_hooks_get_up_values_on_create() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04",
+                "onCreateCommand":"echo on-create",
+                "postCreateCommand":["echo post-create"],
+                "postStartCommand":{"a":"echo start-a","b":"echo start-b"}}"#,
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let hooks: Vec<ExecCall> = rt.execs().into_iter().filter(is_hook_exec).collect();
+        assert_eq!(hooks.len(), 4, "string, array and two parallel branches");
+        for hook in &hooks {
+            assert!(
+                carries(hook, UP_KEY, UP_VALUE),
+                "hook without env: {hook:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_hooks_never_see_exec_secrets() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postCreateCommand":"echo hook-ran"}"#,
+        );
+        write_secrets_json(
+            &workspace,
+            &secrets_json(&[(UP_KEY, "up"), (EXEC_KEY, "exec")]),
+        );
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        assert!(
+            fake.batch_keys().iter().flatten().all(|k| k != EXEC_KEY),
+            "dev up must not resolve exec entries"
+        );
+        let execs = rt.execs();
+        let hooks: Vec<&ExecCall> = execs.iter().filter(|c| is_hook_exec(c)).collect();
+        assert_eq!(hooks.len(), 1);
+        assert!(carries(hooks[0], UP_KEY, UP_VALUE));
+        for call in &execs {
+            assert!(
+                call.3.iter().all(|(k, v)| k != EXEC_KEY && v != EXEC_VALUE),
+                "exec value leaked into {call:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_restarting_a_stopped_container_resolves_only_up_secrets() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postStartCommand":"echo restarted"}"#,
+        );
+        write_secrets_json(
+            &workspace,
+            &secrets_json(&[(CREATE_KEY, "create"), (UP_KEY, "up")]),
+        );
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        assert_eq!(fake.batch_keys(), vec![vec![UP_KEY.to_string()]]);
+        let execs = rt.execs();
+        assert!(
+            execs
+                .iter()
+                .any(|c| is_up_store_write(&c.0) && carries_value(c, UP_VALUE))
+        );
+        let hooks: Vec<&ExecCall> = execs.iter().filter(|c| is_hook_exec(c)).collect();
+        assert_eq!(hooks.len(), 1);
+        assert!(carries(hooks[0], UP_KEY, UP_VALUE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_restart_writes_the_store_before_post_start() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postStartCommand":"echo restarted"}"#,
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let execs = rt.execs();
+        let hook = execs.iter().position(is_hook_exec).expect("postStart ran");
+        let store = execs
+            .iter()
+            .position(|c| is_up_store_write(&c.0))
+            .expect("a store write");
+        assert!(store < hook, "the store is written before postStart");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_restart_with_a_failing_up_secret_does_not_start_the_container() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = FakeProvider::answering(&[]).also_failing_for(UP_KEY);
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .expect_err("a required up secret that cannot resolve fails the command");
+        assert!(rt.started_id.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_reusing_a_running_container_resolves_and_stores_up_secrets() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postStartCommand":"echo restarted"}"#,
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        assert!(!rt.create_was_attempted());
+        let execs = rt.execs();
+        assert!(
+            execs
+                .iter()
+                .any(|c| c.1.as_deref() == Some("root") && carries_value(c, UP_VALUE))
+        );
+        assert!(
+            !execs.iter().any(is_hook_exec),
+            "reuse keeps postStart's old value"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_reuse_with_only_optional_unresolved_up_keys_still_rewrites_the_store() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(
+            &workspace,
+            r#"{"version":1,"secrets":{"UP_KEY":{"provider":"fake","ref":"r","resolve":"up","optional":true}}}"#,
+        );
+        let fake = FakeProvider::answering(&[]).also_failing_for(UP_KEY);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let execs = rt.execs();
+        let store: Vec<&ExecCall> = execs.iter().filter(|c| is_up_store_write(&c.0)).collect();
+        assert_eq!(store.len(), 1, "the stale value must be replaced");
+        assert_eq!(store[0].1.as_deref(), Some("root"));
+        assert!(store[0].3.is_empty(), "no value to store");
+    }
+
+    fn store_execs(rt: &UpFakeRuntime) -> Vec<ExecCall> {
+        rt.execs()
+            .into_iter()
+            .filter(|c| is_up_store_exec(&c.0))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_reuse_without_up_secrets_makes_no_call_and_one_clear() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(EXEC_KEY, "exec")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), 0);
+        let store = store_execs(&rt);
+        assert_eq!(store.len(), 1, "exactly one store exec: {store:?}");
+        assert!(is_up_store_clear(&store[0].0));
+        assert_eq!(store[0].1.as_deref(), Some("root"));
+        assert!(store[0].3.is_empty());
+        assert_eq!(rt.execs().len(), 2, "the readiness probe and the clear");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_warns_and_still_succeeds_when_the_clear_fails() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let fake = all_values_fake();
+        let rt =
+            UpFakeRuntime::up_store_clear_fails(1).already_running(workspace.path(), &config_path);
+        let (result, warnings) = run_up_capturing_warnings(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &fake),
+            &DevHome::at(home.path()),
+        )
+        .await;
+        result.expect("a failed clear must not fail dev up");
+        let store = store_execs(&rt);
+        assert_eq!(store.len(), 1);
+        assert!(is_up_store_clear(&store[0].0));
+        let warnings: Vec<&str> = warnings.lines().collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "Warning: could not clear stale `up` secrets in container `already-running`: "
+            ),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("failed to clear the secret store"),
+            "the clear's own error: {}",
+            warnings[0]
+        );
+    }
+
+    /// A plain-image container's `/dev/shm` is private to it, so a restart
+    /// leaves it empty and there is no store to clear.
+    #[tokio::test(start_paused = true)]
+    async fn up_restart_without_up_secrets_runs_no_store_exec() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(EXEC_KEY, "exec")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        assert!(rt.started_id.lock().unwrap().is_some(), "it was restarted");
+        assert!(store_execs(&rt).is_empty(), "{:?}", store_execs(&rt));
+    }
+
+    /// A plain-image container this `dev up` created has a private `/dev/shm`
+    /// of its own, so there is no store to clear.
+    #[tokio::test(start_paused = true)]
+    async fn up_create_without_up_secrets_runs_no_store_exec() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(EXEC_KEY, "exec")]));
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(
+            &rt,
+            &workspace,
+            &registry_with(&workspace, &all_values_fake()),
+        )
+        .await
+        .unwrap();
+        assert!(rt.started_id.lock().unwrap().is_some(), "it was created");
+        assert!(store_execs(&rt).is_empty(), "{:?}", store_execs(&rt));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_stores_under_the_workspaces_own_key() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let fake = all_values_fake();
+        let rt = UpFakeRuntime::ok();
+        run_up_with_providers(&rt, &workspace, &registry_with(&workspace, &fake))
+            .await
+            .unwrap();
+        let store = store_execs(&rt);
+        assert_eq!(store.len(), 1);
+        let expected = crate::util::naming::workspace_hash(workspace.path());
+        assert_eq!(up_store_key(&store[0].0), Some(expected));
+    }
+
+    /// A config with `sshServer` on, the given extra fields, and one `up` key,
+    /// so a run's alias registration and store write are both observable.
+    fn ssh_enabled_up_workspace(extra: &str) -> (TempDir, std::path::PathBuf) {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            &format!(r#"{{"image":"ubuntu:24.04","sshServer":{{"enabled":true}}{extra}}}"#),
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        (workspace, config_path)
+    }
+
+    /// Everything after the failed write still ran: the hooks when
+    /// `expect_hook`, and the ssh alias, which every path registers after its
+    /// routes. Then `dev up` failed with the store's error, and the container
+    /// is kept.
+    fn assert_store_failure_came_last(
+        rt: &UpFakeRuntime,
+        result: anyhow::Result<()>,
+        dev_home: &DevHome,
+        workspace: &TempDir,
+        expect_hook: bool,
+    ) {
+        let err = result.expect_err("a failed store write must fail dev up");
+        let text = format!("{err:#}");
+        assert!(text.contains("could not store `up` secrets"), "{text}");
+        assert!(!text.contains(UP_VALUE), "{text}");
+        let execs = rt.execs();
+        let store = execs
+            .iter()
+            .position(|c| is_up_store_write(&c.0))
+            .expect("the failed write");
+        if expect_hook {
+            let hook = execs.iter().position(is_hook_exec).expect("the hook ran");
+            assert!(store < hook, "the write was attempted before the hooks");
+        }
+        let hash = crate::util::naming::workspace_hash(workspace.path());
+        assert!(
+            dev_home.ssh_alias_file(&hash).exists(),
+            "the alias was registered"
+        );
+        assert!(rt.stopped().is_empty(), "the container is not stopped");
+        assert!(rt.removed().is_empty(), "the container is not removed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_create_path_store_failure_is_reported_after_the_hooks_and_alias() {
+        let (workspace, _) = ssh_enabled_up_workspace(r#","postCreateCommand":"echo hook-ran""#);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt = UpFakeRuntime::up_store_write_fails(1);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let (result, _) = run_up_capturing_warnings(&rt, &workspace, &providers, &dev_home).await;
+        assert_store_failure_came_last(&rt, result, &dev_home, &workspace, true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_store_failure_is_reported_after_the_hooks_and_alias() {
+        let (workspace, config_path) =
+            ssh_enabled_up_workspace(r#","postStartCommand":"echo restarted""#);
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt =
+            UpFakeRuntime::up_store_write_fails(1).already_stopped(workspace.path(), &config_path);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let (result, _) = run_up_capturing_warnings(&rt, &workspace, &providers, &dev_home).await;
+        assert_store_failure_came_last(&rt, result, &dev_home, &workspace, true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_reuse_store_failure_is_reported_after_the_alias() {
+        let (workspace, config_path) = ssh_enabled_up_workspace("");
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let rt =
+            UpFakeRuntime::up_store_write_fails(1).already_running(workspace.path(), &config_path);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let (result, _) = run_up_capturing_warnings(&rt, &workspace, &providers, &dev_home).await;
+        assert_store_failure_came_last(&rt, result, &dev_home, &workspace, false);
+    }
+
+    /// A hook failure ends `dev up` with its own error, and the held store
+    /// failure is printed rather than lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_hook_failure_beside_a_store_failure_prints_the_store_error() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","postCreateCommand":"echo hook-ran"}"#,
+        );
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::up_store_write_fails(1).hooks_fail(7);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let (result, warnings) =
+            run_up_capturing_warnings(&rt, &workspace, &providers, &DevHome::at(home.path())).await;
+        assert_hook_error_with_store_error_printed(result, &warnings);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_hook_failure_beside_a_store_failure_prints_the_store_error() {
+        let (workspace, config_path) =
+            ssh_enabled_up_workspace(r#","postStartCommand":"echo restarted""#);
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::up_store_write_fails(1)
+            .hooks_fail(7)
+            .already_stopped(workspace.path(), &config_path);
+        let providers = registry_with(&workspace, &all_values_fake());
+        let (result, warnings) =
+            run_up_capturing_warnings(&rt, &workspace, &providers, &DevHome::at(home.path())).await;
+        assert_hook_error_with_store_error_printed(result, &warnings);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_compose_hook_failure_beside_a_store_failure_prints_the_store_error() {
+        for owed in [super::ComposeHooks::Create, super::ComposeHooks::Start] {
+            let workspace = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let rt = UpFakeRuntime::up_store_write_fails(1).hooks_fail(7);
+            let (result, warnings) = compose_set_up_in(
+                &rt,
+                &FakeProvider::answering(&[(UP_KEY, UP_VALUE)]),
+                &workspace,
+                (
+                    r#"{"version":1,"secrets":{}}"#,
+                    &secrets_json(&[(UP_KEY, "up")]),
+                ),
+                r#"{"image":"ubuntu:24.04","postCreateCommand":"echo c","postStartCommand":"echo s"}"#,
+                owed,
+                (&DevHome::at(home.path()), super::SshAliasPlan::LeaveAlone),
+            )
+            .await;
+            assert_hook_error_with_store_error_printed(result, &warnings);
+        }
+    }
+
+    /// `dev up` ended with the hook's error, and the held store failure was
+    /// printed rather than lost.
+    fn assert_hook_error_with_store_error_printed(result: anyhow::Result<()>, warnings: &str) {
+        let err = format!("{:#}", result.expect_err("the hook failed"));
+        assert!(!err.contains("could not store"), "the hook's error: {err}");
+        assert!(
+            warnings.starts_with("Error: could not store `up` secrets in container `"),
+            "{warnings}"
+        );
+        assert!(!warnings.contains(UP_VALUE), "{warnings}");
+    }
+
+    fn secrets_from(workspace: &TempDir, entries: &[(&str, &str)]) -> ValidatedSecrets {
+        validated_secrets(workspace, &secrets_json(entries))
+    }
+
+    fn running_container() -> ContainerInfo {
+        ContainerInfo {
+            id: "c1".to_string(),
+            name: "box".to_string(),
+            state: ContainerState::Running,
+            labels: HashMap::new(),
+            image: "ubuntu:24.04".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_key_missing_from_a_reused_container_is_named() {
+        let workspace = TempDir::new().unwrap();
+        let secrets = secrets_from(
+            &workspace,
+            &[(CREATE_KEY, "create"), ("OTHER", "create"), (UP_KEY, "up")],
+        );
+        let rt = UpFakeRuntime::ok().with_container_env(&["OTHER=x", "PATH=/bin"]);
+        let warning = super::create_keys_warning(&rt, &running_container(), &secrets)
+            .await
+            .expect("a warning");
+        assert!(warning.starts_with("Warning: "), "{warning}");
+        assert!(warning.contains(CREATE_KEY), "{warning}");
+        assert!(
+            !warning.contains("OTHER") && !warning.contains(UP_KEY),
+            "{warning}"
+        );
+        assert!(warning.contains("dev up --rebuild"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn no_create_key_warning_when_every_key_is_present_or_the_runtime_has_no_env_read() {
+        let workspace = TempDir::new().unwrap();
+        let secrets = secrets_from(&workspace, &[(CREATE_KEY, "create")]);
+        let present = UpFakeRuntime::ok().with_container_env(&["CREATE_KEY=v"]);
+        assert!(
+            super::create_keys_warning(&present, &running_container(), &secrets)
+                .await
+                .is_none()
+        );
+        let unsupported = UpFakeRuntime::ok();
+        assert!(
+            super::create_keys_warning(&unsupported, &running_container(), &secrets)
+                .await
+                .is_none()
+        );
+        assert_eq!(unsupported.container_env_calls(), 1);
+        let trait_default = FakeRuntime::new(true);
+        assert!(
+            super::create_keys_warning(&trait_default, &running_container(), &secrets)
+                .await
+                .is_none(),
+            "the trait's own decline counts as unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_env_read_says_the_create_key_check_was_skipped() {
+        let workspace = TempDir::new().unwrap();
+        let secrets = secrets_from(&workspace, &[(CREATE_KEY, "create")]);
+        let rt = UpFakeRuntime::ok().container_env_failing();
+        let warning = super::create_keys_warning(&rt, &running_container(), &secrets)
+            .await
+            .expect("a warning");
+        assert_eq!(
+            warning,
+            "Warning: could not read the env of container 'box', so the check for missing \
+             create-time secrets was skipped: the runtime returned an error (Runtime)"
+        );
+        assert!(!warning.contains(ENV_READ_SENTINEL), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn an_optional_create_key_missing_from_the_container_is_not_named() {
+        let workspace = TempDir::new().unwrap();
+        let secrets = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{
+                "CREATE_KEY":{"provider":"fake","ref":"r","resolve":"create"},
+                "MAYBE":{"provider":"fake","ref":"m","resolve":"create","optional":true}
+            }}"#,
+        );
+        let rt = UpFakeRuntime::ok().with_container_env(&[]);
+        let warning = super::create_keys_warning(&rt, &running_container(), &secrets)
+            .await
+            .expect("the required key is still named");
+        assert!(warning.contains("secret(s) CREATE_KEY are"), "{warning}");
+        assert!(!warning.contains("MAYBE"), "{warning}");
+
+        let only_optional = validated_secrets(
+            &workspace,
+            r#"{"version":1,"secrets":{
+                "MAYBE":{"provider":"fake","ref":"m","resolve":"create","optional":true}
+            }}"#,
+        );
+        let rt = UpFakeRuntime::ok().with_container_env(&[]);
+        assert!(
+            super::create_keys_warning(&rt, &running_container(), &only_optional)
+                .await
+                .is_none()
+        );
+        assert_eq!(rt.container_env_calls(), 0, "nothing to check for");
+    }
+
+    #[tokio::test]
+    async fn without_create_keys_the_container_env_is_never_read() {
+        let workspace = TempDir::new().unwrap();
+        let secrets = secrets_from(&workspace, &[(UP_KEY, "up"), (EXEC_KEY, "exec")]);
+        let rt = UpFakeRuntime::ok().with_container_env(&[]);
+        assert!(
+            super::create_keys_warning(&rt, &running_container(), &secrets)
+                .await
+                .is_none()
+        );
+        assert_eq!(rt.container_env_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_reuse_paths_check_for_missing_create_keys() {
+        for stopped in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+            write_secrets_json(&workspace, &secrets_json(&[(CREATE_KEY, "create")]));
+            let fake = all_values_fake();
+            let rt = UpFakeRuntime::ok().with_container_env(&[]);
+            let (rt, name) = if stopped {
+                (
+                    rt.already_stopped(workspace.path(), &config_path),
+                    "already-stopped",
+                )
+            } else {
+                (
+                    rt.already_running(workspace.path(), &config_path),
+                    "already-running",
+                )
+            };
+            let home = TempDir::new().unwrap();
+            let (result, warnings) = run_up_capturing_warnings(
+                &rt,
+                &workspace,
+                &registry_with(&workspace, &fake),
+                &DevHome::at(home.path()),
+            )
+            .await;
+            result.unwrap();
+            assert_eq!(
+                warnings.lines().collect::<Vec<_>>(),
+                [format!(
+                    "Warning: create-time secret(s) CREATE_KEY are not in container '{name}', \
+                     which was created without them. Run `dev up --rebuild` to recreate it with them."
+                )],
+                "stopped: {stopped}"
+            );
+        }
+    }
+
+    /// Validates `entries` written to `name` as an explicit references file.
+    fn validate_override_fixture(
+        workspace: &TempDir,
+        dev_home: &DevHome,
+        name: &str,
+        entries: &[(&str, &str)],
+    ) -> ValidatedSecrets {
+        let path = workspace.path().join(name);
+        fs::write(&path, secrets_json(entries)).unwrap();
+        let registry = registry_with(workspace, &FakeProvider::answers_everything());
+        crate::devcontainer::secrets::validate_secrets_at(
+            dev_home,
+            Some(path),
+            workspace.path(),
+            None,
+            false,
+            &registry,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn up_warns_when_secrets_override_declares_up_keys_the_sidecar_does_not() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let validate =
+            |name, entries| validate_override_fixture(&workspace, &dev_home, name, entries);
+        let overriding = validate("o.json", &[("A", "up"), ("B", "up")]);
+
+        let sidecar = validate("s1.json", &[("B", "up")]);
+        assert_eq!(
+            super::up_keys_missing_from(&overriding, &sidecar),
+            vec!["A"]
+        );
+
+        let sidecar = validate("s2.json", &[("A", "exec"), ("B", "up")]);
+        assert_eq!(
+            super::up_keys_missing_from(&overriding, &sidecar),
+            vec!["A"]
+        );
+        let warnings = super::override_up_key_warnings(&overriding, &sidecar, false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("Warning: --secrets declares"));
+        assert!(warnings[0].contains(": A."), "{}", warnings[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_prints_the_override_warning() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let home = TempDir::new().unwrap();
+        let overriding = workspace.path().join("override.json");
+        fs::write(&overriding, secrets_json(&[("A", "up")])).unwrap();
+        let rt = UpFakeRuntime::ok();
+        let providers = registry_with(&workspace, &FakeProvider::answers_everything());
+        let (result, warnings) = run_up_capturing_warnings_with(
+            &rt,
+            &workspace,
+            &providers,
+            &DevHome::at(home.path()),
+            Some(&overriding),
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            warnings.starts_with("Warning: --secrets declares `up` secrets"),
+            "{warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn up_warns_when_the_sidecar_declares_up_keys_the_secrets_override_does_not() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let validate =
+            |name, entries| validate_override_fixture(&workspace, &dev_home, name, entries);
+        let sidecar = validate("s.json", &[("A", "up"), ("B", "up")]);
+
+        let overriding = validate("o1.json", &[("B", "up"), ("A", "exec")]);
+        let warnings = super::override_up_key_warnings(&overriding, &sidecar, false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Warning: the workspace's secrets.json declares"),
+            "{}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains(": A."), "{}", warnings[0]);
+
+        let overriding = validate("o2.json", &[]);
+        let warnings = super::override_up_key_warnings(&overriding, &sidecar, false);
+        assert_eq!(warnings.len(), 1, "an override with no up keys still warns");
+        assert!(warnings[0].contains(": A, B."), "{}", warnings[0]);
+
+        let agreeing = validate("o3.json", &[("A", "up"), ("B", "up")]);
+        assert!(super::override_up_key_warnings(&agreeing, &sidecar, false).is_empty());
+    }
+
+    /// An override that declares no `up` keys at all is the case the old early
+    /// return skipped, and it is the one that hides every sidecar `up` key.
+    #[tokio::test]
+    async fn an_override_without_up_keys_still_checks_the_sidecar() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        write_secrets_json(&workspace, &secrets_json(&[(UP_KEY, "up")]));
+        let overriding = validate_override_fixture(&workspace, &dev_home, "o.json", &[]);
+        let override_path = workspace.path().join("o.json");
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let registry = registry_with(&workspace, &FakeProvider::answers_everything());
+        let warnings = |override_path| {
+            super::override_up_key_warnings_for(
+                &config,
+                &config_path,
+                workspace.path(),
+                &registry,
+                override_path,
+                &dev_home,
+                &overriding,
+            )
+        };
+        let found = warnings(Some(override_path.as_path()));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(UP_KEY), "{}", found[0]);
+        assert!(warnings(None).is_empty(), "no override, nothing to compare");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_create_hooks_passes_env_to_feature_hooks() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04"}"#).unwrap();
+        let feature = crate::devcontainer::features::ResolvedFeature {
+            id: "feat".to_string(),
+            oci_ref: "feat".to_string(),
+            version: "1".to_string(),
+            options: serde_json::Value::Null,
+            install_script_path: std::path::PathBuf::new(),
+            install_after: Vec::new(),
+            container_env: Default::default(),
+            option_defaults: Default::default(),
+            mounts: Vec::new(),
+            init: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            entrypoint: None,
+            lifecycle_hooks: crate::devcontainer::features::FeatureLifecycleHooks {
+                post_create_command: Some(crate::devcontainer::config::LifecycleCommand::Single(
+                    "echo feature-hook".to_string(),
+                )),
+                ..Default::default()
+            },
+            is_dependency: false,
+        };
+        let rt = UpFakeRuntime::ok();
+        let env = vec![(UP_KEY.to_string(), SecretValue::new(UP_VALUE.to_string()))];
+        crate::devcontainer::run_create_hooks(
+            &HookTarget {
+                runtime: &rt,
+                container_id: "fake-id",
+                user: None,
+                workdir: None,
+                log: None,
+                env: &env,
+                host: &crate::session::host_identity().await,
+            },
+            &config,
+            Some(&[feature]),
+        )
+        .await
+        .unwrap();
+        let execs = rt.execs();
+        assert_eq!(execs.len(), 1);
+        assert!(carries(&execs[0], UP_KEY, UP_VALUE));
     }
 
     /// Restoring `#[derive(Debug)]` on `ContainerConfig`, or adding a
@@ -7007,8 +8929,8 @@ mod tests {
         assert_eq!(env.get("LITERAL_ONLY"), Some(&"literal-value".to_string()));
     }
 
-    /// The compose branch returns before anything would read a references file,
-    /// so an accepted `--secrets` would be a path read by nothing.
+    /// `--secrets` feeds no Compose path, so an accepted one would be a path
+    /// read by nothing.
     #[tokio::test]
     async fn up_rejects_explicit_secrets_for_compose() {
         let workspace = TempDir::new().unwrap();
@@ -7077,10 +8999,9 @@ mod tests {
         );
     }
 
-    /// The Compose path builds its own env map and never reads `secrets.json`,
-    /// so a declared secret must fail before `run_compose` does anything. The
-    /// missing `initialized` marker is the proof: `initializeCommand` is the
-    /// first thing `run_compose` runs.
+    /// A project `create` secret is something Compose cannot inject, so it must
+    /// fail before `run_compose` does anything. The missing `initialized` marker
+    /// is the proof: `initializeCommand` is the first thing `run_compose` runs.
     #[tokio::test]
     async fn compose_project_with_secrets_fails_before_any_compose_side_effect() {
         let workspace = TempDir::new().unwrap();
@@ -7107,12 +9028,91 @@ mod tests {
 
         assert!(msg.contains("secrets.json"), "{msg}");
         assert!(msg.contains("Compose"), "{msg}");
+        assert!(msg.contains(r#""resolve": "up""#), "{msg}");
         assert!(
             !marker.exists(),
             "initializeCommand must not run before the compose rejection"
         );
         assert!(!rt.create_was_attempted(), "{msg}");
         assert_eq!(fake.calls(), 0, "the compose path resolves nothing");
+    }
+
+    /// Writes a compose project whose `initializeCommand` fails after leaving a
+    /// marker, so a run that gets past the secret checks is observable without
+    /// a compose binary.
+    async fn compose_run_reaches_initialize(
+        base: Option<&str>,
+        project_secrets: Option<&str>,
+    ) -> (anyhow::Result<()>, bool, usize) {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("compose.yml"),
+            "services:\n  app:\n    image: ubuntu:24.04\n",
+        )
+        .unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","initializeCommand":"touch initialized && exit 1"}"#,
+        );
+        if let Some(secrets) = project_secrets {
+            write_secrets_json(&workspace, secrets);
+        }
+        let home_dir = TempDir::new().unwrap();
+        let home = DevHome::at(home_dir.path());
+        if let Some(base) = base {
+            fs::create_dir_all(home.base_secrets().parent().unwrap()).unwrap();
+            fs::write(home.base_secrets(), base).unwrap();
+        }
+        let fake = FakeProvider::answers_everything();
+        let rt = UpFakeRuntime::ok();
+        let result = super::run_with_runtime_with_providers(
+            workspace.path(),
+            &rt,
+            false,
+            false,
+            false,
+            false,
+            "never",
+            &[],
+            None,
+            true,
+            None,
+            &registry_with(&workspace, &fake),
+            &home,
+            &Cmux::recording().0,
+            &mut std::io::stderr(),
+        )
+        .await;
+        (
+            result,
+            workspace.path().join("initialized").exists(),
+            fake.calls(),
+        )
+    }
+
+    #[tokio::test]
+    async fn compose_with_base_create_passes_the_secret_checks() {
+        let (result, marker, calls) =
+            compose_run_reaches_initialize(Some(ONE_FAKE_SECRET), None).await;
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("initializeCommand failed"), "{msg}");
+        assert!(marker, "run_compose must have begun");
+        assert_eq!(calls, 0);
+    }
+
+    #[tokio::test]
+    async fn compose_with_project_up_passes_the_secret_checks() {
+        let (result, marker, calls) = compose_run_reaches_initialize(
+            None,
+            Some(r#"{"version":1,"secrets":{"TOKEN":{"provider":"fake","ref":"item","resolve":"up"}}}"#),
+        )
+        .await;
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("initializeCommand failed"), "{msg}");
+        assert!(marker, "run_compose must have begun");
+        assert_eq!(calls, 0);
     }
 
     /// Compose `up -d` can return and `compose ps -q <service>` can identify
@@ -7143,7 +9143,7 @@ mod tests {
         assert!(
             rt.execs()
                 .iter()
-                .all(|(_, user, workdir)| user.as_deref() == Some("vscode")
+                .all(|(_, user, workdir, _)| user.as_deref() == Some("vscode")
                     && workdir.as_deref().is_none()),
             "Compose readiness must preserve the existing Compose command working-directory behavior"
         );
@@ -7308,13 +9308,17 @@ mod tests {
         let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
         let rt = UpFakeRuntime::ok();
         crate::devcontainer::run_create_hooks(
-            &rt,
-            "fake-id",
+            &HookTarget {
+                runtime: &rt,
+                container_id: "fake-id",
+                user: None,
+                workdir: None,
+                log: Some(&log),
+                env: &[],
+                host: &crate::session::host_identity().await,
+            },
             &config,
             None,
-            None,
-            None,
-            Some(&log),
         )
         .await
         .expect("the hook exits zero");
@@ -7327,13 +9331,17 @@ mod tests {
         let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
         let rt = UpFakeRuntime::execs_report(7);
         crate::devcontainer::run_create_hooks(
-            &rt,
-            "fake-id",
+            &HookTarget {
+                runtime: &rt,
+                container_id: "fake-id",
+                user: None,
+                workdir: None,
+                log: Some(&log),
+                env: &[],
+                host: &crate::session::host_identity().await,
+            },
             &config,
             None,
-            None,
-            None,
-            Some(&log),
         )
         .await
         .expect_err("the hook fails");
@@ -7358,20 +9366,31 @@ mod tests {
         let log = super::begin_hook_log(&dev_home, workspace.path(), "create").unwrap();
         let rt = UpFakeRuntime::ok();
         crate::devcontainer::run_create_hooks(
-            &rt,
-            "fake-id",
+            &HookTarget {
+                runtime: &rt,
+                container_id: "fake-id",
+                user: None,
+                workdir: None,
+                log: Some(&log),
+                env: &[],
+                host: &crate::session::host_identity().await,
+            },
             &config,
             None,
-            None,
-            None,
-            Some(&log),
         )
         .await
         .expect("parallel hooks succeed");
 
         let content = std::fs::read_to_string(&log.path).unwrap();
-        assert!(content.contains("echo lint"), "{content}");
-        assert!(content.contains("echo build"), "{content}");
+        // The label is only for the progress line; the log names the hook.
+        assert!(
+            content.contains("--- postCreateCommand: echo lint (exit 0) ---"),
+            "{content}"
+        );
+        assert!(
+            content.contains("--- postCreateCommand: echo build (exit 0) ---"),
+            "{content}"
+        );
     }
 
     /// Lifecycle hooks are the visible race: without a readiness gate the
@@ -7390,9 +9409,21 @@ mod tests {
         super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
             .await
             .expect("readiness should wait for the target service to become usable");
-        crate::devcontainer::run_create_hooks(&rt, "fake-id", &config, None, None, None, None)
-            .await
-            .expect("lifecycle hook should run after readiness");
+        crate::devcontainer::run_create_hooks(
+            &HookTarget {
+                runtime: &rt,
+                container_id: "fake-id",
+                user: None,
+                workdir: None,
+                log: None,
+                env: &[],
+                host: &crate::session::host_identity().await,
+            },
+            &config,
+            None,
+        )
+        .await
+        .expect("lifecycle hook should run after readiness");
 
         let execs = rt.execs();
         assert_eq!(
@@ -7402,7 +9433,7 @@ mod tests {
         );
         let last = execs
             .last()
-            .map(|(cmd, _, _)| cmd.join(" "))
+            .map(|(cmd, _, _, _)| cmd.join(" "))
             .unwrap_or_default();
         assert!(
             last.starts_with("sh -c ") && last.contains("\ntouch ready\n"),

@@ -31,8 +31,9 @@ pub async fn run(
 
     // Loaded once: for a recipe-backed workspace this is a full recipe
     // composition, and both the pill and the report want the same answer.
-    let config =
-        load_workspace_config_or_warn(workspace, runtime.runtime_name()).map(|(_, config)| config);
+    let dev_home = DevHome::current();
+    let config = load_workspace_config_or_warn(&dev_home, workspace, runtime.runtime_name())
+        .map(|(_, config)| config);
 
     let sessions = collect_sessions(runtime.as_ref(), &containers).await;
     repaint_session_pill(
@@ -50,7 +51,7 @@ pub async fn run(
         runtime.as_ref(),
         &containers,
         config.as_ref(),
-        &DevHome::current(),
+        &dev_home,
         &status_runtime::SystemSsh::default(),
         &interrupt,
     )

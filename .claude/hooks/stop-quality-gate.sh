@@ -26,7 +26,7 @@ if [ -f tsconfig.json ]; then
 fi
 
 # 4. Tests
-TESTS=$(cargo test 2>&1)
+TESTS=$(PATH="$PWD/.claude/hooks/no-provider-bin:$PATH" cargo test 2>&1)
 [ $? -ne 0 ] && ERRORS="$ERRORS\n## 🧪 Test Failures\n$(echo "$TESTS" | tail -20)"
 
 # 5. Dependency audit (quick)

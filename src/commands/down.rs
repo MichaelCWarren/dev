@@ -14,13 +14,13 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
 
+    let dev_home = DevHome::current();
     // Try compose-aware teardown first.
-    let loaded = load_workspace_config_or_warn(workspace, runtime.runtime_name());
+    let loaded = load_workspace_config_or_warn(&dev_home, workspace, runtime.runtime_name());
     let pill_enabled = loaded
         .as_ref()
         .is_some_and(|(_, config)| config.cmux_status_enabled());
     let mut pill = Cmux::detect(pill_enabled).guard(BUILD_KEY, pill_enabled);
-    let dev_home = DevHome::current();
     let torn_down = match loaded {
         Some((config_path, config)) if config.is_compose() => {
             run_compose_down(

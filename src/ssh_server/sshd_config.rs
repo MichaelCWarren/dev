@@ -48,8 +48,9 @@ fn refusal(name: &str, value: &str) -> Option<&'static str> {
 }
 
 /// The env an ssh session gets: the container's, with each secret overriding
-/// a container value of the same name, as in a `dev exec`. Warnings name the
-/// key only, never the value.
+/// a container value of the same name, as in a `dev exec`. `secrets` holds the
+/// `up` and `exec` values; `create` values arrive through `container_env`.
+/// Warnings name the key only, never the value.
 pub(crate) fn session_env(
     container_env: &[(String, String)],
     secrets: &[(String, SecretValue)],
@@ -238,6 +239,20 @@ mod tests {
         assert!(env.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("BAD-NAME"));
+    }
+
+    #[test]
+    fn session_env_merges_up_and_exec_values_over_the_container_env() {
+        let container = [pair("PATH", "/usr/bin"), pair("TOKEN", "stale")];
+        let secrets = [secret("TOKEN", "up-value"), secret("E", "exec-value")];
+
+        let (env, warnings) = session_env(&container, &secrets);
+
+        let names: Vec<&str> = env.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["PATH", "TOKEN", "E"]);
+        assert_eq!(env[1].1.expose(), "up-value");
+        assert_eq!(env[2].1.expose(), "exec-value");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

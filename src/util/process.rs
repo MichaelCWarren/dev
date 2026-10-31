@@ -236,6 +236,28 @@ pub(crate) fn group_members(group: i32) -> String {
     String::from_utf8_lossy(&found.stdout).trim().to_string()
 }
 
+/// The shells a container's `/bin/sh` may be, for running in-container
+/// scripts on the host. Debian's and Ubuntu's `/bin/sh` is dash and Alpine's is
+/// busybox ash, so each runs whenever the host has it, alongside the host's own
+/// `sh`.
+#[cfg(test)]
+pub(crate) fn shells() -> Vec<&'static str> {
+    let mut shells: Vec<_> = ["sh", "/bin/dash", "/bin/bash"]
+        .into_iter()
+        .filter(|shell| !shell.starts_with('/') || std::path::Path::new(shell).exists())
+        .collect();
+    if on_path("busybox") {
+        shells.push("busybox sh");
+    }
+    shells
+}
+
+#[cfg(test)]
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

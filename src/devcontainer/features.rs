@@ -143,13 +143,85 @@ enum FeatureRefKind {
 /// a computed image tag depend on the machine rather than on that home, which
 /// is how `dev prune` came to compute a keep set the developer's own
 /// `~/.dev` could change.
+///
+/// Stages into a home under the target directory, never the developer's own
+/// `~/.dev`, and never the system temp dir, where a static `TempDir` (never
+/// dropped) would leave one directory per run.
 #[cfg(test)]
 pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeature>, DevError> {
     resolve_features_in(
         config,
-        &DevHome::current(),
+        &DevHome::at(test_features_home()),
         crate::ssh_agent::RelayDecision::Off,
     )
+}
+
+/// This process's slot under `<target>/test-dev-home`, locked until it exits.
+#[cfg(test)]
+fn test_features_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<(PathBuf, std::fs::File)> = std::sync::OnceLock::new();
+    &HOME
+        .get_or_init(|| {
+            let exe = std::env::current_exe().expect("the test executable's path");
+            let target = target_dir_of(&exe)
+                .unwrap_or_else(|| panic!("{} is not in a cargo target directory", exe.display()));
+            claim_test_home(&target.join("test-dev-home"))
+        })
+        .0
+}
+
+/// The target directory of a cargo-built test executable, which sits at
+/// `<target>/<profile>/deps/<exe>`. With `--target <triple>` this is
+/// `<target>/<triple>`, still inside the real target directory, which is the
+/// point: `CARGO_TARGET_DIR` can be relative, or set in a config file the
+/// test process never sees.
+#[cfg(test)]
+fn target_dir_of(exe: &std::path::Path) -> Option<PathBuf> {
+    let deps = exe
+        .parent()
+        .filter(|dir| dir.file_name() == Some("deps".as_ref()))?;
+    deps.parent()?.parent().map(std::path::Path::to_path_buf)
+}
+
+/// Claim the first free `features/slot-<n>` under `root`, empty it, and return
+/// it with the exclusive lock on `slot-<n>.lock` that keeps it claimed while
+/// the file stays open. Concurrent processes take different slots, so none
+/// empties another's, and there are never more slots than processes that ran
+/// at once.
+#[cfg(test)]
+fn claim_test_home(root: &std::path::Path) -> (PathBuf, std::fs::File) {
+    let slots = root.join("features");
+    std::fs::create_dir_all(&slots).unwrap();
+    (0..)
+        .find_map(|n| {
+            let home = slots.join(format!("slot-{n}"));
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(home.with_extension("lock"))
+                .unwrap_or_else(|e| panic!("could not open the lock for {}: {e}", home.display()));
+            match lock.try_lock() {
+                Ok(()) => Some((home, lock)),
+                Err(std::fs::TryLockError::WouldBlock) => None,
+                Err(std::fs::TryLockError::Error(e)) => {
+                    panic!("could not lock {}: {e}", home.display())
+                }
+            }
+        })
+        .inspect(|(home, _)| empty_dir(home))
+        .expect("an unbounded range always finds a free slot")
+}
+
+#[cfg(test)]
+fn empty_dir(dir: &std::path::Path) {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            panic!("could not empty {}: {e}", dir.display())
+        }
+        _ => {}
+    }
+    std::fs::create_dir_all(dir).unwrap();
 }
 
 /// Every feature the config asks for, plus the ones `dev` supplies itself.
@@ -1345,6 +1417,75 @@ mod tests {
     use super::*;
     use crate::ssh_agent::RelayDecision;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_test_features_home_is_a_locked_slot_in_the_running_target_dir() {
+        let home = super::test_features_home();
+        let exe = std::env::current_exe().unwrap();
+        let target = super::target_dir_of(&exe).unwrap();
+        let below: Vec<_> = exe
+            .strip_prefix(&target)
+            .unwrap_or_else(|_| panic!("{exe:?} under {target:?}"))
+            .components()
+            .map(|c| c.as_os_str().to_owned())
+            .collect();
+        assert_eq!(
+            below.len(),
+            3,
+            "<profile>/deps/<exe> below {target:?}: {below:?}"
+        );
+        assert_eq!(below[1], "deps", "{below:?}");
+        assert!(
+            home.starts_with(target.join("test-dev-home").join("features")),
+            "{home:?}"
+        );
+        assert!(home.is_dir());
+        let lock = std::fs::File::open(home.with_extension("lock")).unwrap();
+        assert!(
+            matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "this process holds its slot's lock"
+        );
+    }
+
+    #[test]
+    fn the_target_dir_is_two_up_from_deps() {
+        assert_eq!(
+            super::target_dir_of(std::path::Path::new("/w/custom-target/debug/deps/dev-0a1b")),
+            Some(PathBuf::from("/w/custom-target"))
+        );
+        assert_eq!(
+            super::target_dir_of(std::path::Path::new("/w/bin/dev")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_claimed_slot_is_skipped_and_slots_are_reused() {
+        let root = TempDir::new().unwrap();
+        let slots = root.path().join("features");
+        std::fs::create_dir_all(slots.join("slot-0")).unwrap();
+        std::fs::write(slots.join("slot-0/kept"), "").unwrap();
+        let other = std::fs::File::create(slots.join("slot-0.lock")).unwrap();
+        other.lock().unwrap();
+
+        let (home, lock) = super::claim_test_home(root.path());
+        assert_eq!(home, slots.join("slot-1"));
+        assert!(
+            slots.join("slot-0/kept").exists(),
+            "a held slot is left alone"
+        );
+
+        drop((lock, other));
+        let (home, _lock) = super::claim_test_home(root.path());
+        assert_eq!(home, slots.join("slot-0"), "a released slot is reused");
+        assert!(!home.join("kept").exists(), "and emptied");
+        let dirs = std::fs::read_dir(&slots)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(dirs, 2);
+    }
 
     fn feature(id: &str) -> ResolvedFeature {
         ResolvedFeature {

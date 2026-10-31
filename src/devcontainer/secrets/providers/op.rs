@@ -853,7 +853,7 @@ mod tests {
     fn validate_accepts_an_account_and_ignores_other_options() {
         let secret = with_account("TOKEN", "v/i/f", "work".into())
             .with_option("vault", "Private".into())
-            .with_option("createTime", serde_json::json!(true));
+            .with_option("retries", serde_json::json!(3));
         assert_eq!(validate(&secret).unwrap(), Some("work"));
     }
 

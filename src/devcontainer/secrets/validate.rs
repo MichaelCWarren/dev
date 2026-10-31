@@ -18,34 +18,87 @@ use std::path::{Path, PathBuf};
 
 use super::file;
 use super::provider::ProviderRegistry;
-use super::reference::SecretRef;
+use super::reference::{ResolveTime, SecretRef};
 use crate::devcontainer::variables::substitute_variables_with_user;
 use crate::error::DevError;
 use crate::util::paths::DevHome;
+
+/// Which layer declared an entry. A project key that replaces a base key is
+/// `Project`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretOrigin {
+    Base,
+    Project,
+}
 
 /// The base and project `secrets.json` files, found, parsed, checked against
 /// the provider registry, variable-substituted, and merged. Empty when neither
 /// file exists.
 #[derive(Debug, Clone, Default)]
 pub struct ValidatedSecrets {
-    sources: Vec<PathBuf>,
-    entries: Vec<SecretRef>,
+    sources: Vec<(PathBuf, SecretOrigin)>,
+    entries: Vec<(SecretRef, SecretOrigin)>,
+    downgraded: Vec<String>,
 }
 
 impl ValidatedSecrets {
     /// The files these entries came from, base first. Empty when there were none.
-    pub fn sources(&self) -> &[PathBuf] {
-        &self.sources
+    #[cfg(test)]
+    pub fn sources(&self) -> Vec<&Path> {
+        self.sources.iter().map(|(p, _)| p.as_path()).collect()
     }
 
-    pub fn entries(&self) -> &[SecretRef] {
-        &self.entries
+    /// The file the `origin` layer was read from, if that layer had one.
+    pub fn source_from(&self, origin: SecretOrigin) -> Option<&Path> {
+        self.sources
+            .iter()
+            .find(|(_, o)| *o == origin)
+            .map(|(p, _)| p.as_path())
     }
 
-    /// The subset the create path injects. `createTime: false` means exec-time
-    /// only, so those entries are skipped at create.
-    pub fn create_time_entries(&self) -> impl Iterator<Item = &SecretRef> {
-        self.entries.iter().filter(|r| r.create_time())
+    #[cfg(test)]
+    pub fn entries(&self) -> Vec<&SecretRef> {
+        self.entries.iter().map(|(r, _)| r).collect()
+    }
+
+    pub fn entries_at(&self, time: ResolveTime) -> impl Iterator<Item = &SecretRef> {
+        self.entries
+            .iter()
+            .map(|(r, _)| r)
+            .filter(move |r| r.resolve_time() == time)
+    }
+
+    pub fn entries_with_origin(&self) -> impl Iterator<Item = (&SecretRef, SecretOrigin)> {
+        self.entries.iter().map(|(r, o)| (r, *o))
+    }
+
+    pub fn entries_at_from(
+        &self,
+        time: ResolveTime,
+        origin: SecretOrigin,
+    ) -> impl Iterator<Item = &SecretRef> {
+        self.entries_with_origin()
+            .filter(move |(r, o)| r.resolve_time() == time && *o == origin)
+            .map(|(r, _)| r)
+    }
+
+    /// The base-file `create` keys a Compose validation moved to `up`, in entry
+    /// order. Only `dev up` reports them, so the warning prints once.
+    pub fn downgraded_to_up(&self) -> &[String] {
+        &self.downgraded
+    }
+
+    /// Compose cannot inject at create, so a base-file `create` entry is
+    /// resolved at `up` instead. Returns the downgraded keys in entry order.
+    fn downgrade_base_create_to_up(&mut self) -> Vec<String> {
+        let mut keys = Vec::new();
+        for (entry, origin) in &mut self.entries {
+            if *origin == SecretOrigin::Base && entry.resolve_time() == ResolveTime::Create {
+                keys.push(entry.key().to_string());
+                entry.set_resolve_time(ResolveTime::Up);
+            }
+        }
+        keys
     }
 }
 
@@ -56,6 +109,9 @@ impl ValidatedSecrets {
 /// two values the `runArgs` substitution passes, so one rule covers the whole
 /// config.
 ///
+/// `compose` applies the Compose rule that a base-file `create` entry resolves
+/// at `up`, here, so every reader of a Compose workspace agrees on it.
+///
 /// Parsing, provider lookup, and substitution only. No provider is asked to
 /// resolve anything, so this is safe to call before any side effect.
 // `dev up` goes through `validate_secrets_at` so the sidecar-vs-override choice
@@ -65,6 +121,7 @@ pub fn validate_secrets_for_config(
     config_path: &Path,
     workspace: &Path,
     remote_user: Option<&str>,
+    compose: bool,
     registry: &ProviderRegistry,
 ) -> Result<ValidatedSecrets, DevError> {
     validate_secrets_at(
@@ -72,6 +129,7 @@ pub fn validate_secrets_for_config(
         super::discovery::secrets_path_beside(config_path),
         workspace,
         remote_user,
+        compose,
         registry,
     )
 }
@@ -87,25 +145,41 @@ pub fn validate_secrets_at(
     path: Option<PathBuf>,
     workspace: &Path,
     remote_user: Option<&str>,
+    compose: bool,
     registry: &ProviderRegistry,
 ) -> Result<ValidatedSecrets, DevError> {
     let base = dev_home.base_secrets();
-    let sources: Vec<PathBuf> = base
+    let layers: Vec<(PathBuf, SecretOrigin)> = base
         .is_file()
-        .then_some(base)
+        .then_some((base, SecretOrigin::Base))
         .into_iter()
-        .chain(path)
+        .chain(path.map(|p| (p, SecretOrigin::Project)))
         .collect();
-    let mut entries: Vec<SecretRef> = Vec::new();
-    for source in &sources {
+    let mut entries = merge_layers(&layers)?;
+    check_providers(entries.iter().map(|(r, _)| r), registry)?;
+    substitute_entries(entries.iter_mut().map(|(r, _)| r), workspace, remote_user)?;
+    let mut validated = ValidatedSecrets {
+        sources: layers,
+        entries,
+        downgraded: Vec::new(),
+    };
+    if compose {
+        validated.downgraded = validated.downgrade_base_create_to_up();
+    }
+    Ok(validated)
+}
+
+fn merge_layers(
+    layers: &[(PathBuf, SecretOrigin)],
+) -> Result<Vec<(SecretRef, SecretOrigin)>, DevError> {
+    let mut merged: Vec<(SecretRef, SecretOrigin)> = Vec::new();
+    for (source, origin) in layers {
         for entry in file::load(source)?.secrets {
-            entries.retain(|e| e.key() != entry.key());
-            entries.push(entry);
+            merged.retain(|(e, _)| e.key() != entry.key());
+            merged.push((entry, *origin));
         }
     }
-    check_providers(&entries, registry)?;
-    substitute_entries(&mut entries, workspace, remote_user)?;
-    Ok(ValidatedSecrets { sources, entries })
+    Ok(merged)
 }
 
 /// One lookup per distinct provider name, in declaration order.
@@ -115,7 +189,10 @@ pub fn validate_secrets_at(
 /// whole-batch failure path for the same reason. The lookup result is thrown
 /// away so `ValidatedSecrets` stays plain data; the create path looks providers
 /// up again when it groups references for resolution.
-fn check_providers(entries: &[SecretRef], registry: &ProviderRegistry) -> Result<(), DevError> {
+fn check_providers<'a>(
+    entries: impl Iterator<Item = &'a SecretRef>,
+    registry: &ProviderRegistry,
+) -> Result<(), DevError> {
     let mut checked: Vec<&str> = Vec::new();
     for entry in entries {
         if checked.contains(&entry.provider()) {
@@ -137,12 +214,12 @@ fn check_providers(entries: &[SecretRef], registry: &ProviderRegistry) -> Result
 /// After the provider check, so a file that is wrong in two ways reports the
 /// unknown provider, which is the more useful of the two, and reports it
 /// identically whether or not the body had variables in it.
-fn substitute_entries(
-    entries: &mut [SecretRef],
+fn substitute_entries<'a>(
+    entries: impl Iterator<Item = &'a mut SecretRef>,
     workspace: &Path,
     remote_user: Option<&str>,
 ) -> Result<(), DevError> {
-    for entry in entries.iter_mut() {
+    for entry in entries {
         // An option that expands to the empty string keeps its key with an empty
         // value; only an empty reference body is an error. The asymmetry is
         // deliberate: an empty `account` or `cwd` is coherent, an empty locator
@@ -150,6 +227,20 @@ fn substitute_entries(
         entry.substitute(|s| substitute_variables_with_user(s, workspace, remote_user))?;
     }
     Ok(())
+}
+
+/// A `~/.dev` under `workspace` whose `base/secrets.json` holds `secrets`.
+#[cfg(test)]
+pub(crate) fn with_base(workspace: &Path, secrets: &str) -> DevHome {
+    let home = DevHome::at(workspace.join("dev-home"));
+    write_base_secrets(&home, secrets);
+    home
+}
+
+#[cfg(test)]
+pub(crate) fn write_base_secrets(home: &DevHome, secrets: &str) {
+    std::fs::create_dir_all(home.base_secrets().parent().unwrap()).unwrap();
+    std::fs::write(home.base_secrets(), secrets).unwrap();
 }
 
 #[cfg(test)]
@@ -195,17 +286,9 @@ mod tests {
         DevHome::at(workspace.join("dev-home"))
     }
 
-    /// A `~/.dev` whose `base/secrets.json` holds `secrets`.
-    fn with_base(workspace: &Path, secrets: &str) -> DevHome {
-        let home = DevHome::at(workspace.join("dev-home"));
-        fs::create_dir_all(home.base_secrets().parent().unwrap()).unwrap();
-        fs::write(home.base_secrets(), secrets).unwrap();
-        home
-    }
-
     fn validate_with(home: &DevHome, f: &Fixture) -> Result<ValidatedSecrets, DevError> {
         let registry = registry(&f.workspace);
-        validate_secrets_for_config(home, &f.config_path, &f.workspace, None, &registry)
+        validate_secrets_for_config(home, &f.config_path, &f.workspace, None, false, &registry)
     }
 
     #[test]
@@ -225,6 +308,7 @@ mod tests {
             &config_path,
             dir.path(),
             None,
+            false,
             &registry(dir.path()),
         )
         .unwrap();
@@ -277,6 +361,7 @@ mod tests {
             &f.config_path,
             &f.workspace,
             None,
+            false,
             &registry,
         )
     }
@@ -301,6 +386,7 @@ mod tests {
             &config_path,
             dir.path(),
             None,
+            false,
             &registry,
         )
         .unwrap();
@@ -313,6 +399,13 @@ mod tests {
         let f = fixture(r#"{"version":1,"secrets":{"TOKEN":"env://TOKEN"}}"#);
         let validated = validate(&f).unwrap();
         assert_eq!(validated.entries().len(), 1);
+        assert_eq!(
+            validated
+                .entries_with_origin()
+                .map(|(_, o)| o)
+                .collect::<Vec<_>>(),
+            [SecretOrigin::Project]
+        );
         assert_eq!(
             validated.sources(),
             [f.config_path.parent().unwrap().join("secrets.json")]
@@ -381,6 +474,7 @@ mod tests {
             &f.config_path,
             &f.workspace,
             None,
+            false,
             &registry,
         )
         .unwrap();
@@ -508,13 +602,180 @@ mod tests {
         assert!(validated.entries().iter().all(|r| r.key() != "INJECTED"));
     }
 
+    fn keys<'a>(entries: impl Iterator<Item = &'a SecretRef>) -> Vec<&'a str> {
+        entries.map(|r| r.key()).collect()
+    }
+
     #[test]
-    fn create_time_entries_skip_exec_time_only_references() {
+    fn entries_at_filters_by_resolve_time() {
         let f = fixture(
-            r#"{"version":1,"secrets":{"A":"env://A","B":{"provider":"env","ref":"B","createTime":false}}}"#,
+            r#"{"version":1,"secrets":{
+                "A":"env://A",
+                "B":{"provider":"env","ref":"B","createTime":false},
+                "C":{"provider":"env","ref":"C","resolve":"up"},
+                "D":{"provider":"env","ref":"D","resolve":"exec"}}}"#,
         );
         let validated = validate(&f).unwrap();
-        let keys: Vec<&str> = validated.create_time_entries().map(|r| r.key()).collect();
-        assert_eq!(keys, vec!["A"]);
+        assert_eq!(keys(validated.entries_at(ResolveTime::Create)), ["A"]);
+        assert_eq!(keys(validated.entries_at(ResolveTime::Up)), ["C"]);
+        assert_eq!(keys(validated.entries_at(ResolveTime::Exec)), ["B", "D"]);
+    }
+
+    #[test]
+    fn origins_track_the_declaring_layer() {
+        let f =
+            fixture(r#"{"version":1,"secrets":{"GH_TOKEN":"env://PROJECT","OWN":"env://OWN"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"GH_TOKEN":"env://BASE","SHARED":"env://SHARED"}}"#,
+        );
+
+        let validated = validate_with(&home, &f).unwrap();
+        let pairs: Vec<(&str, SecretOrigin)> = validated
+            .entries_with_origin()
+            .map(|(r, o)| (r.key(), o))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("SHARED", SecretOrigin::Base),
+                ("GH_TOKEN", SecretOrigin::Project),
+                ("OWN", SecretOrigin::Project)
+            ]
+        );
+        let (gh, _) = validated
+            .entries_with_origin()
+            .find(|(r, _)| r.key() == "GH_TOKEN")
+            .unwrap();
+        assert_eq!(gh.reference(), "PROJECT");
+    }
+
+    #[test]
+    fn entries_at_from_combines_time_and_origin() {
+        let f = fixture(r#"{"version":1,"secrets":{"P_CREATE":"env://P"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{
+                "B_UP":{"provider":"env","ref":"U","resolve":"up"},
+                "B_CREATE":"env://B"}}"#,
+        );
+        let validated = validate_with(&home, &f).unwrap();
+        use SecretOrigin::{Base, Project};
+        let at = |t, o| keys(validated.entries_at_from(t, o));
+        assert_eq!(at(ResolveTime::Create, Base), ["B_CREATE"]);
+        assert_eq!(at(ResolveTime::Create, Project), ["P_CREATE"]);
+        assert_eq!(at(ResolveTime::Up, Base), ["B_UP"]);
+        assert!(at(ResolveTime::Up, Project).is_empty());
+    }
+
+    #[test]
+    fn an_override_file_is_project_origin() {
+        let f = fixture(r#"{"version":1,"secrets":{"SIDECAR":"env://S"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"BASE_ONLY":"env://B"}}"#,
+        );
+        let override_file = f.workspace.join("elsewhere.json");
+        fs::write(
+            &override_file,
+            r#"{"version":1,"secrets":{"FROM_OVERRIDE":"env://O"}}"#,
+        )
+        .unwrap();
+
+        let validated = validate_secrets_at(
+            &home,
+            Some(override_file),
+            &f.workspace,
+            None,
+            false,
+            &registry(&f.workspace),
+        )
+        .unwrap();
+        let pairs: Vec<(&str, SecretOrigin)> = validated
+            .entries_with_origin()
+            .map(|(r, o)| (r.key(), o))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("BASE_ONLY", SecretOrigin::Base),
+                ("FROM_OVERRIDE", SecretOrigin::Project)
+            ]
+        );
+    }
+
+    #[test]
+    fn downgrade_moves_base_create_to_up_and_reports_keys() {
+        let f = fixture(r#"{"version":1,"secrets":{"C":"env://C"}}"#);
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"A":"env://A","B":{"provider":"env","ref":"B","resolve":"exec"}}}"#,
+        );
+        let mut validated = validate_with(&home, &f).unwrap();
+
+        let keys = validated.downgrade_base_create_to_up();
+
+        assert_eq!(keys, ["A"]);
+        let time = |k: &str| {
+            validated
+                .entries()
+                .iter()
+                .find(|e| e.key() == k)
+                .unwrap()
+                .resolve_time()
+        };
+        assert_eq!(time("A"), ResolveTime::Up);
+        assert_eq!(time("B"), ResolveTime::Exec);
+        assert_eq!(time("C"), ResolveTime::Create);
+    }
+
+    #[test]
+    fn downgrade_skips_a_project_override_of_a_base_create_key() {
+        let f = fixture(
+            r#"{"version":1,"secrets":{"TOKEN":{"provider":"env","ref":"T","resolve":"exec"}}}"#,
+        );
+        let home = with_base(
+            &f.workspace,
+            r#"{"version":1,"secrets":{"TOKEN":"env://T"}}"#,
+        );
+        let mut validated = validate_with(&home, &f).unwrap();
+
+        assert!(validated.downgrade_base_create_to_up().is_empty());
+        assert_eq!(validated.entries()[0].resolve_time(), ResolveTime::Exec);
+    }
+
+    #[test]
+    fn only_a_compose_validation_downgrades_base_create_entries() {
+        let f = fixture(r#"{"version":1,"secrets":{"C":"env://C"}}"#);
+        let home = with_base(&f.workspace, r#"{"version":1,"secrets":{"A":"env://A"}}"#);
+        let registry = registry(&f.workspace);
+        let validate = |compose| {
+            validate_secrets_for_config(
+                &home,
+                &f.config_path,
+                &f.workspace,
+                None,
+                compose,
+                &registry,
+            )
+            .unwrap()
+        };
+
+        let compose = validate(true);
+        assert_eq!(compose.downgraded_to_up(), ["A"]);
+        let up: Vec<&str> = compose
+            .entries_at(ResolveTime::Up)
+            .map(|r| r.key())
+            .collect();
+        assert_eq!(up, ["A"]);
+        let create: Vec<&str> = compose
+            .entries_at(ResolveTime::Create)
+            .map(|r| r.key())
+            .collect();
+        assert_eq!(create, ["C"]);
+
+        let plain = validate(false);
+        assert!(plain.downgraded_to_up().is_empty());
+        assert_eq!(plain.entries_at(ResolveTime::Up).count(), 0);
     }
 }

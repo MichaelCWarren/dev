@@ -16,8 +16,9 @@ pub async fn run(
     cmd: &[String],
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    let config = load_workspace_config_or_warn(workspace, runtime.runtime_name()).map(|(_, c)| c);
     let dev_home = DevHome::current();
+    let config =
+        load_workspace_config_or_warn(&dev_home, workspace, runtime.runtime_name()).map(|(_, c)| c);
     let registered = registered_alias_in(&dev_home, &workspace_hash(workspace)).ok();
     let alias = ssh_target(config.as_ref(), registered, workspace)?;
 

@@ -759,6 +759,16 @@ mod tests {
         assert!(!out.contains("hunter2"), "leaked the value: {out}");
     }
 
+    /// Callers resolve whatever subset a resolve time selects without
+    /// checking it is non-empty, so no refs has to mean no provider call.
+    #[tokio::test]
+    async fn no_refs_call_no_provider() {
+        let stub = fake("stub");
+        let registry = registry_with(stub.clone());
+        assert!(registry.resolve_all(&[]).await.unwrap().is_empty());
+        assert_eq!(stub.calls(), 0);
+    }
+
     #[tokio::test]
     async fn one_resolve_call_per_provider_per_batch() {
         let stub = fake("stub");

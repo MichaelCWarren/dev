@@ -22,7 +22,7 @@ pub use features::{
 };
 #[allow(unused_imports)]
 pub use lifecycle::run_post_attach_hooks;
-pub use lifecycle::{run_create_hooks, run_start_hooks};
+pub use lifecycle::{HookTarget, run_create_hooks, run_start_hooks};
 pub use recipe::Recipe;
 pub use templates::apply_template;
 pub use variables::{substitute_variables, substitute_variables_with_user};

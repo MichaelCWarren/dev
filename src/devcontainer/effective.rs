@@ -21,17 +21,6 @@ pub(crate) struct EffectiveConfig {
     pub(crate) base_feature_ids: HashSet<String>,
 }
 
-pub(crate) fn load_effective_config(
-    config_path: &Path,
-    include_base: bool,
-) -> anyhow::Result<EffectiveConfig> {
-    load_effective_config_in(
-        &crate::util::paths::DevHome::current(),
-        config_path,
-        include_base,
-    )
-}
-
 pub(crate) fn load_effective_config_in(
     dev_home: &crate::util::paths::DevHome,
     config_path: &Path,

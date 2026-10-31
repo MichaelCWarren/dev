@@ -3,8 +3,8 @@
 //! This is the only reader of the format, so the rules that belong to the
 //! document live here: the supported `version`, which environment variable
 //! names are legal keys, the rejection of a repeated key, and document order.
-//! Everything about a single reference, including the `optional` and
-//! `createTime` flags, is [`SecretRef::from_json`]'s business.
+//! Everything about a single reference, including the `optional` flag
+//! and the resolve time, is [`SecretRef::from_json`]'s business.
 //!
 //! Failures split two ways. A problem attached to one key is a
 //! [`DevError::SecretReference`] naming that key; a problem with the document as
@@ -170,6 +170,7 @@ impl<'de> Visitor<'de> for OrderedSecretsVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devcontainer::secrets::ResolveTime;
 
     const DESIGN_DOC_EXAMPLE: &str = r#"{
   "version": 1,
@@ -317,21 +318,23 @@ mod tests {
     fn flags_default_for_shorthand() {
         let r = one(r#""op://Private/Linear CLI/credential""#);
         assert!(!r.optional());
-        assert!(r.create_time());
+        assert_eq!(r.resolve_time(), ResolveTime::Create);
     }
 
     #[test]
     fn flags_default_for_object_form() {
         let r = one(r#"{"provider":"op","ref":"a/b/c"}"#);
         assert!(!r.optional());
-        assert!(r.create_time());
+        assert_eq!(r.resolve_time(), ResolveTime::Create);
     }
 
     #[test]
     fn flags_are_read_through() {
         let r = one(r#"{"provider":"op","ref":"a/b/c","optional":true,"createTime":false}"#);
         assert!(r.optional());
-        assert!(!r.create_time());
+        assert_eq!(r.resolve_time(), ResolveTime::Exec);
+        let up = one(r#"{"provider":"op","ref":"a/b/c","resolve":"up"}"#);
+        assert_eq!(up.resolve_time(), ResolveTime::Up);
     }
 
     #[test]

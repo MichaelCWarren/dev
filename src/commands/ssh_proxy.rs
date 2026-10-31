@@ -2,13 +2,13 @@ use anyhow::{Context, bail};
 
 use std::time::Duration;
 
-use crate::commands::exec::{ExitSignals, SignalSource, resolve_exec_secrets};
+use crate::commands::exec::{ExitSignals, SignalSource, session_secrets};
 use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::devcontainer::secrets::{ProviderRegistry, SecretValue};
 use crate::runtime::{
     ContainerInfo, ContainerRuntime, PipedStdio, detect_runtime, find_running_container,
 };
-use crate::session::{self, SessionKind};
+use crate::session::{self, SessionKind, shm_tmpfs_guard};
 use crate::ssh_server::sshd_config::{render_sshd_config, session_dir_name, session_env};
 use crate::ssh_server::{SSHD_PATH, WorkspaceRecord, public_half, read_workspace_record_in};
 use crate::util::paths::DevHome;
@@ -163,13 +163,14 @@ async fn build_session(
 ) -> anyhow::Result<Session> {
     let (host_key, public_key) = read_keys(record, hash, dev_home)?;
     let (config_path, config) =
-        load_workspace_config_or_warn(&record.workspace, runtime.runtime_name()).unzip();
-    let remote_user = config.as_ref().and_then(|c| c.remote_user.as_deref());
+        load_workspace_config_or_warn(dev_home, &record.workspace, runtime.runtime_name()).unzip();
     let (secrets, container_env, host) = tokio::join!(
-        resolve_exec_secrets(
+        session_secrets(
+            runtime,
+            &container.id,
             config_path.as_deref(),
+            config.as_ref(),
             &record.workspace,
-            remote_user,
             registry,
             dev_home,
         ),
@@ -216,11 +217,12 @@ fn parse_env(entries: &[String]) -> Vec<(String, String)> {
 /// the shell sets as it forks, so a signal right after the fork still reaches
 /// sshd; nothing else here runs in the background.
 fn session_script() -> String {
+    let shm_guard = shm_tmpfs_guard("refusing to write keys and secrets there", 1);
     format!(
         r#"dir=$1 sshd=${{2:-{SSHD_PATH}}} mounts=${{3:-/proc/mounts}} pause_at=${{4-}} made=
 hold() {{ [ "$pause_at" != "$1" ] || {{ : > "$dir.held"; sleep 1; }}; }}
 [ -x "$sshd" ] || {{ echo 'sshd is not installed in this container (the ssh-server feature is baked in at build: run dev up --rebuild)' >&2; exit 1; }}
-grep -q ' /dev/shm tmpfs ' "$mounts" || {{ echo '/dev/shm is not a tmpfs in this container; refusing to write keys and secrets there' >&2; exit 1; }}
+{shm_guard}
 trap '[ -z "$made" ] || rm -rf "$dir"' EXIT
 stop() {{ [ -z "$!" ] || kill "$!" 2>/dev/null; exit "$1"; }}
 trap 'stop 129' HUP
@@ -322,6 +324,9 @@ mod tests {
     use super::*;
     use crate::commands::exec::ScriptedSignals;
     use crate::devcontainer::secrets::provider::{FakeProvider, PluginPath};
+    use crate::devcontainer::secrets::up_store::FakeUpStore;
+    use crate::devcontainer::secrets::validate::write_base_secrets;
+    use crate::devcontainer::secrets::{expose, secrets_json};
     use crate::error::DevError;
     use crate::runtime::fake_daemon::{capture, read_captured};
     use crate::runtime::{
@@ -369,6 +374,7 @@ mod tests {
         execs: Arc<Mutex<Vec<ExecCall>>>,
         piped: Arc<Mutex<Vec<ExecCall>>>,
         sshd_stdin: Arc<Mutex<Vec<u8>>>,
+        store: FakeUpStore,
     }
 
     impl ProxyFakeRuntime {
@@ -392,7 +398,18 @@ mod tests {
                 execs: Arc::default(),
                 piped: Arc::default(),
                 sshd_stdin: Arc::default(),
+                store: FakeUpStore::default(),
             }
+        }
+
+        fn storing(mut self, pairs: &[(&str, &str)]) -> Self {
+            self.store = FakeUpStore::storing(pairs);
+            self
+        }
+
+        /// Reads of the in-container up store, which `execs()` also lists.
+        fn store_reads(&self) -> Vec<ExecCall> {
+            FakeUpStore::reads(&self.execs(), |call| &call.0)
         }
 
         fn running(workspace: &Path) -> Self {
@@ -420,13 +437,6 @@ mod tests {
         fn piped(&self) -> Vec<ExecCall> {
             self.piped.lock().unwrap().clone()
         }
-    }
-
-    fn expose(env: &[(String, SecretValue)]) -> Vec<(String, String)> {
-        // Exposing inside a test double is the only way to prove the value arrived.
-        env.iter()
-            .map(|(key, value)| (key.clone(), value.expose().to_string()))
-            .collect()
     }
 
     impl ContainerRuntime for ProxyFakeRuntime {
@@ -481,6 +491,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((cmd.to_vec(), user.map(str::to_string), expose(env)));
+            if let Some(reply) = self.store.answer(cmd) {
+                return Box::pin(async move { Ok(reply) });
+            }
             let reply = self.release.clone();
             Box::pin(async move {
                 let stdout = match reply {
@@ -698,7 +711,11 @@ mod tests {
 
     fn running_with_env(fx: &Fixture) -> ProxyFakeRuntime {
         let mut runtime = ProxyFakeRuntime::running(&fx.workspace);
-        runtime.container_env = vec!["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
+        runtime.container_env = vec![
+            "PATH=/usr/bin".to_string(),
+            "HOME=/root".to_string(),
+            "TOKEN=hunter2".to_string(),
+        ];
         runtime
     }
 
@@ -740,9 +757,11 @@ mod tests {
     async fn the_session_is_one_recorded_exec_as_the_recorded_user_with_the_files_in_env() {
         let fx = fixture();
         let runtime = running_with_env(&fx);
+        let provider = FakeProvider::recording();
 
-        let (result, _) = proxy(&fx, &runtime, token_provider(), b"").await;
+        let (result, _) = proxy(&fx, &runtime, provider.clone(), b"").await;
         assert_eq!(result.unwrap(), ProxyOutcome::Finished(0));
+        assert_eq!(provider.calls(), 0);
 
         assert!(runtime.execs().is_empty(), "{:?}", runtime.execs());
         let piped = runtime.piped();
@@ -765,6 +784,135 @@ mod tests {
         assert!(config.contains(&cmd[4]), "the config names its own dir");
         assert_eq!(env[1].1, HOST_KEY);
         assert_eq!(env[2].1, format!("{PUBLIC_KEY}\n"));
+    }
+
+    fn declare_token_at(fx: &Fixture, time: &str) {
+        std::fs::write(
+            fx.workspace.join(".devcontainer/secrets.json"),
+            secrets_json(&[("TOKEN", time)]),
+        )
+        .unwrap();
+    }
+
+    fn from_provider() -> FakeProvider {
+        FakeProvider::answering(&[("TOKEN", "from-provider")])
+    }
+
+    fn running_with_container_token(fx: &Fixture, value: &str) -> ProxyFakeRuntime {
+        let mut runtime = ProxyFakeRuntime::running(&fx.workspace);
+        runtime.container_env = vec![format!("TOKEN={value}")];
+        runtime
+    }
+
+    fn session_set_env(runtime: &ProxyFakeRuntime) -> String {
+        runtime.piped()[0].2[0].1.clone()
+    }
+
+    #[tokio::test]
+    async fn a_create_secret_is_neither_resolved_nor_read() {
+        let fx = fixture();
+        declare_token_at(&fx, "create");
+        let runtime =
+            running_with_container_token(&fx, "from-container").storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        let (result, _) = proxy(&fx, &runtime, provider.clone(), b"").await;
+        result.unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        assert!(runtime.store_reads().is_empty());
+        assert!(session_set_env(&runtime).contains("TOKEN=from-container"));
+    }
+
+    #[tokio::test]
+    async fn an_up_secret_is_read_from_the_store_not_resolved() {
+        let fx = fixture();
+        declare_token_at(&fx, "up");
+        let runtime = ProxyFakeRuntime::running(&fx.workspace).storing(&[("TOKEN", "from-store")]);
+        let provider = from_provider();
+
+        let (result, _) = proxy(&fx, &runtime, provider.clone(), b"").await;
+        result.unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let reads = runtime.store_reads();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].1.as_deref(), Some("root"));
+        assert!(reads[0].2.is_empty());
+        assert!(session_set_env(&runtime).contains("TOKEN=from-store"));
+    }
+
+    #[tokio::test]
+    async fn an_exec_secret_is_resolved_for_this_session() {
+        let fx = fixture();
+        declare_token_at(&fx, "exec");
+        let runtime = ProxyFakeRuntime::running(&fx.workspace).storing(&[("TOKEN", "x")]);
+        let provider = from_provider();
+
+        let (result, _) = proxy(&fx, &runtime, provider.clone(), b"").await;
+        result.unwrap();
+
+        assert_eq!(provider.calls(), 1);
+        assert!(runtime.store_reads().is_empty());
+        assert!(session_set_env(&runtime).contains("TOKEN=from-provider"));
+    }
+
+    #[tokio::test]
+    async fn a_required_up_secret_missing_from_the_store_starts_no_sshd() {
+        let fx = fixture();
+        declare_token_at(&fx, "up");
+        let runtime = ProxyFakeRuntime::running(&fx.workspace).storing(&[]);
+
+        let (result, _) = proxy(&fx, &runtime, from_provider(), b"").await;
+
+        let message = result
+            .expect_err("a missing required up secret")
+            .to_string();
+        assert!(message.contains("TOKEN"), "{message}");
+        assert!(message.contains("dev up"), "{message}");
+        assert!(!runtime.calls().contains(&"exec_piped"));
+        assert!(runtime.piped().is_empty());
+    }
+
+    /// `dev up` stores a base `create` key for Compose, so the session reads it
+    /// from the store rather than expecting it in an env Compose never set.
+    #[tokio::test]
+    async fn a_compose_base_create_secret_is_read_from_the_store() {
+        let fx = fixture();
+        let devcontainer_dir = fx.workspace.join(".devcontainer");
+        std::fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"dockerComposeFile":"compose.yml","service":"app","workspaceFolder":"/app"}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(devcontainer_dir.join("secrets.json")).unwrap();
+        write_base_secrets(
+            &fx.dev_home,
+            r#"{"version":1,"secrets":{"TOKEN":"fake://token"}}"#,
+        );
+        let runtime = ProxyFakeRuntime::running(&fx.workspace).storing(&[("TOKEN", "from-store")]);
+        let provider = from_provider();
+
+        let (result, _) = proxy(&fx, &runtime, provider.clone(), b"").await;
+        result.unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(runtime.store_reads().len(), 1);
+        assert!(session_set_env(&runtime).contains("TOKEN=from-store"));
+    }
+
+    #[tokio::test]
+    async fn an_up_value_replaces_a_stale_container_value_of_the_same_name() {
+        let fx = fixture();
+        declare_token_at(&fx, "up");
+        let runtime = running_with_container_token(&fx, "stale").storing(&[("TOKEN", "fresh")]);
+
+        let (result, _) = proxy(&fx, &runtime, from_provider(), b"").await;
+        result.unwrap();
+
+        let config = session_set_env(&runtime);
+        assert!(config.contains("TOKEN=fresh"), "{config}");
+        assert!(!config.contains("stale"), "{config}");
     }
 
     #[tokio::test]
@@ -1010,7 +1158,7 @@ mod tests {
 #[cfg(test)]
 mod session_script_tests {
     use super::*;
-    use crate::util::process::{is_process_alive, wait_bounded};
+    use crate::util::process::{is_process_alive, shells, wait_bounded};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1019,24 +1167,6 @@ mod session_script_tests {
 
     const PATIENCE: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(10);
-
-    /// Debian's and Ubuntu's `/bin/sh` is dash and Alpine's is busybox ash,
-    /// so each runs whenever the host has it, alongside the host's own `sh`.
-    fn shells() -> Vec<&'static str> {
-        let mut shells: Vec<_> = ["sh", "/bin/dash", "/bin/bash"]
-            .into_iter()
-            .filter(|shell| !shell.starts_with('/') || Path::new(shell).exists())
-            .collect();
-        if on_path("busybox") {
-            shells.push("busybox sh");
-        }
-        shells
-    }
-
-    fn on_path(program: &str) -> bool {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
-    }
 
     /// Starts every fake sshd: it notes its pid beside the session dir,
     /// which it finds from the `-f <dir>/sshd_config` it is handed as `$4`.

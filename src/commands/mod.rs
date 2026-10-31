@@ -19,3 +19,15 @@ pub mod status;
 pub mod status_runtime;
 pub mod up;
 pub mod vscode;
+
+/// Print each warning on its own line to `out`, which is stderr in production
+/// and a buffer in tests that check what a command printed.
+pub(crate) fn print_warnings(
+    out: &mut dyn std::io::Write,
+    warnings: impl IntoIterator<Item = String>,
+) {
+    for warning in warnings {
+        // A warning that cannot be written has nowhere left to be reported.
+        let _ = writeln!(out, "{warning}");
+    }
+}

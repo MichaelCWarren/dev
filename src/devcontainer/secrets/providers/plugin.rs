@@ -26,7 +26,7 @@
 //! `ref` has the `foo://` scheme already stripped. `options` carries the object
 //! form's unrecognised keys verbatim, absent when empty; an option written as
 //! `""` stays on the wire as `""` and stays distinguishable from one that is
-//! not there. Dev never sends `optional` or `createTime`: what to do about a
+//! not there. Dev never sends `optional`, `resolve` or `createTime`: what to do about a
 //! failure is dev's policy, not the plugin's.
 //!
 //! Response, `version` required, `error` and `secrets` both optional:

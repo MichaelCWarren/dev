@@ -1,6 +1,7 @@
 use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
 use crate::devcontainer::features::{FeatureLifecycleHooks, ResolvedFeature};
 use crate::devcontainer::hooklog::HookLog;
+use crate::devcontainer::secrets::SecretValue;
 use crate::error::DevError;
 use crate::runtime::{ContainerRuntime, ExecResult};
 use crate::session::{HostIdentity, SessionKind, host_identity, recorded_script};
@@ -16,6 +17,21 @@ enum Stages {
     StartOnly,
 }
 
+/// Where a container's hooks run, as whom, and what each one is handed.
+pub struct HookTarget<'a, R: ?Sized> {
+    pub runtime: &'a R,
+    pub container_id: &'a str,
+    pub user: Option<&'a str>,
+    /// The resolved `workspaceFolder`, so a reused container with a stale
+    /// `WorkingDir` does not run hooks in an unrelated directory.
+    pub workdir: Option<&'a str>,
+    pub log: Option<&'a HookLog>,
+    /// Handed to every hook exec.
+    pub env: &'a [(String, SecretValue)],
+    /// This process, as each hook's session record names it.
+    pub host: &'a HostIdentity,
+}
+
 /// Execute the hooks a freshly created container is owed.
 ///
 /// Runs, in spec order: `onCreateCommand`, `updateContentCommand`,
@@ -25,25 +41,11 @@ enum Stages {
 /// `postAttachCommand` is not run here as it requires an attached session.
 /// Use [`run_post_attach_hooks`] for that.
 pub async fn run_create_hooks<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     config: &DevcontainerConfig,
-    user: Option<&str>,
-    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
-    log: Option<&HookLog>,
 ) -> Result<(), DevError> {
-    run_hooks(
-        runtime,
-        container_id,
-        config,
-        user,
-        workdir,
-        features,
-        log,
-        Stages::CreateAndStart,
-    )
-    .await
+    run_hooks(target, config, features, Stages::CreateAndStart).await
 }
 
 /// Execute the hooks a container that already existed is owed on restart.
@@ -53,41 +55,20 @@ pub async fn run_create_hooks<R: ContainerRuntime + ?Sized>(
 /// — `postCreateCommand` is where toolchains get installed and databases get
 /// seeded.
 pub async fn run_start_hooks<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     config: &DevcontainerConfig,
-    user: Option<&str>,
-    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
-    log: Option<&HookLog>,
 ) -> Result<(), DevError> {
-    run_hooks(
-        runtime,
-        container_id,
-        config,
-        user,
-        workdir,
-        features,
-        log,
-        Stages::StartOnly,
-    )
-    .await
+    run_hooks(target, config, features, Stages::StartOnly).await
 }
 
-/// Container lifecycle hooks are workspace-scoped commands: callers pass the
-/// resolved `workspaceFolder` so a reused container with a stale `WorkingDir`
-/// does not run hooks in an unrelated directory.
-#[allow(clippy::too_many_arguments)]
 async fn run_hooks<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     config: &DevcontainerConfig,
-    user: Option<&str>,
-    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
-    log: Option<&HookLog>,
     stages: Stages,
 ) -> Result<(), DevError> {
+    let (runtime, container_id, user) = (target.runtime, target.container_id, target.user);
     // Before adding sessions of its own, this collects the ones whose client is
     // gone — a container being brought up is one nothing else has looked at yet.
     match crate::session::sweep(runtime, container_id, user).await {
@@ -96,19 +77,8 @@ async fn run_hooks<R: ContainerRuntime + ?Sized>(
         Err(e) => eprintln!("[lifecycle] Warning: could not check for orphaned sessions: {e}"),
     }
 
-    let host = host_identity().await;
-    let hooks = run_hooks_in_order(
-        runtime,
-        container_id,
-        config,
-        user,
-        workdir,
-        features,
-        log,
-        &host,
-        stages,
-    );
-    attend_hooks(runtime, container_id, user, &host, hooks).await
+    let hooks = run_hooks_in_order(target, config, features, stages);
+    attend_hooks(runtime, container_id, user, target.host, hooks).await
 }
 
 /// Run the hooks, and end whichever is running if `dev` is told to go away.
@@ -151,16 +121,10 @@ where
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     config: &DevcontainerConfig,
-    user: Option<&str>,
-    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
-    log: Option<&HookLog>,
-    host: &HostIdentity,
     stages: Stages,
 ) -> Result<(), DevError> {
     let empty = Vec::new();
@@ -168,78 +132,47 @@ async fn run_hooks_in_order<R: ContainerRuntime + ?Sized>(
 
     if stages == Stages::CreateAndStart {
         run_stage(
-            runtime,
-            container_id,
+            target,
             "onCreateCommand",
             features,
             |h| h.on_create_command.as_ref(),
             config.on_create_command.as_ref(),
-            user,
-            workdir,
-            log,
-            host,
         )
         .await?;
 
         // updateContentCommand: config only, features don't declare this.
         if let Some(cmd) = config.update_content_command.as_ref() {
-            run_hook(
-                runtime,
-                container_id,
-                "updateContentCommand",
-                cmd,
-                user,
-                workdir,
-                log,
-                host,
-            )
-            .await?;
+            run_hook(target, "updateContentCommand", cmd).await?;
         }
 
         run_stage(
-            runtime,
-            container_id,
+            target,
             "postCreateCommand",
             features,
             |h| h.post_create_command.as_ref(),
             config.post_create_command.as_ref(),
-            user,
-            workdir,
-            log,
-            host,
         )
         .await?;
     }
 
     run_stage(
-        runtime,
-        container_id,
+        target,
         "postStartCommand",
         features,
         |h| h.post_start_command.as_ref(),
         config.post_start_command.as_ref(),
-        user,
-        workdir,
-        log,
-        host,
     )
     .await
 }
 
 /// Run one lifecycle stage: every feature's hook in dependency order, then the
 /// devcontainer.json hook.
-#[allow(clippy::too_many_arguments)]
 async fn run_stage<R, F>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     stage: &str,
     features: &[ResolvedFeature],
     feature_hook: F,
     config_hook: Option<&LifecycleCommand>,
-    user: Option<&str>,
-    workdir: Option<&str>,
-    log: Option<&HookLog>,
-    host: &HostIdentity,
 ) -> Result<(), DevError>
 where
     R: ContainerRuntime + ?Sized,
@@ -247,21 +180,11 @@ where
 {
     for f in features {
         if let Some(cmd) = feature_hook(&f.lifecycle_hooks) {
-            run_hook(
-                runtime,
-                container_id,
-                &format!("{stage} [{}]", f.id),
-                cmd,
-                user,
-                workdir,
-                log,
-                host,
-            )
-            .await?;
+            run_hook(target, &format!("{stage} [{}]", f.id), cmd).await?;
         }
     }
     if let Some(cmd) = config_hook {
-        run_hook(runtime, container_id, stage, cmd, user, workdir, log, host).await?;
+        run_hook(target, stage, cmd).await?;
     }
     Ok(())
 }
@@ -283,69 +206,72 @@ pub async fn run_post_attach_hooks<R: ContainerRuntime + ?Sized>(
     let empty = Vec::new();
     let features = features.unwrap_or(&empty);
     let host = host_identity().await;
-
-    run_stage(
+    let target = HookTarget {
         runtime,
         container_id,
+        user,
+        workdir,
+        log,
+        env: &[],
+        host: &host,
+    };
+
+    run_stage(
+        &target,
         "postAttachCommand",
         features,
         |h| h.post_attach_command.as_ref(),
         config.post_attach_command.as_ref(),
-        user,
-        workdir,
-        log,
-        &host,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_hook<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     name: &str,
     cmd: &LifecycleCommand,
-    user: Option<&str>,
-    workdir: Option<&str>,
-    log: Option<&HookLog>,
-    host: &HostIdentity,
 ) -> Result<(), DevError> {
     match cmd {
         LifecycleCommand::Single(command) => {
-            eprintln!("[lifecycle] Running {name}: {command}");
-            let args = hook_args(command, host);
-            let result = runtime
-                .exec(container_id, &args, user, workdir, &[])
-                .await?;
-            record_hook(log, name, command, &result);
-            check_result(name, command, &result)?;
+            run_in_turn(target, name, std::slice::from_ref(command)).await
         }
-        LifecycleCommand::Multiple(commands) => {
-            for command in commands {
-                eprintln!("[lifecycle] Running {name}: {command}");
-                let args = hook_args(command, host);
-                let result = runtime
-                    .exec(container_id, &args, user, workdir, &[])
-                    .await?;
-                record_hook(log, name, command, &result);
-                check_result(name, command, &result)?;
-            }
-        }
-        LifecycleCommand::Parallel(commands) => {
-            run_parallel(
-                runtime,
-                container_id,
-                name,
-                commands,
-                user,
-                workdir,
-                log,
-                host,
-            )
-            .await?;
-        }
+        LifecycleCommand::Multiple(commands) => run_in_turn(target, name, commands).await,
+        LifecycleCommand::Parallel(commands) => run_parallel(target, name, commands).await,
+    }
+}
+
+async fn run_in_turn<R: ContainerRuntime + ?Sized>(
+    target: &HookTarget<'_, R>,
+    name: &str,
+    commands: &[String],
+) -> Result<(), DevError> {
+    for command in commands {
+        eprintln!("[lifecycle] Running {name}: {command}");
+        run_command(target, name, command).await?;
     }
     Ok(())
+}
+
+/// The log and any failure name the hook by `name`; the progress line is the
+/// caller's.
+async fn run_command<R: ContainerRuntime + ?Sized>(
+    target: &HookTarget<'_, R>,
+    name: &str,
+    command: &str,
+) -> Result<(), DevError> {
+    let args = hook_args(command, target.host);
+    let result = target
+        .runtime
+        .exec(
+            target.container_id,
+            &args,
+            target.user,
+            target.workdir,
+            target.env,
+        )
+        .await?;
+    record_hook(target.log, name, command, &result);
+    check_result(name, command, &result)
 }
 
 /// Append a hook's outcome to the workspace hook log, when one is being kept.
@@ -370,50 +296,19 @@ fn hook_args(command: &str, host: &HostIdentity) -> Vec<String> {
 }
 
 /// Run named commands in parallel using tokio tasks (Gap 14).
-#[allow(clippy::too_many_arguments)]
 async fn run_parallel<R: ContainerRuntime + ?Sized>(
-    runtime: &R,
-    container_id: &str,
+    target: &HookTarget<'_, R>,
     name: &str,
     commands: &std::collections::BTreeMap<String, String>,
-    user: Option<&str>,
-    workdir: Option<&str>,
-    log: Option<&HookLog>,
-    host: &HostIdentity,
 ) -> Result<(), DevError> {
     use futures_util::future::join_all;
 
-    let futures: Vec<_> = commands
-        .iter()
-        .map(|(label, command)| {
-            let label = label.clone();
-            let command = command.clone();
-            let container_id = container_id.to_string();
-            let name = name.to_string();
-            let user = user.map(|u| u.to_string());
-            let workdir = workdir.map(|d| d.to_string());
+    let futures = commands.iter().map(|(label, command)| async move {
+        eprintln!("[lifecycle] Running {name} ({label}): {command}");
+        run_command(target, name, command).await
+    });
 
-            async move {
-                eprintln!("[lifecycle] Running {name} ({label}): {command}");
-                let args = hook_args(&command, host);
-                let result = runtime
-                    .exec(
-                        &container_id,
-                        &args,
-                        user.as_deref(),
-                        workdir.as_deref(),
-                        &[],
-                    )
-                    .await?;
-                record_hook(log, &name, &command, &result);
-                check_result(&name, &command, &result)?;
-                Ok::<(), DevError>(())
-            }
-        })
-        .collect();
-
-    let results = join_all(futures).await;
-    for result in results {
+    for result in join_all(futures).await {
         result?;
     }
 

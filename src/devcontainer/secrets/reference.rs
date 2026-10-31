@@ -20,12 +20,33 @@ use crate::error::DevError;
 use std::collections::BTreeMap;
 
 /// Keys the object form spells itself. Everything else is a provider option.
-const RESERVED_KEYS: [&str; 4] = ["provider", "ref", "optional", "createTime"];
+const RESERVED_KEYS: [&str; 5] = ["provider", "ref", "optional", "createTime", "resolve"];
+
+/// When a secret is resolved: into the container's environment at creation,
+/// on every `dev up`, or only when a command runs in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveTime {
+    Create,
+    Up,
+    Exec,
+}
+
+impl ResolveTime {
+    fn from_name(name: &str) -> Option<ResolveTime> {
+        match name {
+            "create" => Some(ResolveTime::Create),
+            "up" => Some(ResolveTime::Up),
+            "exec" => Some(ResolveTime::Exec),
+            _ => None,
+        }
+    }
+}
 
 /// One entry of the `secrets` map in `secrets.json`, parsed and validated.
 ///
-/// Every field is private and `substitute` is the only `&mut self` method, so
-/// nothing outside this file can change which provider a reference resolves to.
+/// Every field is private and the only changes are `substitute` and
+/// `set_resolve_time`, so nothing outside this file can change which provider
+/// a reference resolves to.
 // `#[allow(dead_code)]` goes when `up.rs` validation (Group 5) reaches this type
 // from the bin target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +57,7 @@ pub struct SecretRef {
     reference: String,
     options: BTreeMap<String, serde_json::Value>,
     optional: bool,
-    create_time: bool,
+    resolve_time: ResolveTime,
 }
 
 #[allow(dead_code)]
@@ -68,7 +89,7 @@ impl SecretRef {
             reference.into(),
             BTreeMap::new(),
             false,
-            true,
+            ResolveTime::Create,
         )
     }
 
@@ -92,8 +113,8 @@ impl SecretRef {
         self.optional
     }
 
-    pub fn create_time(&self) -> bool {
-        self.create_time
+    pub fn resolve_time(&self) -> ResolveTime {
+        self.resolve_time
     }
 
     /// One provider option, whatever its JSON type. For the plugin provider,
@@ -148,6 +169,12 @@ impl SecretRef {
         }
         Ok(())
     }
+
+    /// Key and provider cannot change, so this never moves a reference to
+    /// another provider.
+    pub(crate) fn set_resolve_time(&mut self, resolve_time: ResolveTime) {
+        self.resolve_time = resolve_time;
+    }
 }
 
 /// Test fixtures only. Private fields mean a test can no longer write a struct
@@ -166,8 +193,8 @@ impl SecretRef {
         self
     }
 
-    pub fn with_create_time(mut self, create_time: bool) -> Self {
-        self.create_time = create_time;
+    pub fn with_resolve_time(mut self, resolve_time: ResolveTime) -> Self {
+        self.resolve_time = resolve_time;
         self
     }
 }
@@ -179,7 +206,7 @@ fn build(
     reference: String,
     options: BTreeMap<String, serde_json::Value>,
     optional: bool,
-    create_time: bool,
+    resolve_time: ResolveTime,
 ) -> Result<SecretRef, DevError> {
     if key.is_empty() {
         return Err(reference_error(
@@ -197,7 +224,7 @@ fn build(
         reference,
         options,
         optional,
-        create_time,
+        resolve_time,
     })
 }
 
@@ -219,7 +246,7 @@ fn parse_shorthand(key: &str, text: &str) -> Result<SecretRef, DevError> {
         body.to_string(),
         BTreeMap::new(),
         false,
-        true,
+        ResolveTime::Create,
     )
 }
 
@@ -232,15 +259,51 @@ fn parse_object(
     let provider = required_string(key, map, "provider")?;
     let reference = required_string(key, map, "ref")?;
     let optional = optional_bool(key, map, "optional", false)?;
-    let create_time = optional_bool(key, map, "createTime", true)?;
+    let resolve_time = resolve_time_field(key, map)?;
     build(
         key.to_string(),
         provider,
         reference,
         collect_options(map),
         optional,
-        create_time,
+        resolve_time,
     )
+}
+
+/// `resolve` or the older `createTime` flag, never both. The both-set check
+/// comes first so a wrong type in either cannot hide it.
+fn resolve_time_field(
+    key: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ResolveTime, DevError> {
+    match (map.get("resolve"), map.contains_key("createTime")) {
+        (Some(_), true) => Err(reference_error(
+            key,
+            "set either `resolve` or `createTime`, not both",
+        )),
+        (Some(serde_json::Value::String(name)), false) => {
+            ResolveTime::from_name(name).ok_or_else(|| {
+                reference_error(
+                    key,
+                    format!(
+                        "field `resolve` must be one of `create`, `up`, `exec`, found `{name}`"
+                    ),
+                )
+            })
+        }
+        (Some(other), false) => Err(reference_error(
+            key,
+            format!(
+                "field `resolve` must be a string, found {}",
+                value_type_name(other)
+            ),
+        )),
+        (None, _) => Ok(if optional_bool(key, map, "createTime", true)? {
+            ResolveTime::Create
+        } else {
+            ResolveTime::Exec
+        }),
+    }
 }
 
 fn validate_provider_name(key: &str, provider: &str) -> Result<(), DevError> {
@@ -379,7 +442,7 @@ mod tests {
         let r = parse("LINEAR_API_KEY", r#""op://Private/Linear CLI/credential""#);
         assert_eq!(r.key(), "LINEAR_API_KEY");
         assert!(!r.optional());
-        assert!(r.create_time());
+        assert_eq!(r.resolve_time(), ResolveTime::Create);
     }
 
     #[test]
@@ -493,21 +556,93 @@ mod tests {
     }
 
     #[test]
-    fn object_form_flags_default_to_optional_false_and_create_time_true() {
+    fn object_form_flags_default_to_optional_false_and_resolve_create() {
         let plain = parse("T", r#"{"provider":"env","ref":"TOKEN"}"#);
         assert!(!plain.optional());
-        assert!(plain.create_time());
+        assert_eq!(plain.resolve_time(), ResolveTime::Create);
 
         let optional = parse(
             "T",
             r#"{"provider":"keychain","ref":"fsm-db","optional":true}"#,
         );
         assert!(optional.optional());
-        assert!(optional.create_time());
+        assert_eq!(optional.resolve_time(), ResolveTime::Create);
 
         let late = parse("T", r#"{"provider":"op","ref":"a/b/c","createTime":false}"#);
-        assert!(!late.create_time());
+        assert_eq!(late.resolve_time(), ResolveTime::Exec);
         assert!(!late.optional());
+    }
+
+    #[test]
+    fn resolve_names_each_time() {
+        for (name, expected) in [
+            ("create", ResolveTime::Create),
+            ("up", ResolveTime::Up),
+            ("exec", ResolveTime::Exec),
+        ] {
+            let r = parse(
+                "T",
+                &format!(r#"{{"provider":"env","ref":"X","resolve":"{name}"}}"#),
+            );
+            assert_eq!(r.resolve_time(), expected, "resolve {name}");
+        }
+    }
+
+    #[test]
+    fn create_time_true_maps_to_create() {
+        let r = parse("T", r#"{"provider":"env","ref":"X","createTime":true}"#);
+        assert_eq!(r.resolve_time(), ResolveTime::Create);
+    }
+
+    #[test]
+    fn resolve_and_create_time_together_is_an_error() {
+        for json in [
+            r#"{"provider":"env","ref":"X","resolve":"exec","createTime":false}"#,
+            r#"{"provider":"env","ref":"X","resolve":"create","createTime":true}"#,
+            r#"{"provider":"env","ref":"X","resolve":7,"createTime":"x"}"#,
+        ] {
+            let err = SecretRef::from_json("T", &v(json)).unwrap_err();
+            assert!(matches!(err, DevError::SecretReference { .. }), "{json}");
+            let msg = format!("{err}");
+            assert!(msg.contains("T"), "names the key for {json}: {msg}");
+            assert!(msg.contains("`resolve`"), "names resolve for {json}: {msg}");
+            assert!(
+                msg.contains("`createTime`"),
+                "names createTime for {json}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_resolve_value_errors_naming_the_choices() {
+        for value in ["later", "Up", ""] {
+            let msg = err_msg(
+                "T",
+                &format!(r#"{{"provider":"env","ref":"X","resolve":"{value}"}}"#),
+            );
+            for needle in ["T", "resolve", "`create`", "`up`", "`exec`"] {
+                assert!(msg.contains(needle), "names {needle} for {value:?}: {msg}");
+            }
+            assert!(
+                msg.contains(&format!("found `{value}`")),
+                "names the value {value:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_never_lands_in_options() {
+        let r = parse(
+            "T",
+            r#"{"provider":"op","ref":"a/b/c","resolve":"up","account":"x"}"#,
+        );
+        assert_eq!(
+            r,
+            SecretRef::new("T", "op", "a/b/c")
+                .unwrap()
+                .with_option("account", v(r#""x""#))
+                .with_resolve_time(ResolveTime::Up)
+        );
     }
 
     #[test]
@@ -522,7 +657,7 @@ mod tests {
                 .unwrap()
                 .with_option("account", v(r#""x""#))
                 .with_optional(true)
-                .with_create_time(false)
+                .with_resolve_time(ResolveTime::Exec)
         );
         for reserved in RESERVED_KEYS {
             assert!(r.option(reserved).is_none(), "{reserved} leaked to options");
@@ -644,6 +779,16 @@ mod tests {
                 "createTime",
                 "boolean",
             ),
+            (
+                r#"{"provider":"op","ref":"a/b/c","resolve":1}"#,
+                "resolve",
+                "string",
+            ),
+            (
+                r#"{"provider":"op","ref":"a/b/c","resolve":true}"#,
+                "resolve",
+                "string",
+            ),
         ] {
             let msg = err_msg("T", json);
             assert!(msg.contains(field), "names `{field}` for {json}: {msg}");
@@ -683,6 +828,8 @@ mod tests {
             format!(r#"{{"provider":3,"ref":"{SENTINEL}"}}"#),
             format!(r#"{{"provider":"op","ref":"{SENTINEL}","optional":"yes"}}"#),
             format!(r#"{{"provider":"op","ref":"{SENTINEL}","createTime":1}}"#),
+            format!(r#"{{"provider":"op","ref":"{SENTINEL}","resolve":"up","createTime":true}}"#),
+            format!(r#"{{"provider":"op","ref":"{SENTINEL}","resolve":"later"}}"#),
             format!(r#"["{SENTINEL}"]"#),
         ];
         for json in bodies {

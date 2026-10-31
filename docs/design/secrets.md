@@ -139,10 +139,12 @@ reject unknown providers and malformed URIs before any side effect: before
 discipline `run_args.rs` already documents, and it means a typo fails in a second
 rather than after a five-minute build.
 
-**Resolve late**, just before the env map is assembled around `up.rs:486`, and only
-on the create path. Env only reaches a container at create, so resolving during a
-`dev up` that reuses an existing container buys nothing and costs a biometric
-prompt every single time. Get this wrong and the feature is annoying enough that
+**Resolve late**, just before the env map is assembled around `up.rs:486`. A `create`
+value resolves only on the create path. Env only reaches a container at create, so
+resolving it during a `dev up` that reuses an existing container buys nothing and
+costs a biometric prompt every single time. An `up` value resolves on every `dev up`
+path, so it can change without a rebuild. That costs a prompt on each `dev up`, which
+is why `up` is opt-in. Get the default wrong and the feature is annoying enough that
 people turn it off.
 
 **Apply last.** After the `runArgs` env loop at `up.rs:545`, so secrets are the
@@ -156,12 +158,18 @@ time injection alone cannot do that. `docker exec` accepts `-e`, so `dev exec` a
 `dev shell` can re-resolve and inject per invocation, and a rotated secret then
 reaches the next shell without a recreate.
 
-Both halves are wanted, for different reasons: create-time so lifecycle hooks and
-long-running container processes have the values, exec-time so they stay fresh.
+Each secret picks one of three times with `"resolve"`, for a different job. `create`
+puts the value in the container env, so lifecycle hooks and long-running container
+processes have it, and `docker inspect` shows it. `up` resolves on every `dev up` and
+sits in a root-only tmpfs store in the container, so hooks and postStart processes
+have it without `docker inspect` showing it. `exec` resolves for each `dev exec`,
+`dev shell` and ssh session, so it stays fresh. `createTime` is the older spelling:
+`true` is `create` and `false` is `exec`.
+
 Two consequences to be honest about. Already-running processes (a dev server
-started at postStart) keep the old value until restarted. And the create-time half
-is what puts secrets in `docker inspect`; a `"createTime": false` per-secret option
-covers the case where only exec-time injection is wanted.
+started at postStart) keep the old value until restarted. And the `create` time is
+what puts a secret in `docker inspect`, so a secret that must stay out of it uses
+`up` or `exec`.
 
 Per-invocation resolution is only tolerable because providers cache their own
 sessions. Dev must not build a cache of its own.
@@ -170,7 +178,10 @@ sessions. Dev must not build a cache of its own.
 
 1. Resolved values are never persisted. Not to the lockfile (which carries only
    features), not to the `devcontainer.metadata` image label (written from feature
-   metadata), not to any cache. Both are clean today and must stay that way.
+   metadata), not to any cache. Both are clean today and must stay that way. An `up`
+   value lives only in the root-only tmpfs store inside the container (one directory
+   per workspace under `/dev/shm/dev-secrets`), never on host disk and never in a
+   `dev` cache.
 2. `SecretValue` is a newtype whose `Debug` prints `***`, but it does not by itself
    close the leak. `ContainerConfig.env` is a `HashMap<String, String>`
    (`runtime/mod.rs:75`), so the newtype is gone by the time a resolved value lands

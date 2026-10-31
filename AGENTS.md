@@ -57,6 +57,12 @@
   with a `made` flag so a pre-existing dir is never removed, and `stop` kills `$!`, never a pid
   assigned after the fork. When ssh-proxy
   dies the runtime closes the exec's stdin and sshd's EOF ends the session.
+- `session_secrets` (`src/commands/exec.rs`) resolves only `exec` entries for exec, shell and
+  ssh-proxy. It reads `up` from the store and leaves `create` to the container env. The store
+  (`up_store.rs`) is one child per workspace hash under a root-owned 0700 `/dev/shm/dev-secrets`,
+  written only by `dev up` through a root exec's env and refused off tmpfs. Every rename happens
+  inside that parent: a rename straight into world-writable `/dev/shm` follows a planted symlink.
+  A missing `up` key says run `dev up`; a provider fallback brings back a prompt per session.
 - The `ssh server` row of `dev status` runs host `ssh -F <alias file>`, never the user's
   `~/.ssh/config`, so it does not prove the `Include` line exists. It is the last row, after
   cmux relay. T3's `dev-t3-${devcontainerId}` volume lives in the user's base config, not `dev`.
@@ -158,6 +164,11 @@
   read the real home, so neither surfaced as a failure. The rule generalizes past `DevHome` —
   `wanted_endpoint_from` exists as a seam beside `wanted_endpoint` because `SSH_AUTH_SOCK` had
   the same shape. Check the call tree, not the signature.
+- Under `#[cfg(test)]`, `DevHome::current()` panics. Before that guard, `up.rs` helpers went
+  through `run_with_runtime` (real home, `with_builtins`), and once the user's base declared an
+  `op` secret every `cargo test` raised Touch ID prompts. Never weaken the guard to pass a test;
+  route it through `DevHome::at` and a fake-only registry. The stop hook also puts a failing `op`
+  first on PATH (`.claude/hooks/no-provider-bin`).
 - Fail-proof a test by DELETING the mechanism it covers and re-running, not by inverting its
   assertion. Inverting proves the assertion is wired to something; deleting proves it is wired
   to the right thing. Four ways a test here passed while proving nothing, all caught this way:
