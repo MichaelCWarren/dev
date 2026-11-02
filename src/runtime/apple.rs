@@ -3551,6 +3551,7 @@ mod tests {
             userns_mode: None,
             memory: None,
             memory_swap: None,
+            cpus: None,
             extra_hosts: vec![],
         }
     }
@@ -3678,6 +3679,7 @@ mod tests {
             userns_mode: None,
             memory: None,
             memory_swap: None,
+            cpus: None,
             extra_hosts: vec![],
         };
 
@@ -3928,6 +3930,7 @@ mod tests {
             userns_mode: None,
             memory: None,
             memory_swap: None,
+            cpus: None,
             extra_hosts: vec![],
         };
 

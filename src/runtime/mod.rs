@@ -154,6 +154,8 @@ pub struct ContainerConfig {
     pub memory: Option<i64>,
     /// Memory plus swap limit in bytes, -1 for unlimited (--memory-swap).
     pub memory_swap: Option<i64>,
+    /// CPU limit in nano-CPUs (--cpus).
+    pub cpus: Option<i64>,
     /// Extra `/etc/hosts` entries in Docker's `host:ip` form.
     pub extra_hosts: Vec<String>,
 }
@@ -195,6 +197,7 @@ impl std::fmt::Debug for ContainerConfig {
             .field("userns_mode", &self.userns_mode)
             .field("memory", &self.memory)
             .field("memory_swap", &self.memory_swap)
+            .field("cpus", &self.cpus)
             .field("extra_hosts", &self.extra_hosts)
             .finish()
     }
@@ -1835,6 +1838,7 @@ mod tests {
             userns_mode: None,
             memory: None,
             memory_swap: None,
+            cpus: None,
             extra_hosts: vec![],
         }
     }

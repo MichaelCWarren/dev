@@ -862,6 +862,7 @@ pub(crate) async fn run_with_runtime_with_providers(
         userns_mode: resolved_run_args.userns_mode.clone(),
         memory: resolved_run_args.memory,
         memory_swap: resolved_run_args.memory_swap,
+        cpus: resolved_run_args.cpus,
         extra_hosts: host_access.host_gateway_entry().into_iter().collect(),
     };
 
@@ -6982,10 +6983,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apple_runtime_rejects_memory_runargs() {
+    async fn up_cpus_runarg_reaches_container_config() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--cpus=1.5"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("cpus runArg should create successfully");
+
+        assert_eq!(rt.created_config().cpus, Some(1_500_000_000));
+    }
+
+    #[tokio::test]
+    async fn apple_runtime_rejects_resource_runargs() {
         for (run_arg, flag) in [
             ("\"--memory=16g\"", "--memory"),
             ("\"--memory-swap=-1\"", "--memory-swap"),
+            ("\"--cpus=2\"", "--cpus"),
         ] {
             let workspace = TempDir::new().unwrap();
             write_project_config(
@@ -6995,7 +7012,7 @@ mod tests {
             let rt = UpFakeRuntime::ok().named_runtime("apple");
             let err = run_up_with_fake(&rt, &workspace)
                 .await
-                .expect_err("Apple must reject memory runArgs");
+                .expect_err("Apple must reject resource runArgs");
             let msg = format!("{err}");
             assert!(msg.contains("Apple"), "{msg}");
             assert!(msg.contains(&format!("flag(s) {flag} are")), "{msg}");
@@ -8236,6 +8253,20 @@ mod tests {
         assert_eq!(
             warning,
             "Warning: container 'box' was created with runArgs options `--memory=8g`, but the config now asks for `--memory=16g --memory-swap=0`. Run `dev up --rebuild` to recreate it with them."
+        );
+    }
+
+    #[test]
+    fn an_added_cpus_option_on_a_reused_container_says_rebuild() {
+        let container = labelled_container(Some("--memory=8g"));
+        let wanted = ResolvedRunArgs {
+            cpus: Some(2_000_000_000),
+            ..memory_run_args(Some(8 * GIB), None)
+        };
+        let warning = super::run_args_options_warning(&container, &wanted).expect("a warning");
+        assert!(
+            warning.contains("now asks for `--memory=8g --cpus=2`."),
+            "{warning}"
         );
     }
 

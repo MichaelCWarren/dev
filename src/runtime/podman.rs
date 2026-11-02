@@ -494,6 +494,7 @@ mod tests {
             userns_mode: Some("keep-id".to_string()),
             memory: Some(16 * 1024 * 1024 * 1024),
             memory_swap: Some(-1),
+            cpus: Some(1_500_000_000),
             extra_hosts: vec![],
         };
         config.labels.insert(
@@ -534,6 +535,7 @@ mod tests {
         assert_eq!(body["HostConfig"]["UsernsMode"], "keep-id");
         assert_eq!(body["HostConfig"]["Memory"], 16_i64 * 1024 * 1024 * 1024);
         assert_eq!(body["HostConfig"]["MemorySwap"], -1);
+        assert_eq!(body["HostConfig"]["NanoCpus"], 1_500_000_000_i64);
     }
 
     #[test]

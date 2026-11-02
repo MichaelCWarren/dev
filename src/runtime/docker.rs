@@ -763,6 +763,7 @@ impl BollardRuntime {
             userns_mode: config.userns_mode.clone(),
             memory: config.memory,
             memory_swap: config.memory_swap,
+            nano_cpus: config.cpus,
             extra_hosts: if config.extra_hosts.is_empty() {
                 None
             } else {
@@ -1714,6 +1715,7 @@ mod tests {
             userns_mode: None,
             memory: None,
             memory_swap: None,
+            cpus: None,
             extra_hosts: vec![],
         }
     }
@@ -1892,6 +1894,21 @@ mod tests {
             .expect("host config should be set");
         assert_eq!(host.memory, Some(16 * 1024 * 1024 * 1024));
         assert_eq!(host.memory_swap, Some(-1));
+    }
+
+    #[test]
+    fn create_body_carries_nano_cpus_only_when_set() {
+        let unset = BollardRuntime::to_create_body(&container_config(None))
+            .host_config
+            .expect("host config should be set");
+        assert_eq!(unset.nano_cpus, None);
+
+        let mut cfg = container_config(None);
+        cfg.cpus = Some(1_500_000_000);
+        let host = BollardRuntime::to_create_body(&cfg)
+            .host_config
+            .expect("host config should be set");
+        assert_eq!(host.nano_cpus, Some(1_500_000_000));
     }
 
     /// A `Vec` field is `None` when empty, never `Some(vec![])` — Docker

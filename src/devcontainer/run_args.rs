@@ -17,6 +17,7 @@
 //! - `--userns VALUE`, `--userns=VALUE`
 //! - `--memory SIZE`, `--memory=SIZE`, `-m SIZE`
 //! - `--memory-swap SIZE`, `--memory-swap=SIZE` (`-1` means unlimited swap)
+//! - `--cpus N`, `--cpus=N` (a positive decimal such as `8` or `1.5`)
 //! - bare `--privileged` and `--init`
 //!
 //! ## Environment precedence (last value for a key wins)
@@ -48,7 +49,9 @@
 
 use crate::error::DevError;
 
+mod cpus;
 mod memory;
+pub use cpus::format_cpus;
 pub use memory::format_size;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +69,8 @@ pub struct ResolvedRunArgs {
     pub userns_mode: Option<String>,
     pub memory: Option<i64>,
     pub memory_swap: Option<i64>,
+    /// CPU limit in nano-CPUs.
+    pub cpus: Option<i64>,
 }
 
 /// Container label holding [`ResolvedRunArgs::runtime_options`] as the
@@ -89,6 +94,7 @@ impl ResolvedRunArgs {
             userns_mode,
             memory,
             memory_swap,
+            cpus,
         } = self;
         let mut options = Vec::new();
         options.extend(sorted_unique(cap_add).map(|v| format!("--cap-add={v}")));
@@ -96,6 +102,7 @@ impl ResolvedRunArgs {
         options.extend(userns_mode.iter().map(|v| format!("--userns={v}")));
         options.extend(memory.map(|v| format!("--memory={}", format_size(v))));
         options.extend(memory_swap.map(|v| format!("--memory-swap={}", format_size(v))));
+        options.extend(cpus.map(|v| format!("--cpus={}", format_cpus(v))));
         options.extend(privileged.then(|| "--privileged".to_string()));
         options.extend(init.then(|| "--init".to_string()));
         options
@@ -139,7 +146,8 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
     while i < args.len() {
         let handled = apply_env_flag(args, &mut i, workspace, &mut env)?
             || apply_runtime_option(args, &mut i, &mut resolved)?
-            || apply_memory_flag(args, &mut i, &mut resolved)?;
+            || apply_memory_flag(args, &mut i, &mut resolved)?
+            || apply_cpus_flag(args, &mut i, &mut resolved)?;
         if !handled {
             return Err(unsupported_flag_error(&args[i]));
         }
@@ -231,7 +239,7 @@ fn apply_memory_flag(
         let value = non_empty_inline_value(arg, value, "--memory")?;
         resolved.memory = Some(memory::parse_memory("--memory", value)?);
     } else if arg == "--memory" || arg == "-m" {
-        let value = next_size_value(args, i, arg)?;
+        let value = next_numeric_value(args, i, arg)?;
         resolved.memory = Some(memory::parse_memory(arg, &value)?);
     } else if let Some(value) = attached_short_memory_value(arg) {
         let value = non_empty_inline_value(arg, value, "-m")?;
@@ -240,11 +248,29 @@ fn apply_memory_flag(
         let value = non_empty_inline_value(arg, value, "--memory-swap")?;
         resolved.memory_swap = Some(memory::parse_memory_swap("--memory-swap", value)?);
     } else if arg == "--memory-swap" {
-        let value = next_size_value(args, i, arg)?;
+        let value = next_numeric_value(args, i, arg)?;
         resolved.memory_swap = Some(memory::parse_memory_swap(arg, &value)?);
     } else {
         return Ok(false);
     }
+    Ok(true)
+}
+
+/// `--cpus`. The last value wins.
+fn apply_cpus_flag(
+    args: &[String],
+    i: &mut usize,
+    resolved: &mut ResolvedRunArgs,
+) -> Result<bool, DevError> {
+    let arg = &args[*i];
+    let value = if let Some(value) = arg.strip_prefix("--cpus=") {
+        non_empty_inline_value(arg, value, "--cpus")?.to_string()
+    } else if arg == "--cpus" {
+        next_numeric_value(args, i, arg)?
+    } else {
+        return Ok(false);
+    };
+    resolved.cpus = Some(cpus::parse_cpus("--cpus", &value)?);
     Ok(true)
 }
 
@@ -255,8 +281,9 @@ fn attached_short_memory_value(arg: &str) -> Option<&str> {
 }
 
 /// Like `next_value`, but a negative number is a value, not another flag, so
-/// `--memory-swap -1` parses and `--memory -2` is reported as a bad size.
-fn next_size_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
+/// `--memory-swap -1` parses and `--memory -2` or `--cpus -1` is reported as
+/// a bad value.
+fn next_numeric_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
     let negative_number = args
         .get(*i + 1)
         .and_then(|token| token.strip_prefix('-'))
@@ -477,7 +504,7 @@ fn unsupported_flag_error(flag: &str) -> DevError {
         "unsupported `runArgs` flag `{name}`: `dev` translates only the documented \
          `runArgs` subset into the container create request: `--env-file`, `--env`, `-e`, \
          `--cap-add`, `--security-opt`, `--userns`, `--memory`, `-m`, `--memory-swap`, \
-         `--privileged`, and `--init`. \
+         `--cpus`, `--privileged`, and `--init`. \
          Other Docker/Podman CLI flags have no direct daemon-API equivalent here; use the \
          equivalent first-class devcontainer property where Dev implements one (for example \
          `forwardPorts`, `mounts`, or `containerEnv`). See the README `runArgs` support matrix."
@@ -809,6 +836,54 @@ mod tests {
     }
 
     #[test]
+    fn cpus_flag_accepts_both_spellings_and_last_value_wins() {
+        for args in [&["--cpus", "1.5"][..], &["--cpus=1.5"][..]] {
+            assert_eq!(
+                resolve_all(args).unwrap().cpus,
+                Some(1_500_000_000),
+                "{args:?}"
+            );
+        }
+        let resolved = resolve_all(&["--cpus=2", "--cpus", "8"]).unwrap();
+        assert_eq!(resolved.cpus, Some(8_000_000_000));
+    }
+
+    #[test]
+    fn invalid_cpus_are_rejected_naming_flag_and_value() {
+        for (args, value) in [
+            (&["--cpus=0"][..], "0"),
+            (&["--cpus=-1"][..], "-1"),
+            (&["--cpus", "-1"][..], "-1"),
+            (&["--cpus", "nan"][..], "nan"),
+            (&["--cpus=lots"][..], "lots"),
+            (&["--cpus=1.2.3"][..], "1.2.3"),
+        ] {
+            let err = resolve_all(args).unwrap_err();
+            assert!(matches!(err, DevError::InvalidConfig(_)), "{args:?}: {err}");
+            let msg = format!("{err}");
+            assert!(msg.contains("invalid value"), "{args:?}: {msg}");
+            assert!(msg.contains("`--cpus`"), "{args:?}: {msg}");
+            assert!(msg.contains(&format!("`{value}`")), "{args:?}: {msg}");
+        }
+        for args in [&["--cpus="][..], &["--cpus"][..]] {
+            let err = resolve_all(args).unwrap_err();
+            assert!(format!("{err}").contains("missing its value"), "{err}");
+        }
+    }
+
+    #[test]
+    fn cpus_runtime_option_is_the_shortest_decimal() {
+        assert_eq!(
+            resolve_all(&["--cpus=8"]).unwrap().runtime_options(),
+            vec!["--cpus=8"]
+        );
+        assert_eq!(
+            resolve_all(&["--cpus", "1.50"]).unwrap().runtime_options(),
+            vec!["--cpus=1.5"]
+        );
+    }
+
+    #[test]
     fn runtime_options_are_canonical_and_leave_env_out() {
         let resolved = resolve_all(&[
             "--env=TOKEN=secret",
@@ -851,6 +926,7 @@ mod tests {
             "--userns=host",
             "--memory=16g",
             "--memory-swap=-1",
+            "--cpus=2",
             "--privileged",
             "--init",
         ])
@@ -863,6 +939,7 @@ mod tests {
                 "--userns",
                 "--memory",
                 "--memory-swap",
+                "--cpus",
                 "--privileged",
                 "--init",
             ]
@@ -888,6 +965,7 @@ mod tests {
             ("--memory", "--init"),
             ("-m", "--init"),
             ("--memory-swap", "--init"),
+            ("--cpus", "--init"),
         ] {
             let err =
                 super::resolve_run_args(&[flag.to_string(), next.to_string()], &ws).unwrap_err();

@@ -349,6 +349,7 @@ previously every `runArg` was parsed and then dropped.)
 | `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
 | `--memory` | `--memory SIZE`, `--memory=SIZE`, `-m SIZE`, `-mSIZE`, `-m=SIZE` | HostConfig `Memory` in bytes; last value wins |
 | `--memory-swap` | `--memory-swap SIZE`, `--memory-swap=SIZE` | HostConfig `MemorySwap` in bytes, `-1` for unlimited; last value wins |
+| `--cpus` | `--cpus N`, `--cpus=N` | HostConfig `NanoCpus` (N × 10⁹); last value wins |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
 | `--init` | `--init` only | HostConfig `Init=true` |
 
@@ -357,8 +358,9 @@ preserved; repeated duplicate capabilities/security options are sent once in
 stable order after feature-contributed values. Boolean assignments such as
 `--init=true` and `--privileged=false` are rejected; use the bare flag. For
 value-taking two-token forms, the next token must be a non-empty value, not
-another flag. A negative number after `--memory` or `--memory-swap` is read as
-its value, so `--memory-swap -1` works.
+another flag. A negative number after `--memory`, `--memory-swap` or `--cpus`
+is read as its value, so `--memory-swap -1` works and `--cpus -1` is reported
+as a bad value.
 
 Sizes follow Docker's parser (go-units `RAMInBytes`): a number, then an
 optional space and an optional unit `k`, `m`, `g`, `t`, or `p` in binary
@@ -367,6 +369,10 @@ bytes (`16g`, `16GB`, `16GiB`, `512m`, `1.5g`). `dev` also checks what the daemo
 would refuse at create: `--memory` under 6m, `--memory-swap` without
 `--memory`, and `--memory-swap` below `--memory` (it is memory plus swap). Both
 checks fail before side effects.
+
+`--cpus` takes a positive decimal number of CPUs with at most 9 decimal places
+(`8`, `1.5`, `.5`). Zero, negatives, exponents (`1e3`) and fractions (`1/2`) are
+rejected; Docker's own CLI takes the last two, `dev` does not.
 
 A container keeps the options it was created with. `dev up` records the non-env
 runArgs options in the container's `dev.run-args-options` label, and when it
@@ -377,7 +383,7 @@ asks for any option, until it is rebuilt.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
 and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
-`--memory`, `--memory-swap`, `--privileged`, and `--init` fail before side
+`--memory`, `--memory-swap`, `--cpus`, `--privileged`, and `--init` fail before side
 effects when `--runtime apple` or `defaultRuntime: "apple"` selects Apple.
 
 ### The reporter's configuration
