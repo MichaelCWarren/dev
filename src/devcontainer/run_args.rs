@@ -15,6 +15,8 @@
 //! - `--cap-add VALUE`, `--cap-add=VALUE`
 //! - `--security-opt VALUE`, `--security-opt=VALUE`
 //! - `--userns VALUE`, `--userns=VALUE`
+//! - `--memory SIZE`, `--memory=SIZE`, `-m SIZE`
+//! - `--memory-swap SIZE`, `--memory-swap=SIZE` (`-1` means unlimited swap)
 //! - bare `--privileged` and `--init`
 //!
 //! ## Environment precedence (last value for a key wins)
@@ -59,6 +61,8 @@ pub struct ResolvedRunArgs {
     pub privileged: bool,
     pub init: bool,
     pub userns_mode: Option<String>,
+    pub memory: Option<i64>,
+    pub memory_swap: Option<i64>,
 }
 
 /// Validate and translate the supported `runArgs` subset into the existing
@@ -117,6 +121,18 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
         } else if arg == "--userns" {
             let value = next_value(args, &mut i, arg, "--userns")?;
             resolved.userns_mode = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--memory=") {
+            let value = non_empty_inline_value(arg, value, "--memory")?;
+            resolved.memory = Some(parse_memory_size("--memory", value)?);
+        } else if arg == "--memory" || arg == "-m" {
+            let value = next_value(args, &mut i, arg, "--memory")?;
+            resolved.memory = Some(parse_memory_size(arg, &value)?);
+        } else if let Some(value) = arg.strip_prefix("--memory-swap=") {
+            let value = non_empty_inline_value(arg, value, "--memory-swap")?;
+            resolved.memory_swap = Some(parse_memory_swap("--memory-swap", value)?);
+        } else if arg == "--memory-swap" {
+            let value = next_swap_value(args, &mut i, arg)?;
+            resolved.memory_swap = Some(parse_memory_swap(arg, &value)?);
         } else if arg == "--privileged" {
             resolved.privileged = true;
         } else if arg.starts_with("--privileged=") {
@@ -163,6 +179,61 @@ fn next_value(
         )));
     }
     Ok(value.clone())
+}
+
+/// `-1` starts with a dash, so `next_value` would read it as a missing value.
+fn next_swap_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
+    if args.get(*i + 1).map(String::as_str) == Some(UNLIMITED_SWAP) {
+        *i += 1;
+        return Ok(UNLIMITED_SWAP.to_string());
+    }
+    next_value(args, i, flag, "--memory-swap")
+}
+
+const UNLIMITED_SWAP: &str = "-1";
+
+fn parse_memory_swap(flag: &str, value: &str) -> Result<i64, DevError> {
+    if value == UNLIMITED_SWAP {
+        return Ok(-1);
+    }
+    parse_memory_size(flag, value)
+}
+
+fn parse_memory_size(flag: &str, value: &str) -> Result<i64, DevError> {
+    ram_in_bytes(value).ok_or_else(|| {
+        DevError::InvalidConfig(format!(
+            "`runArgs` flag `{flag}` has an invalid size `{value}`; expected a number with an optional unit b, k, m or g (for example `16g` or `512m`)"
+        ))
+    })
+}
+
+/// Docker's go-units `RAMInBytes` for the b/k/m/g units: binary multiples,
+/// case-insensitive, an optional trailing `b`, and a fractional part that is
+/// truncated after scaling.
+fn ram_in_bytes(value: &str) -> Option<i64> {
+    let lower = value.to_ascii_lowercase();
+    let number_end = lower
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(lower.len());
+    let (number, unit) = lower.split_at(number_end);
+    let multiplier: f64 = match unit {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1024.0,
+        "m" | "mb" => 1024.0 * 1024.0,
+        "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let well_formed = match number.split_once('.') {
+        Some((whole, fraction)) => {
+            !whole.is_empty() && !fraction.is_empty() && !fraction.contains('.')
+        }
+        None => !number.is_empty(),
+    };
+    if !well_formed {
+        return None;
+    }
+    let bytes = number.parse::<f64>().ok()? * multiplier;
+    (bytes < i64::MAX as f64).then_some(bytes as i64)
 }
 
 fn non_empty_inline_value<'a>(
@@ -351,7 +422,8 @@ fn unsupported_flag_error(flag: &str) -> DevError {
     DevError::InvalidConfig(format!(
         "unsupported `runArgs` flag `{name}`: `dev` translates only the documented \
          `runArgs` subset into the container create request: `--env-file`, `--env`, `-e`, \
-         `--cap-add`, `--security-opt`, `--userns`, `--privileged`, and `--init`. \
+         `--cap-add`, `--security-opt`, `--userns`, `--memory`, `-m`, `--memory-swap`, \
+         `--privileged`, and `--init`. \
          Other Docker/Podman CLI flags have no direct daemon-API equivalent here; use the \
          equivalent first-class devcontainer property where Dev implements one (for example \
          `forwardPorts`, `mounts`, or `containerEnv`). See the README `runArgs` support matrix."
@@ -582,6 +654,105 @@ mod tests {
         assert_eq!(resolved.userns_mode.as_deref(), Some("keep-id"));
     }
 
+    fn resolve_all(args: &[&str]) -> Result<ResolvedRunArgs, DevError> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        super::resolve_run_args(&args, &PathBuf::from("/ws"))
+    }
+
+    const GIB: i64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn memory_flags_accept_every_spelling() {
+        for args in [
+            &["--memory", "16g"][..],
+            &["--memory=16g"][..],
+            &["-m", "16g"][..],
+        ] {
+            let resolved = resolve_all(args).unwrap();
+            assert_eq!(resolved.memory, Some(16 * GIB), "{args:?}");
+        }
+        for args in [&["--memory-swap", "32g"][..], &["--memory-swap=32g"][..]] {
+            let resolved = resolve_all(args).unwrap();
+            assert_eq!(resolved.memory_swap, Some(32 * GIB), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_memory_flags_last_value_wins() {
+        let resolved = resolve_all(&[
+            "--memory",
+            "8g",
+            "-m",
+            "12g",
+            "--memory=16g",
+            "--memory-swap",
+            "20g",
+            "--memory-swap=24g",
+        ])
+        .unwrap();
+        assert_eq!(resolved.memory, Some(16 * GIB));
+        assert_eq!(resolved.memory_swap, Some(24 * GIB));
+    }
+
+    #[test]
+    fn memory_sizes_parse_like_docker_ram_in_bytes() {
+        for (size, bytes) in [
+            ("0", 0),
+            ("100", 100),
+            ("100b", 100),
+            ("100B", 100),
+            ("1k", 1024),
+            ("1kb", 1024),
+            ("512m", 512 * 1024 * 1024),
+            ("512MB", 512 * 1024 * 1024),
+            ("16g", 16 * GIB),
+            ("16gb", 16 * GIB),
+            ("16G", 16 * GIB),
+            ("1.5g", 3 * GIB / 2),
+            ("1.5", 1),
+        ] {
+            assert_eq!(ram_in_bytes(size), Some(bytes), "{size}");
+        }
+    }
+
+    #[test]
+    fn unlimited_swap_is_accepted_only_for_memory_swap() {
+        assert_eq!(
+            resolve_all(&["--memory-swap", "-1"]).unwrap().memory_swap,
+            Some(-1)
+        );
+        assert_eq!(
+            resolve_all(&["--memory-swap=-1"]).unwrap().memory_swap,
+            Some(-1)
+        );
+
+        let err = resolve_all(&["--memory=-1"]).unwrap_err();
+        assert!(format!("{err}").contains("invalid size `-1`"), "{err}");
+        let err = resolve_all(&["--memory", "-1"]).unwrap_err();
+        assert!(format!("{err}").contains("missing its value"), "{err}");
+    }
+
+    #[test]
+    fn invalid_memory_size_is_rejected_naming_flag_and_value() {
+        for (args, flag, value) in [
+            (&["--memory", "lots"][..], "--memory", "lots"),
+            (&["-m", "16x"][..], "-m", "16x"),
+            (&["--memory=16t"][..], "--memory", "16t"),
+            (&["--memory=g"][..], "--memory", "g"),
+            (&["--memory=1.g"][..], "--memory", "1.g"),
+            (&["--memory=1.2.3g"][..], "--memory", "1.2.3g"),
+            (&["--memory=16 g"][..], "--memory", "16 g"),
+            (&["--memory-swap=-2"][..], "--memory-swap", "-2"),
+            (&["--memory-swap", "1gbb"][..], "--memory-swap", "1gbb"),
+        ] {
+            let err = resolve_all(args).unwrap_err();
+            assert!(matches!(err, DevError::InvalidConfig(_)), "{args:?}: {err}");
+            let msg = format!("{err}");
+            assert!(msg.contains(&format!("`{flag}`")), "{args:?}: {msg}");
+            assert!(msg.contains(&format!("`{value}`")), "{args:?}: {msg}");
+        }
+    }
+
     #[test]
     fn value_taking_flags_reject_another_flag_as_their_missing_value() {
         let ws = PathBuf::from("/ws");
@@ -592,6 +763,9 @@ mod tests {
             ("--cap-add", "--init"),
             ("--security-opt", "--init"),
             ("--userns", "--init"),
+            ("--memory", "--init"),
+            ("-m", "--init"),
+            ("--memory-swap", "--init"),
         ] {
             let err =
                 super::resolve_run_args(&[flag.to_string(), next.to_string()], &ws).unwrap_err();

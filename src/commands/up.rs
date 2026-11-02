@@ -856,6 +856,8 @@ pub(crate) async fn run_with_runtime_with_providers(
         cap_add: caps.cap_add,
         security_opt: caps.security_opt,
         userns_mode: resolved_run_args.userns_mode.clone(),
+        memory: resolved_run_args.memory,
+        memory_swap: resolved_run_args.memory_swap,
         extra_hosts: host_access.host_gateway_entry().into_iter().collect(),
     };
 
@@ -1743,6 +1745,12 @@ fn reject_run_args_unsupported_by_runtime(
     }
     if resolved.userns_mode.is_some() {
         unsupported.push("--userns");
+    }
+    if resolved.memory.is_some() {
+        unsupported.push("--memory");
+    }
+    if resolved.memory_swap.is_some() {
+        unsupported.push("--memory-swap");
     }
     if resolved.privileged {
         unsupported.push("--privileged");
@@ -6938,6 +6946,48 @@ mod tests {
             !rt.create_was_attempted(),
             "container creation must not run"
         );
+    }
+
+    #[tokio::test]
+    async fn up_memory_runargs_reach_container_config() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--memory=16g","--memory-swap","-1"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("memory runArgs should create successfully");
+
+        let created = rt.created_config();
+        assert_eq!(created.memory, Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(created.memory_swap, Some(-1));
+    }
+
+    #[tokio::test]
+    async fn apple_runtime_rejects_memory_runargs() {
+        for (run_arg, flag) in [
+            ("\"--memory=16g\"", "--memory"),
+            ("\"--memory-swap=16g\"", "--memory-swap"),
+        ] {
+            let workspace = TempDir::new().unwrap();
+            write_project_config(
+                &workspace,
+                &format!(r#"{{"image":"ubuntu:24.04","runArgs":[{run_arg}]}}"#),
+            );
+            let rt = UpFakeRuntime::ok().named_runtime("apple");
+            let err = run_up_with_fake(&rt, &workspace)
+                .await
+                .expect_err("Apple must reject memory runArgs");
+            let msg = format!("{err}");
+            assert!(msg.contains("Apple"), "{msg}");
+            assert!(msg.contains(&format!("flag(s) {flag} are")), "{msg}");
+            assert!(
+                !rt.create_was_attempted(),
+                "container creation must not run"
+            );
+        }
     }
 
     #[tokio::test]

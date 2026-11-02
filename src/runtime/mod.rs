@@ -150,6 +150,10 @@ pub struct ContainerConfig {
     pub security_opt: Vec<String>,
     /// User namespace mode (--userns).
     pub userns_mode: Option<String>,
+    /// Memory limit in bytes (--memory).
+    pub memory: Option<i64>,
+    /// Memory plus swap limit in bytes, -1 for unlimited (--memory-swap).
+    pub memory_swap: Option<i64>,
     /// Extra `/etc/hosts` entries in Docker's `host:ip` form.
     pub extra_hosts: Vec<String>,
 }
@@ -189,6 +193,8 @@ impl std::fmt::Debug for ContainerConfig {
             .field("cap_add", &self.cap_add)
             .field("security_opt", &self.security_opt)
             .field("userns_mode", &self.userns_mode)
+            .field("memory", &self.memory)
+            .field("memory_swap", &self.memory_swap)
             .field("extra_hosts", &self.extra_hosts)
             .finish()
     }
@@ -1827,6 +1833,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            memory: None,
+            memory_swap: None,
             extra_hosts: vec![],
         }
     }

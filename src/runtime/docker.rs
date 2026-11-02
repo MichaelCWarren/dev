@@ -761,6 +761,8 @@ impl BollardRuntime {
                 Some(config.security_opt.clone())
             },
             userns_mode: config.userns_mode.clone(),
+            memory: config.memory,
+            memory_swap: config.memory_swap,
             extra_hosts: if config.extra_hosts.is_empty() {
                 None
             } else {
@@ -1710,6 +1712,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            memory: None,
+            memory_swap: None,
             extra_hosts: vec![],
         }
     }
@@ -1870,6 +1874,24 @@ mod tests {
         assert_eq!(host.privileged, Some(true));
         assert_eq!(host.init, Some(true));
         assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
+    }
+
+    #[test]
+    fn create_body_carries_memory_limits_only_when_set() {
+        let unset = BollardRuntime::to_create_body(&container_config(None))
+            .host_config
+            .expect("host config should be set");
+        assert_eq!(unset.memory, None);
+        assert_eq!(unset.memory_swap, None);
+
+        let mut cfg = container_config(None);
+        cfg.memory = Some(16 * 1024 * 1024 * 1024);
+        cfg.memory_swap = Some(-1);
+        let host = BollardRuntime::to_create_body(&cfg)
+            .host_config
+            .expect("host config should be set");
+        assert_eq!(host.memory, Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(host.memory_swap, Some(-1));
     }
 
     /// A `Vec` field is `None` when empty, never `Some(vec![])` — Docker

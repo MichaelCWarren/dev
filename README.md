@@ -347,6 +347,8 @@ previously every `runArg` was parsed and then dropped.)
 | `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
 | `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
 | `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
+| `--memory` | `--memory SIZE`, `--memory=SIZE`, `-m SIZE` | HostConfig `Memory` in bytes; last value wins |
+| `--memory-swap` | `--memory-swap SIZE`, `--memory-swap=SIZE` | HostConfig `MemorySwap` in bytes, `-1` for unlimited; last value wins |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
 | `--init` | `--init` only | HostConfig `Init=true` |
 
@@ -355,12 +357,16 @@ preserved; repeated duplicate capabilities/security options are sent once in
 stable order after feature-contributed values. Boolean assignments such as
 `--init=true` and `--privileged=false` are rejected; use the bare flag. For
 value-taking two-token forms, the next token must be a non-empty value, not
-another flag.
+another flag. The one exception is `--memory-swap -1`.
+
+Sizes follow Docker's parser: a number with an optional unit `b`, `k`, `m`, or
+`g`, in binary multiples, case-insensitive, with an optional trailing `b`
+(`16g`, `16GB`, `512m`, `1.5g`). An invalid size fails before side effects.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
 and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
-`--privileged`, and `--init` fail before side effects when `--runtime apple` or
-`defaultRuntime: "apple"` selects Apple.
+`--memory`, `--memory-swap`, `--privileged`, and `--init` fail before side
+effects when `--runtime apple` or `defaultRuntime: "apple"` selects Apple.
 
 ### The reporter's configuration
 

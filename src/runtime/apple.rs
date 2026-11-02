@@ -3549,6 +3549,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            memory: None,
+            memory_swap: None,
             extra_hosts: vec![],
         }
     }
@@ -3674,6 +3676,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            memory: None,
+            memory_swap: None,
             extra_hosts: vec![],
         };
 
@@ -3922,6 +3926,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            memory: None,
+            memory_swap: None,
             extra_hosts: vec![],
         };
 
