@@ -29,8 +29,10 @@
   `--memory-swap`, `--privileged`, `--init`; sizes in `run_args/memory.rs`, a go-units
   port plus the daemon's create checks) and applied in `src/commands/up.rs` before container
   creation. Every other flag is rejected before side effects. Docker/Podman use the shared
-  bollard create body; Apple accepts only the env subset, enforced through
-  `ResolvedRunArgs::runtime_option_flags`, so a new field must be sorted there. Compose
+  bollard create body. `ResolvedRunArgs::runtime_options` is the one list of non-env options:
+  Apple rejects whatever it returns, and create stores it in the `dev.run-args-options` label
+  that reuse compares (never the daemon's inspect values, which it rewrites). A new field must
+  be sorted in there. Compose
   rejects project-declared `runArgs` but ignores inherited lower-layer `runArgs`.
   `extra_args` on `ContainerConfig` is now always empty (kept for struct compatibility).
 - Feature contributions (mounts, entrypoints, capabilities, hooks) round-trip through the

@@ -368,9 +368,12 @@ would refuse at create: `--memory` under 6m, `--memory-swap` without
 `--memory`, and `--memory-swap` below `--memory` (it is memory plus swap). Both
 checks fail before side effects.
 
-A container keeps the limits it was created with. When `dev up` reuses one whose
-`--memory` or `--memory-swap` differs from the config, it warns and says to run
-`dev up --rebuild`.
+A container keeps the options it was created with. `dev up` records the non-env
+runArgs options in the container's `dev.run-args-options` label, and when it
+reuses a container whose label differs from the config, it warns and says to run
+`dev up --rebuild`. Env values stay out of the label because they can be
+secrets. A container created before the label existed warns once the config
+asks for any option, until it is rebuilt.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
 and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,

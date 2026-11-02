@@ -35,6 +35,7 @@ fn invalid_size(flag: &str, value: &str) -> DevError {
 /// here fails `dev up` before the image build instead of after it. Zero is
 /// what the daemon reads as no limit, so it passes.
 pub(super) fn validate_limits(memory: Option<i64>, swap: Option<i64>) -> Result<(), DevError> {
+    let explicit_zero_memory = memory == Some(0);
     let memory = memory.unwrap_or(0);
     let swap = swap.unwrap_or(0);
     if memory != 0 && memory < MIN_MEMORY {
@@ -44,9 +45,14 @@ pub(super) fn validate_limits(memory: Option<i64>, swap: Option<i64>) -> Result<
         )));
     }
     if swap > 0 && memory == 0 {
-        return Err(DevError::InvalidConfig(
-            "`runArgs` sets `--memory-swap` without `--memory`; Docker and Podman refuse a swap limit unless a memory limit is set too".to_string(),
-        ));
+        let memory_state = if explicit_zero_memory {
+            "with `--memory` 0, which means no memory limit"
+        } else {
+            "without `--memory`"
+        };
+        return Err(DevError::InvalidConfig(format!(
+            "`runArgs` sets `--memory-swap` {memory_state}; Docker and Podman refuse a swap limit unless a memory limit is set too"
+        )));
     }
     if swap > 0 && swap < memory {
         return Err(DevError::InvalidConfig(format!(
@@ -58,19 +64,18 @@ pub(super) fn validate_limits(memory: Option<i64>, swap: Option<i64>) -> Result<
     Ok(())
 }
 
-/// A byte count in the largest binary unit that divides it, for messages.
+/// A byte count in Docker's own size syntax, in the largest binary unit that
+/// divides it, so it reads well in messages and parses back to the same value.
 pub fn format_size(bytes: i64) -> String {
-    match bytes {
-        UNLIMITED_SWAP => return "unlimited".to_string(),
-        0 => return "no limit".to_string(),
-        _ => {}
+    if bytes <= 0 {
+        return bytes.to_string();
     }
     for (unit, scale) in [("g", GIB), ("m", MIB), ("k", KIB)] {
         if bytes % scale == 0 {
             return format!("{}{unit}", bytes / scale);
         }
     }
-    format!("{bytes} bytes")
+    format!("{bytes}b")
 }
 
 /// A port of go-units `RAMInBytes` (`parseSize` with binary units), which is
@@ -169,7 +174,7 @@ mod tests {
         let err = validate_limits(Some(512), None).unwrap_err();
         let msg = format!("{err}");
         assert!(matches!(err, DevError::InvalidConfig(_)), "{msg}");
-        assert!(msg.contains("512 bytes") && msg.contains("512m"), "{msg}");
+        assert!(msg.contains("is 512b") && msg.contains("`512m`"), "{msg}");
 
         validate_limits(Some(MIN_MEMORY), None).unwrap();
         validate_limits(Some(0), None).unwrap();
@@ -179,6 +184,8 @@ mod tests {
     fn a_swap_limit_needs_a_memory_limit_unless_it_is_unlimited() {
         let err = validate_limits(None, Some(8 * GIB)).unwrap_err();
         assert!(format!("{err}").contains("without `--memory`"), "{err}");
+        let err = validate_limits(Some(0), Some(8 * GIB)).unwrap_err();
+        assert!(format!("{err}").contains("with `--memory` 0"), "{err}");
 
         validate_limits(None, Some(UNLIMITED_SWAP)).unwrap();
         validate_limits(None, Some(0)).unwrap();
@@ -199,8 +206,15 @@ mod tests {
         assert_eq!(format_size(16 * GIB), "16g");
         assert_eq!(format_size(1536 * MIB), "1536m");
         assert_eq!(format_size(3 * KIB), "3k");
-        assert_eq!(format_size(512), "512 bytes");
-        assert_eq!(format_size(0), "no limit");
-        assert_eq!(format_size(-1), "unlimited");
+        assert_eq!(format_size(512), "512b");
+        assert_eq!(format_size(0), "0");
+        assert_eq!(format_size(-1), "-1");
+    }
+
+    #[test]
+    fn formatted_sizes_parse_back_to_the_same_bytes() {
+        for bytes in [1, 512, KIB, 3 * KIB, 1536 * MIB, 16 * GIB, 5 * GIB + 1] {
+            assert_eq!(ram_in_bytes(&format_size(bytes)), Some(bytes), "{bytes}");
+        }
     }
 }

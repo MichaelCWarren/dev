@@ -68,11 +68,18 @@ pub struct ResolvedRunArgs {
     pub memory_swap: Option<i64>,
 }
 
+/// Container label holding [`ResolvedRunArgs::runtime_options`] as the
+/// container was created with them, so `dev up` can tell when a reused
+/// container no longer matches the config.
+pub const RUN_ARGS_OPTIONS_LABEL: &str = "dev.run-args-options";
+
 impl ResolvedRunArgs {
-    /// The non-env flags that are set, for runtimes that support only the env
-    /// subset. Destructured without `..` so a new field cannot compile until
-    /// it is sorted into env or runtime option here.
-    pub fn runtime_option_flags(&self) -> Vec<&'static str> {
+    /// Every non-env option as a `--flag=value` (or bare `--flag`) argument,
+    /// with list values sorted and deduplicated so order does not count as a
+    /// change. Env is left out: its values can be secrets, and a label is
+    /// readable by anyone who can inspect the container. Destructured without
+    /// `..` so a new field cannot compile until it is sorted in here.
+    pub fn runtime_options(&self) -> Vec<String> {
         let Self {
             env: _,
             cap_add,
@@ -83,19 +90,36 @@ impl ResolvedRunArgs {
             memory,
             memory_swap,
         } = self;
-        [
-            (!cap_add.is_empty(), "--cap-add"),
-            (!security_opt.is_empty(), "--security-opt"),
-            (userns_mode.is_some(), "--userns"),
-            (memory.is_some(), "--memory"),
-            (memory_swap.is_some(), "--memory-swap"),
-            (*privileged, "--privileged"),
-            (*init, "--init"),
-        ]
-        .into_iter()
-        .filter_map(|(set, flag)| set.then_some(flag))
-        .collect()
+        let mut options = Vec::new();
+        options.extend(sorted_unique(cap_add).map(|v| format!("--cap-add={v}")));
+        options.extend(sorted_unique(security_opt).map(|v| format!("--security-opt={v}")));
+        options.extend(userns_mode.iter().map(|v| format!("--userns={v}")));
+        options.extend(memory.map(|v| format!("--memory={}", format_size(v))));
+        options.extend(memory_swap.map(|v| format!("--memory-swap={}", format_size(v))));
+        options.extend(privileged.then(|| "--privileged".to_string()));
+        options.extend(init.then(|| "--init".to_string()));
+        options
     }
+
+    /// The names of the set non-env flags, for runtimes that support only the
+    /// env subset.
+    pub fn runtime_option_flags(&self) -> Vec<String> {
+        let mut flags: Vec<String> = Vec::new();
+        for option in self.runtime_options() {
+            let flag = option.split_once('=').map_or(option.as_str(), |(f, _)| f);
+            if !flags.iter().any(|seen| seen == flag) {
+                flags.push(flag.to_string());
+            }
+        }
+        flags
+    }
+}
+
+fn sorted_unique(values: &[String]) -> impl Iterator<Item = &String> {
+    let mut sorted: Vec<&String> = values.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    sorted.into_iter()
 }
 
 /// Env entries split by source, because Docker applies every env file before
@@ -140,12 +164,12 @@ fn apply_env_flag(
         let path = non_empty_inline_value(arg, path, "--env-file")?;
         read_env_file_into(&mut env.files, &resolve_env_file_path(path, workspace))?;
     } else if arg == "--env-file" {
-        let path = next_value(args, i, arg, "--env-file")?;
+        let path = next_value(args, i, arg)?;
         read_env_file_into(&mut env.files, &resolve_env_file_path(&path, workspace))?;
     } else if let Some(rest) = arg.strip_prefix("--env=") {
         push_env_flag_token(&mut env.flags, rest)?;
     } else if arg == "--env" || arg == "-e" {
-        let token = next_value(args, i, arg, arg)?;
+        let token = next_value(args, i, arg)?;
         push_env_flag_token(&mut env.flags, &token)?;
     } else if arg.starts_with("-env") {
         return Err(unsupported_flag_error(arg));
@@ -171,17 +195,17 @@ fn apply_runtime_option(
         let value = non_empty_inline_value(arg, value, "--cap-add")?;
         resolved.cap_add.push(value.to_string());
     } else if arg == "--cap-add" {
-        resolved.cap_add.push(next_value(args, i, arg, arg)?);
+        resolved.cap_add.push(next_value(args, i, arg)?);
     } else if let Some(value) = arg.strip_prefix("--security-opt=") {
         let value = non_empty_inline_value(arg, value, "--security-opt")?;
         resolved.security_opt.push(value.to_string());
     } else if arg == "--security-opt" {
-        resolved.security_opt.push(next_value(args, i, arg, arg)?);
+        resolved.security_opt.push(next_value(args, i, arg)?);
     } else if let Some(value) = arg.strip_prefix("--userns=") {
         let value = non_empty_inline_value(arg, value, "--userns")?;
         resolved.userns_mode = Some(value.to_string());
     } else if arg == "--userns" {
-        resolved.userns_mode = Some(next_value(args, i, arg, arg)?);
+        resolved.userns_mode = Some(next_value(args, i, arg)?);
     } else if arg == "--privileged" {
         resolved.privileged = true;
     } else if arg.starts_with("--privileged=") {
@@ -241,31 +265,26 @@ fn next_size_value(args: &[String], i: &mut usize, flag: &str) -> Result<String,
         *i += 1;
         return Ok(args[*i].clone());
     }
-    next_value(args, i, flag, flag)
+    next_value(args, i, flag)
 }
 
 /// Fetch the value token that follows a two-token flag, advancing the index so
 /// the loop's trailing `i += 1` lands on the next flag.
-fn next_value(
-    args: &[String],
-    i: &mut usize,
-    flag: &str,
-    flag_name: &str,
-) -> Result<String, DevError> {
+fn next_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
     *i += 1;
     let Some(value) = args.get(*i) else {
         return Err(DevError::InvalidConfig(format!(
-            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a value as the next argument"
+            "`runArgs` flag `{flag}` is missing its value; it expects a value as the next argument"
         )));
     };
     if value.is_empty() {
         return Err(DevError::InvalidConfig(format!(
-            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a non-empty value"
+            "`runArgs` flag `{flag}` is missing its value; it expects a non-empty value"
         )));
     }
     if value.starts_with('-') {
         return Err(DevError::InvalidConfig(format!(
-            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a value as the next argument, but the next token `{value}` is another flag"
+            "`runArgs` flag `{flag}` is missing its value; it expects a value as the next argument, but the next token `{value}` is another flag"
         )));
     }
     Ok(value.clone())
@@ -787,6 +806,40 @@ mod tests {
     fn attached_short_memory_flag_without_a_value_is_missing_its_value() {
         let err = resolve_all(&["-m="]).unwrap_err();
         assert!(format!("{err}").contains("missing its value"), "{err}");
+    }
+
+    #[test]
+    fn runtime_options_are_canonical_and_leave_env_out() {
+        let resolved = resolve_all(&[
+            "--env=TOKEN=secret",
+            "--cap-add=SYS_PTRACE",
+            "--memory",
+            "16384m",
+            "--cap-add=NET_ADMIN",
+            "--cap-add=SYS_PTRACE",
+            "--memory-swap=-1",
+            "--init",
+        ])
+        .unwrap();
+        assert_eq!(
+            resolved.runtime_options(),
+            vec![
+                "--cap-add=NET_ADMIN",
+                "--cap-add=SYS_PTRACE",
+                "--memory=16g",
+                "--memory-swap=-1",
+                "--init",
+            ]
+        );
+        let reordered = resolve_all(&[
+            "--init",
+            "--memory-swap=-1",
+            "--cap-add=NET_ADMIN",
+            "--memory=16g",
+            "--cap-add=SYS_PTRACE",
+        ])
+        .unwrap();
+        assert_eq!(reordered.runtime_options(), resolved.runtime_options());
     }
 
     #[test]
