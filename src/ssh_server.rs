@@ -30,10 +30,7 @@
 //!   StrictHostKeyChecking yes
 //! ```
 //!
-//! - `hinted/<hash>`: the one-time T3 hint marker.
-//!
-//! `remove_alias_in` keeps `workspace.json` and the marker, so the alias name
-//! stays stable and the hint is never shown twice.
+//! `remove_alias_in` keeps `workspace.json`, so the alias name stays stable.
 
 mod alias;
 mod keys;
@@ -131,22 +128,7 @@ fn write_alias_file(
         .context("writing the alias file")
 }
 
-/// The hint is shown once per workspace, ever: the marker outlives a remove.
-fn take_hint(dev_home: &DevHome, hash: &str, alias: &str) -> anyhow::Result<Option<String>> {
-    let marker = dev_home.ssh_hint_marker(hash);
-    if marker.exists() {
-        return Ok(None);
-    }
-    if let Some(dir) = marker.parent() {
-        keys::ensure_private_dir(dir)?;
-    }
-    write_private_file(&marker, b"").context("writing the hint marker")?;
-    Ok(Some(format!(
-        "T3 Code: add \"{alias}\" under Settings \u{2192} Environments \u{2192} SSH (once per project)"
-    )))
-}
-
-/// Writes everything the alias needs and hands back the one-time hint.
+/// Writes everything the alias needs.
 /// `workspace` must already be canonical: it is recorded as given.
 pub(crate) fn register_alias_in(
     dev_home: &DevHome,
@@ -154,7 +136,7 @@ pub(crate) fn register_alias_in(
     user: &str,
     runtime: &str,
     dev_exe: &Path,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<()> {
     alias::validate_user(user)?;
     let hash = workspace_hash(workspace);
     let record = WorkspaceRecord {
@@ -166,8 +148,7 @@ pub(crate) fn register_alias_in(
     keys::ensure_keys_in(dev_home, &hash)?;
     write_workspace_record(dev_home, &hash, &record)?;
     keys::pin_host_key_in(dev_home, &hash, &record.alias)?;
-    write_alias_file(dev_home, &hash, &record, dev_exe)?;
-    take_hint(dev_home, &hash, &record.alias)
+    write_alias_file(dev_home, &hash, &record, dev_exe)
 }
 
 /// Removes whatever alias the workspace has, warning rather than failing the
@@ -292,8 +273,7 @@ mod tests {
         (dirs, paths)
     }
 
-    /// Registers and hands back the hint.
-    fn register(home: &DevHome, workspace: &Path) -> Option<String> {
+    fn register(home: &DevHome, workspace: &Path) {
         register_alias_in(
             home,
             workspace,
@@ -398,7 +378,6 @@ mod tests {
         assert!(!known.lines().any(|l| l.starts_with(&format!("{a} "))));
         assert!(known.lines().any(|l| l.starts_with(&format!("{b} "))));
         assert!(home.ssh_workspace_record(&hash).exists());
-        assert!(home.ssh_hint_marker(&hash).exists());
         remove_alias_in(&home, &hash).expect("a second remove is fine");
     }
 
@@ -442,24 +421,6 @@ mod tests {
         register(&home, &ws[0]);
         remove_alias_or_warn(&home, &ws[0]);
         assert!(!home.ssh_alias_file(&workspace_hash(&ws[0])).exists());
-    }
-
-    #[test]
-    fn hint_is_returned_once_and_survives_remove() {
-        let home_dir = tempfile::tempdir().unwrap();
-        let home = DevHome::at(home_dir.path());
-        let (_keep, ws) = same_named_workspaces("proj", 1);
-
-        let first = register(&home, &ws[0]);
-        assert_eq!(
-            first.as_deref(),
-            Some(
-                "T3 Code: add \"dev-proj\" under Settings \u{2192} Environments \u{2192} SSH (once per project)"
-            )
-        );
-        assert!(register(&home, &ws[0]).is_none());
-        remove_alias_in(&home, &workspace_hash(&ws[0])).unwrap();
-        assert!(register(&home, &ws[0]).is_none());
     }
 
     #[test]

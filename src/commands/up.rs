@@ -150,10 +150,8 @@ async fn register_ssh_alias(
         SshAliasPlan::Register => {
             let registered =
                 write_ssh_alias(dev_home, workspace, runtime, container_id, user).await;
-            match registered {
-                Ok(Some(hint)) => println!("{hint}"),
-                Ok(None) => {}
-                Err(e) => eprintln!("Warning: ssh alias setup failed: {e}"),
+            if let Err(e) = registered {
+                eprintln!("Warning: ssh alias setup failed: {e}");
             }
         }
     }
@@ -165,7 +163,7 @@ async fn write_ssh_alias(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
     user: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<()> {
     let login = ssh_login_name(runtime, container_id, user.unwrap_or("root")).await?;
     let exe = std::env::current_exe()?;
     crate::ssh_server::register_alias_in(dev_home, workspace, &login, runtime.runtime_name(), &exe)

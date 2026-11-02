@@ -47,8 +47,8 @@
 - `sshServer` (`src/ssh_server.rs`, `src/ssh_server/`) is a `MAP_FIELDS` key the base layer may
   enable, so do not copy `reject_base_relay_key`. `dev up` writes `~/.dev/ssh/config.d/<hash>`
   (`ProxyCommand ... ssh-proxy --workspace-hash`); `workspace.json` survives `down --remove` so
-  the alias name stays stable, and so does the hint marker `~/.dev/ssh/hinted/<hash>` because
-  the T3 environment survives it too.
+  the alias name stays stable, because a saved T3 environment survives it too. `dev up` prints
+  no T3 hint; that was removed on purpose.
 - sshd builds a fresh environment, so ssh-proxy carries the session env as one `SetEnv` line in
   its `/dev/shm` sshd config (`sshd_config.rs`); env on the exec never reaches the session.
   `StrictModes no` is needed because `/dev/shm` is 1777. Keep sshd's stderr out of the raw exec's

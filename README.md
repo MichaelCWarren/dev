@@ -564,7 +564,6 @@ Include ~/.dev/ssh/config.d/*
   <hash>/host_ed25519(.pub)  host key
   <hash>/workspace.json      alias, workspace and user
   known_hosts                the host key, under the alias name
-  hinted/<hash>              marks that the T3 Code hint was printed
 ```
 
 `dev` generates both keys with `ssh-keygen`. They never go into an image; they reach the container per connection through a 0700 directory in `/dev/shm`. They are not in 1Password because T3 reconnects in the background. The host key is pinned with `StrictHostKeyChecking yes`, so there is no first-use prompt and no warning after a rebuild.
@@ -573,7 +572,7 @@ A session sees the env, secrets and ssh agent a `dev exec` gets. A rotated secre
 
 ### Lifecycle
 
-The alias is `dev-<folder>`, with a hash suffix only on a collision, and it never changes once chosen. It stays while the container exists. `dev down --remove` deletes the alias file, both keys and the `known_hosts` line, but keeps `workspace.json` (so the name stays reserved for this workspace) and the hint marker. Turning `sshServer` off removes the alias at the next `dev up`.
+The alias is `dev-<folder>`, with a hash suffix only on a collision, and it never changes once chosen. It stays while the container exists. `dev down --remove` deletes the alias file, both keys and the `known_hosts` line, but keeps `workspace.json`, so the name stays reserved for this workspace. Turning `sshServer` off removes the alias at the next `dev up`.
 
 A stopped or missing container fails fast with `<alias>: container is not running (run dev up in <workspace>)`. `ssh-proxy` never starts one.
 
@@ -581,7 +580,7 @@ A stopped or missing container fails fast with `<alias>: container is not runnin
 
 ### T3 Code
 
-The first `dev up` prints `T3 Code: add "<alias>" under Settings → Environments → SSH (once per project)`. Add the alias there once per project. A stopped container shows as not connected, and T3 reconnects after `dev up`.
+Add the alias under Settings → Environments → SSH, once per project. A stopped container shows as not connected, and T3 reconnects after `dev up`.
 
 To keep T3's `~/.t3/userdata/environment-id` stable across rebuilds, mount a named volume `dev-t3-${devcontainerId}` on the container's `~/.t3`. Set it up in your base config; `dev` does not. Without it, or after deleting it, a rebuild looks like a different machine to T3 and the environment must be removed and added again.
 

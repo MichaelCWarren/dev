@@ -176,12 +176,6 @@ impl DevHome {
     pub fn ssh_alias_file(&self, workspace_hash: &str) -> PathBuf {
         self.ssh_alias_dir().join(workspace_hash)
     }
-
-    /// Marks that a workspace's T3 hint was shown,
-    /// `~/.dev/ssh/hinted/<workspace-hash>`.
-    pub fn ssh_hint_marker(&self, workspace_hash: &str) -> PathBuf {
-        self.ssh_dir().join("hinted").join(workspace_hash)
-    }
 }
 
 /// VS Code remote-containers configs directory.
