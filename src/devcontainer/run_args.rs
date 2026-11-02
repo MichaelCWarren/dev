@@ -47,6 +47,9 @@
 //! context `${localWorkspaceFolder}` substitution already resolves to.
 
 use crate::error::DevError;
+
+mod memory;
+pub use memory::format_size;
 use std::path::{Path, PathBuf};
 
 /// A parsed env entry: `(key, value)`. The returned list is already ordered by
@@ -65,93 +68,180 @@ pub struct ResolvedRunArgs {
     pub memory_swap: Option<i64>,
 }
 
+impl ResolvedRunArgs {
+    /// The non-env flags that are set, for runtimes that support only the env
+    /// subset. Destructured without `..` so a new field cannot compile until
+    /// it is sorted into env or runtime option here.
+    pub fn runtime_option_flags(&self) -> Vec<&'static str> {
+        let Self {
+            env: _,
+            cap_add,
+            security_opt,
+            privileged,
+            init,
+            userns_mode,
+            memory,
+            memory_swap,
+        } = self;
+        [
+            (!cap_add.is_empty(), "--cap-add"),
+            (!security_opt.is_empty(), "--security-opt"),
+            (userns_mode.is_some(), "--userns"),
+            (memory.is_some(), "--memory"),
+            (memory_swap.is_some(), "--memory-swap"),
+            (*privileged, "--privileged"),
+            (*init, "--init"),
+        ]
+        .into_iter()
+        .filter_map(|(set, flag)| set.then_some(flag))
+        .collect()
+    }
+}
+
+/// Env entries split by source, because Docker applies every env file before
+/// every explicit flag whatever their order on the command line.
+#[derive(Default)]
+struct EnvTiers {
+    files: Vec<EnvEntry>,
+    flags: Vec<EnvEntry>,
+}
+
 /// Validate and translate the supported `runArgs` subset into the existing
 /// container-create fields Dev already carries.
 pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRunArgs, DevError> {
-    let mut env_file_entries: Vec<EnvEntry> = Vec::new();
-    let mut env_flag_entries: Vec<EnvEntry> = Vec::new();
+    let mut env = EnvTiers::default();
     let mut resolved = ResolvedRunArgs::default();
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
-        if let Some(path) = arg.strip_prefix("--env-file=") {
-            let path = non_empty_inline_value(arg, path, "--env-file")?;
-            read_env_file_into(
-                &mut env_file_entries,
-                &resolve_env_file_path(path, workspace),
-            )?;
-        } else if arg == "--env-file" {
-            let path = next_value(args, &mut i, arg, "--env-file")?;
-            read_env_file_into(
-                &mut env_file_entries,
-                &resolve_env_file_path(&path, workspace),
-            )?;
-        } else if let Some(rest) = arg.strip_prefix("--env=") {
-            push_env_flag_token(&mut env_flag_entries, rest)?;
-        } else if arg == "--env" {
-            let token = next_value(args, &mut i, arg, "--env")?;
-            push_env_flag_token(&mut env_flag_entries, &token)?;
-        } else if arg == "-e" {
-            let token = next_value(args, &mut i, arg, "-e")?;
-            push_env_flag_token(&mut env_flag_entries, &token)?;
-        } else if arg.starts_with("-env") {
-            return Err(unsupported_flag_error(arg));
-        } else if let Some(rest) = arg.strip_prefix("-e")
-            && !rest.is_empty()
-            && !rest.starts_with('-')
-        {
-            push_env_flag_token(&mut env_flag_entries, rest)?;
-        } else if let Some(value) = arg.strip_prefix("--cap-add=") {
-            resolved
-                .cap_add
-                .push(non_empty_inline_value(arg, value, "--cap-add")?.to_string());
-        } else if arg == "--cap-add" {
-            let value = next_value(args, &mut i, arg, "--cap-add")?;
-            resolved.cap_add.push(value);
-        } else if let Some(value) = arg.strip_prefix("--security-opt=") {
-            resolved
-                .security_opt
-                .push(non_empty_inline_value(arg, value, "--security-opt")?.to_string());
-        } else if arg == "--security-opt" {
-            let value = next_value(args, &mut i, arg, "--security-opt")?;
-            resolved.security_opt.push(value);
-        } else if let Some(value) = arg.strip_prefix("--userns=") {
-            resolved.userns_mode =
-                Some(non_empty_inline_value(arg, value, "--userns")?.to_string());
-        } else if arg == "--userns" {
-            let value = next_value(args, &mut i, arg, "--userns")?;
-            resolved.userns_mode = Some(value);
-        } else if let Some(value) = arg.strip_prefix("--memory=") {
-            let value = non_empty_inline_value(arg, value, "--memory")?;
-            resolved.memory = Some(parse_memory_size("--memory", value)?);
-        } else if arg == "--memory" || arg == "-m" {
-            let value = next_value(args, &mut i, arg, "--memory")?;
-            resolved.memory = Some(parse_memory_size(arg, &value)?);
-        } else if let Some(value) = arg.strip_prefix("--memory-swap=") {
-            let value = non_empty_inline_value(arg, value, "--memory-swap")?;
-            resolved.memory_swap = Some(parse_memory_swap("--memory-swap", value)?);
-        } else if arg == "--memory-swap" {
-            let value = next_swap_value(args, &mut i, arg)?;
-            resolved.memory_swap = Some(parse_memory_swap(arg, &value)?);
-        } else if arg == "--privileged" {
-            resolved.privileged = true;
-        } else if arg.starts_with("--privileged=") {
-            return Err(boolean_assignment_error(arg, "--privileged"));
-        } else if arg == "--init" {
-            resolved.init = true;
-        } else if arg.starts_with("--init=") {
-            return Err(boolean_assignment_error(arg, "--init"));
-        } else {
-            return Err(unsupported_flag_error(arg));
+        let handled = apply_env_flag(args, &mut i, workspace, &mut env)?
+            || apply_runtime_option(args, &mut i, &mut resolved)?
+            || apply_memory_flag(args, &mut i, &mut resolved)?;
+        if !handled {
+            return Err(unsupported_flag_error(&args[i]));
         }
         i += 1;
     }
-    // Docker CLI reads every env-file first, then applies every explicit
-    // --env/-e value after, regardless of interleaving. Preserve relative
-    // order within each group.
-    resolved.env = env_file_entries;
-    resolved.env.extend(env_flag_entries);
+    memory::validate_limits(resolved.memory, resolved.memory_swap)?;
+    resolved.env = env.files;
+    resolved.env.extend(env.flags);
     Ok(resolved)
+}
+
+/// `--env-file`, `--env` and `-e` in every spelling. `Ok(false)` means the
+/// flag is not one of these.
+fn apply_env_flag(
+    args: &[String],
+    i: &mut usize,
+    workspace: &Path,
+    env: &mut EnvTiers,
+) -> Result<bool, DevError> {
+    let arg = &args[*i];
+    if let Some(path) = arg.strip_prefix("--env-file=") {
+        let path = non_empty_inline_value(arg, path, "--env-file")?;
+        read_env_file_into(&mut env.files, &resolve_env_file_path(path, workspace))?;
+    } else if arg == "--env-file" {
+        let path = next_value(args, i, arg, "--env-file")?;
+        read_env_file_into(&mut env.files, &resolve_env_file_path(&path, workspace))?;
+    } else if let Some(rest) = arg.strip_prefix("--env=") {
+        push_env_flag_token(&mut env.flags, rest)?;
+    } else if arg == "--env" || arg == "-e" {
+        let token = next_value(args, i, arg, arg)?;
+        push_env_flag_token(&mut env.flags, &token)?;
+    } else if arg.starts_with("-env") {
+        return Err(unsupported_flag_error(arg));
+    } else if let Some(rest) = arg.strip_prefix("-e")
+        && !rest.is_empty()
+        && !rest.starts_with('-')
+    {
+        push_env_flag_token(&mut env.flags, rest)?;
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `--cap-add`, `--security-opt`, `--userns`, `--privileged` and `--init`.
+fn apply_runtime_option(
+    args: &[String],
+    i: &mut usize,
+    resolved: &mut ResolvedRunArgs,
+) -> Result<bool, DevError> {
+    let arg = &args[*i];
+    if let Some(value) = arg.strip_prefix("--cap-add=") {
+        let value = non_empty_inline_value(arg, value, "--cap-add")?;
+        resolved.cap_add.push(value.to_string());
+    } else if arg == "--cap-add" {
+        resolved.cap_add.push(next_value(args, i, arg, arg)?);
+    } else if let Some(value) = arg.strip_prefix("--security-opt=") {
+        let value = non_empty_inline_value(arg, value, "--security-opt")?;
+        resolved.security_opt.push(value.to_string());
+    } else if arg == "--security-opt" {
+        resolved.security_opt.push(next_value(args, i, arg, arg)?);
+    } else if let Some(value) = arg.strip_prefix("--userns=") {
+        let value = non_empty_inline_value(arg, value, "--userns")?;
+        resolved.userns_mode = Some(value.to_string());
+    } else if arg == "--userns" {
+        resolved.userns_mode = Some(next_value(args, i, arg, arg)?);
+    } else if arg == "--privileged" {
+        resolved.privileged = true;
+    } else if arg.starts_with("--privileged=") {
+        return Err(boolean_assignment_error(arg, "--privileged"));
+    } else if arg == "--init" {
+        resolved.init = true;
+    } else if arg.starts_with("--init=") {
+        return Err(boolean_assignment_error(arg, "--init"));
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `--memory`, `-m` and `--memory-swap`. The last value of each wins.
+fn apply_memory_flag(
+    args: &[String],
+    i: &mut usize,
+    resolved: &mut ResolvedRunArgs,
+) -> Result<bool, DevError> {
+    let arg = &args[*i];
+    if let Some(value) = arg.strip_prefix("--memory=") {
+        let value = non_empty_inline_value(arg, value, "--memory")?;
+        resolved.memory = Some(memory::parse_memory("--memory", value)?);
+    } else if arg == "--memory" || arg == "-m" {
+        let value = next_size_value(args, i, arg)?;
+        resolved.memory = Some(memory::parse_memory(arg, &value)?);
+    } else if let Some(value) = attached_short_memory_value(arg) {
+        let value = non_empty_inline_value(arg, value, "-m")?;
+        resolved.memory = Some(memory::parse_memory("-m", value)?);
+    } else if let Some(value) = arg.strip_prefix("--memory-swap=") {
+        let value = non_empty_inline_value(arg, value, "--memory-swap")?;
+        resolved.memory_swap = Some(memory::parse_memory_swap("--memory-swap", value)?);
+    } else if arg == "--memory-swap" {
+        let value = next_size_value(args, i, arg)?;
+        resolved.memory_swap = Some(memory::parse_memory_swap(arg, &value)?);
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The value of pflag's attached shorthand forms, `-m16g` and `-m=16g`.
+fn attached_short_memory_value(arg: &str) -> Option<&str> {
+    let rest = arg.strip_prefix("-m")?;
+    Some(rest.strip_prefix('=').unwrap_or(rest))
+}
+
+/// Like `next_value`, but a negative number is a value, not another flag, so
+/// `--memory-swap -1` parses and `--memory -2` is reported as a bad size.
+fn next_size_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
+    let negative_number = args
+        .get(*i + 1)
+        .and_then(|token| token.strip_prefix('-'))
+        .is_some_and(|digits| digits.starts_with(|c: char| c.is_ascii_digit()));
+    if negative_number {
+        *i += 1;
+        return Ok(args[*i].clone());
+    }
+    next_value(args, i, flag, flag)
 }
 
 /// Fetch the value token that follows a two-token flag, advancing the index so
@@ -179,61 +269,6 @@ fn next_value(
         )));
     }
     Ok(value.clone())
-}
-
-/// `-1` starts with a dash, so `next_value` would read it as a missing value.
-fn next_swap_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DevError> {
-    if args.get(*i + 1).map(String::as_str) == Some(UNLIMITED_SWAP) {
-        *i += 1;
-        return Ok(UNLIMITED_SWAP.to_string());
-    }
-    next_value(args, i, flag, "--memory-swap")
-}
-
-const UNLIMITED_SWAP: &str = "-1";
-
-fn parse_memory_swap(flag: &str, value: &str) -> Result<i64, DevError> {
-    if value == UNLIMITED_SWAP {
-        return Ok(-1);
-    }
-    parse_memory_size(flag, value)
-}
-
-fn parse_memory_size(flag: &str, value: &str) -> Result<i64, DevError> {
-    ram_in_bytes(value).ok_or_else(|| {
-        DevError::InvalidConfig(format!(
-            "`runArgs` flag `{flag}` has an invalid size `{value}`; expected a number with an optional unit b, k, m or g (for example `16g` or `512m`)"
-        ))
-    })
-}
-
-/// Docker's go-units `RAMInBytes` for the b/k/m/g units: binary multiples,
-/// case-insensitive, an optional trailing `b`, and a fractional part that is
-/// truncated after scaling.
-fn ram_in_bytes(value: &str) -> Option<i64> {
-    let lower = value.to_ascii_lowercase();
-    let number_end = lower
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(lower.len());
-    let (number, unit) = lower.split_at(number_end);
-    let multiplier: f64 = match unit {
-        "" | "b" => 1.0,
-        "k" | "kb" => 1024.0,
-        "m" | "mb" => 1024.0 * 1024.0,
-        "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    let well_formed = match number.split_once('.') {
-        Some((whole, fraction)) => {
-            !whole.is_empty() && !fraction.is_empty() && !fraction.contains('.')
-        }
-        None => !number.is_empty(),
-    };
-    if !well_formed {
-        return None;
-    }
-    let bytes = number.parse::<f64>().ok()? * multiplier;
-    (bytes < i64::MAX as f64).then_some(bytes as i64)
 }
 
 fn non_empty_inline_value<'a>(
@@ -667,11 +702,16 @@ mod tests {
             &["--memory", "16g"][..],
             &["--memory=16g"][..],
             &["-m", "16g"][..],
+            &["-m16g"][..],
+            &["-m=16g"][..],
         ] {
             let resolved = resolve_all(args).unwrap();
             assert_eq!(resolved.memory, Some(16 * GIB), "{args:?}");
         }
-        for args in [&["--memory-swap", "32g"][..], &["--memory-swap=32g"][..]] {
+        for args in [
+            &["-m", "8g", "--memory-swap", "32g"][..],
+            &["-m", "8g", "--memory-swap=32g"][..],
+        ] {
             let resolved = resolve_all(args).unwrap();
             assert_eq!(resolved.memory_swap, Some(32 * GIB), "{args:?}");
         }
@@ -695,41 +735,17 @@ mod tests {
     }
 
     #[test]
-    fn memory_sizes_parse_like_docker_ram_in_bytes() {
-        for (size, bytes) in [
-            ("0", 0),
-            ("100", 100),
-            ("100b", 100),
-            ("100B", 100),
-            ("1k", 1024),
-            ("1kb", 1024),
-            ("512m", 512 * 1024 * 1024),
-            ("512MB", 512 * 1024 * 1024),
-            ("16g", 16 * GIB),
-            ("16gb", 16 * GIB),
-            ("16G", 16 * GIB),
-            ("1.5g", 3 * GIB / 2),
-            ("1.5", 1),
-        ] {
-            assert_eq!(ram_in_bytes(size), Some(bytes), "{size}");
-        }
-    }
-
-    #[test]
     fn unlimited_swap_is_accepted_only_for_memory_swap() {
-        assert_eq!(
-            resolve_all(&["--memory-swap", "-1"]).unwrap().memory_swap,
-            Some(-1)
-        );
-        assert_eq!(
-            resolve_all(&["--memory-swap=-1"]).unwrap().memory_swap,
-            Some(-1)
-        );
-
-        let err = resolve_all(&["--memory=-1"]).unwrap_err();
-        assert!(format!("{err}").contains("invalid size `-1`"), "{err}");
-        let err = resolve_all(&["--memory", "-1"]).unwrap_err();
-        assert!(format!("{err}").contains("missing its value"), "{err}");
+        for args in [&["--memory-swap", "-1"][..], &["--memory-swap=-1"][..]] {
+            assert_eq!(resolve_all(args).unwrap().memory_swap, Some(-1), "{args:?}");
+        }
+        for args in [&["--memory=-1"][..], &["--memory", "-1"][..], &["-m-1"][..]] {
+            let err = resolve_all(args).unwrap_err();
+            assert!(
+                format!("{err}").contains("invalid size `-1`"),
+                "{args:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -737,20 +753,73 @@ mod tests {
         for (args, flag, value) in [
             (&["--memory", "lots"][..], "--memory", "lots"),
             (&["-m", "16x"][..], "-m", "16x"),
-            (&["--memory=16t"][..], "--memory", "16t"),
-            (&["--memory=g"][..], "--memory", "g"),
-            (&["--memory=1.g"][..], "--memory", "1.g"),
+            (&["-m16x"][..], "-m", "16x"),
+            (&["--memory=16gi"][..], "--memory", "16gi"),
             (&["--memory=1.2.3g"][..], "--memory", "1.2.3g"),
-            (&["--memory=16 g"][..], "--memory", "16 g"),
             (&["--memory-swap=-2"][..], "--memory-swap", "-2"),
+            (&["--memory-swap", "-2"][..], "--memory-swap", "-2"),
             (&["--memory-swap", "1gbb"][..], "--memory-swap", "1gbb"),
         ] {
             let err = resolve_all(args).unwrap_err();
             assert!(matches!(err, DevError::InvalidConfig(_)), "{args:?}: {err}");
             let msg = format!("{err}");
+            assert!(msg.contains("invalid size"), "{args:?}: {msg}");
             assert!(msg.contains(&format!("`{flag}`")), "{args:?}: {msg}");
             assert!(msg.contains(&format!("`{value}`")), "{args:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn memory_limits_the_daemon_would_refuse_are_rejected_after_last_value_wins() {
+        for args in [
+            &["--memory=512"][..],
+            &["--memory-swap=8g"][..],
+            &["--memory=16g", "--memory-swap=8g"][..],
+            &["--memory=4g", "--memory-swap=8g", "--memory=16g"][..],
+        ] {
+            let err = resolve_all(args).unwrap_err();
+            assert!(matches!(err, DevError::InvalidConfig(_)), "{args:?}: {err}");
+        }
+        resolve_all(&["--memory=4g", "--memory-swap=8g"]).unwrap();
+    }
+
+    #[test]
+    fn attached_short_memory_flag_without_a_value_is_missing_its_value() {
+        let err = resolve_all(&["-m="]).unwrap_err();
+        assert!(format!("{err}").contains("missing its value"), "{err}");
+    }
+
+    #[test]
+    fn runtime_option_flags_name_every_set_non_env_field_and_never_env() {
+        let resolved = resolve_all(&[
+            "--env=A=1",
+            "--cap-add=SYS_PTRACE",
+            "--security-opt=label=disable",
+            "--userns=host",
+            "--memory=16g",
+            "--memory-swap=-1",
+            "--privileged",
+            "--init",
+        ])
+        .unwrap();
+        assert_eq!(
+            resolved.runtime_option_flags(),
+            vec![
+                "--cap-add",
+                "--security-opt",
+                "--userns",
+                "--memory",
+                "--memory-swap",
+                "--privileged",
+                "--init",
+            ]
+        );
+        assert!(
+            resolve_all(&["--env=A=1"])
+                .unwrap()
+                .runtime_option_flags()
+                .is_empty()
+        );
     }
 
     #[test]

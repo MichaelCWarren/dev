@@ -15,7 +15,7 @@ use crate::runtime::terminal_relay::{
 };
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult, ImageInfo,
-    ImageMetadata, PipedStdio, terminal_size,
+    ImageMetadata, MemoryLimits, PipedStdio, terminal_size,
 };
 
 /// Podman runtime backed by the same bollard client, connecting to the Podman socket.
@@ -417,6 +417,10 @@ impl ContainerRuntime for PodmanRuntime {
 
     fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
         self.0.container_env(id)
+    }
+
+    fn container_memory_limits(&self, id: &str) -> BoxFut<'_, MemoryLimits> {
+        self.0.container_memory_limits(id)
     }
 
     // The podman socket is not a Docker daemon, so its row is the constant

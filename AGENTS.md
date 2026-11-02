@@ -25,12 +25,14 @@
   (`merge_array_concat`) because repeated flags like `--env-file` are legitimate and
   order matters. Don't move `runArgs` back into the dedup path.
 - `runArgs` is translated in `src/devcontainer/run_args.rs` (supported create-time subset:
-  env file/env flags plus `--cap-add`, `--security-opt`, `--userns`, `--privileged`,
-  `--init`) and applied in `src/commands/up.rs` before container creation. Every other
-  flag is rejected before side effects. Docker/Podman use the shared bollard create body;
-  Apple accepts only the env subset. Compose rejects project-declared `runArgs` but ignores
-  inherited lower-layer `runArgs`. `extra_args` on `ContainerConfig` is now always empty
-  (kept for struct compatibility).
+  env file/env flags plus `--cap-add`, `--security-opt`, `--userns`, `--memory`/`-m`,
+  `--memory-swap`, `--privileged`, `--init`; sizes in `run_args/memory.rs`, a go-units
+  port plus the daemon's create checks) and applied in `src/commands/up.rs` before container
+  creation. Every other flag is rejected before side effects. Docker/Podman use the shared
+  bollard create body; Apple accepts only the env subset, enforced through
+  `ResolvedRunArgs::runtime_option_flags`, so a new field must be sorted there. Compose
+  rejects project-declared `runArgs` but ignores inherited lower-layer `runArgs`.
+  `extra_args` on `ContainerConfig` is now always empty (kept for struct compatibility).
 - Feature contributions (mounts, entrypoints, capabilities, hooks) round-trip through the
   image's `devcontainer.metadata` label: written by `build_metadata_label`, recovered on the
   cache-hit path by `features_from_metadata` (both `src/devcontainer/features.rs`). The label's

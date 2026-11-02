@@ -15,6 +15,7 @@ use crate::devcontainer::features::{
     generate_feature_dockerfile_with_opts, order_features,
 };
 use crate::devcontainer::hooklog::HookLog;
+use crate::devcontainer::run_args::format_size;
 use crate::devcontainer::secrets::discovery::secrets_file_path_in;
 use crate::devcontainer::secrets::env_name_problem;
 use crate::devcontainer::secrets::up_store::{clear_up_store, write_up_store};
@@ -524,6 +525,7 @@ pub(crate) async fn run_with_runtime_with_providers(
                     ssh_alias,
                     secrets: &secrets,
                     providers,
+                    run_args: &resolved_run_args,
                 };
                 return reuse_container(&ctx, container, &mut pill, warnings_out).await;
             }
@@ -961,6 +963,7 @@ struct ReuseContext<'a> {
     ssh_alias: SshAliasPlan,
     secrets: &'a ValidatedSecrets,
     providers: &'a ProviderRegistry,
+    run_args: &'a crate::devcontainer::run_args::ResolvedRunArgs,
 }
 
 impl ReuseContext<'_> {
@@ -1004,10 +1007,7 @@ async fn reuse_running_container(
     warnings_out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let (user, _) = settle_container(ctx, container).await?;
-    print_warnings(
-        warnings_out,
-        create_keys_warning(ctx.runtime, container, ctx.secrets).await,
-    );
+    print_warnings(warnings_out, reuse_drift_warnings(ctx, container).await);
     let up = resolve_up_secrets(ctx.secrets, ctx.providers).await?;
     let store = HeldStoreWrite::attempt_or_clear(
         &ctx.store_target(container),
@@ -1044,10 +1044,7 @@ async fn restart_stopped_container(
     let up = resolve_up_secrets(ctx.secrets, ctx.providers).await?;
     ctx.runtime.start_container(&container.id).await?;
     let (user, workspace_folder) = settle_container(ctx, container).await?;
-    print_warnings(
-        warnings_out,
-        create_keys_warning(ctx.runtime, container, ctx.secrets).await,
-    );
+    print_warnings(warnings_out, reuse_drift_warnings(ctx, container).await);
     let store = HeldStoreWrite::attempt(&ctx.store_target(container), ctx.secrets, &up).await;
     let steps = async {
         pill.phase("up: running hooks", BUILD_STYLE);
@@ -1483,6 +1480,55 @@ async fn create_keys_warning(
     })
 }
 
+/// What a reused container was created with that the config no longer asks
+/// for. Both checks are advisory, since only `--rebuild` can change either.
+async fn reuse_drift_warnings(ctx: &ReuseContext<'_>, container: &ContainerInfo) -> Vec<String> {
+    let create_keys = create_keys_warning(ctx.runtime, container, ctx.secrets).await;
+    let memory = memory_limits_warning(ctx.runtime, container, ctx.run_args).await;
+    create_keys.into_iter().chain(memory).collect()
+}
+
+/// A reused container keeps the memory limits it was created with, so an
+/// edited `--memory` or `--memory-swap` runArg does nothing until `--rebuild`.
+/// Swap is compared only when runArgs set it, because otherwise the daemon
+/// picked the value.
+async fn memory_limits_warning(
+    runtime: &dyn ContainerRuntime,
+    container: &ContainerInfo,
+    wanted: &crate::devcontainer::run_args::ResolvedRunArgs,
+) -> Option<String> {
+    let actual = match runtime.container_memory_limits(&container.id).await {
+        Ok(actual) => actual,
+        Err(DevError::Unsupported(_)) => return None,
+        Err(_) if wanted.memory.is_none() && wanted.memory_swap.is_none() => return None,
+        // Only the error's class: an inspect error can quote the container's env.
+        Err(e) => {
+            return Some(format!(
+                "Warning: could not read the memory limits of container '{}', so the check for changed `--memory`/`--memory-swap` runArgs was skipped: the runtime returned an error ({})",
+                container.name,
+                e.content_free_class()
+            ));
+        }
+    };
+    let wanted_memory = wanted.memory.unwrap_or(0);
+    let swap_changed = wanted
+        .memory_swap
+        .is_some_and(|swap| swap != actual.memory_swap);
+    (actual.memory != wanted_memory || swap_changed).then(|| {
+        let wanted_swap = wanted
+            .memory_swap
+            .map_or_else(|| "the runtime default".to_string(), format_size);
+        format!(
+            "Warning: container '{}' was created with memory {} and swap {}, but runArgs now ask for memory {} and swap {}. Run `dev up --rebuild` to recreate it with the new limits.",
+            container.name,
+            format_size(actual.memory),
+            format_size(actual.memory_swap),
+            format_size(wanted_memory),
+            wanted_swap
+        )
+    })
+}
+
 /// The keys `declaring` declares `up` that `other` does not, sorted. Compared
 /// by resolve time, so a key `other` declares `exec` still counts.
 fn up_keys_missing_from(declaring: &ValidatedSecrets, other: &ValidatedSecrets) -> Vec<String> {
@@ -1735,30 +1781,7 @@ fn reject_run_args_unsupported_by_runtime(
     if runtime_name != "apple" {
         return Ok(());
     }
-
-    let mut unsupported = Vec::new();
-    if !resolved.cap_add.is_empty() {
-        unsupported.push("--cap-add");
-    }
-    if !resolved.security_opt.is_empty() {
-        unsupported.push("--security-opt");
-    }
-    if resolved.userns_mode.is_some() {
-        unsupported.push("--userns");
-    }
-    if resolved.memory.is_some() {
-        unsupported.push("--memory");
-    }
-    if resolved.memory_swap.is_some() {
-        unsupported.push("--memory-swap");
-    }
-    if resolved.privileged {
-        unsupported.push("--privileged");
-    }
-    if resolved.init {
-        unsupported.push("--init");
-    }
-
+    let unsupported = resolved.runtime_option_flags();
     if !unsupported.is_empty() {
         anyhow::bail!(
             "`runArgs` flag(s) {} are not supported when the selected runtime is Apple Containers; Apple currently supports only the environment `runArgs` subset (`--env-file`, `--env`, and `-e`). Remove these flags or use runtime-supported devcontainer settings.",
@@ -4277,6 +4300,9 @@ mod tests {
         /// `container_env` fails the way a runtime that has the read can.
         container_env_fails: bool,
         container_env_calls: Arc<AtomicUsize>,
+        /// What `container_memory_limits` reports; `None` declines.
+        memory_limits: Option<crate::runtime::MemoryLimits>,
+        memory_limits_fail: bool,
         /// Ids passed to `stop_container` and `remove_container`, in order.
         stopped: Arc<Mutex<Vec<String>>>,
         removed: Arc<Mutex<Vec<String>>>,
@@ -4329,6 +4355,8 @@ mod tests {
                 container_env: None,
                 container_env_fails: false,
                 container_env_calls: Arc::new(AtomicUsize::new(0)),
+                memory_limits: None,
+                memory_limits_fail: false,
                 stopped: Arc::new(Mutex::new(Vec::new())),
                 removed: Arc::new(Mutex::new(Vec::new())),
                 exec_stdout: String::new(),
@@ -4427,6 +4455,19 @@ mod tests {
         /// [`ENV_READ_SENTINEL`], the way a decode error can quote the env.
         fn container_env_failing(mut self) -> Self {
             self.container_env_fails = true;
+            self
+        }
+
+        fn with_memory_limits(mut self, memory: i64, memory_swap: i64) -> Self {
+            self.memory_limits = Some(crate::runtime::MemoryLimits {
+                memory,
+                memory_swap,
+            });
+            self
+        }
+
+        fn memory_limits_failing(mut self) -> Self {
+            self.memory_limits_fail = true;
             self
         }
 
@@ -4707,6 +4748,19 @@ mod tests {
         fn remove_container(&self, id: &str) -> BoxFut<'_, ()> {
             self.removed.lock().unwrap().push(id.to_string());
             Box::pin(async { Ok(()) })
+        }
+
+        fn container_memory_limits(&self, _id: &str) -> BoxFut<'_, crate::runtime::MemoryLimits> {
+            let limits = self.memory_limits;
+            let fails = self.memory_limits_fail;
+            Box::pin(async move {
+                if fails {
+                    return Err(DevError::Runtime(format!(
+                        "inspect failed (test-injected): {ENV_READ_SENTINEL}"
+                    )));
+                }
+                limits.ok_or_else(|| DevError::Unsupported("memory limits (test-declined)".into()))
+            })
         }
 
         fn container_env(&self, _id: &str) -> BoxFut<'_, Vec<String>> {
@@ -5316,6 +5370,7 @@ mod tests {
             ssh_alias: super::SshAliasPlan::LeaveAlone,
             secrets: &secrets,
             providers: &providers,
+            run_args: &Default::default(),
         };
         super::reuse_running_container(&ctx, &container, &mut pill, &mut Vec::new())
             .await
@@ -5364,6 +5419,7 @@ mod tests {
             ssh_alias: super::SshAliasPlan::LeaveAlone,
             secrets: &secrets,
             providers: &providers,
+            run_args: &Default::default(),
         };
         super::reuse_container(&ctx, &container, &mut pill, &mut Vec::new())
             .await
@@ -6969,7 +7025,7 @@ mod tests {
     async fn apple_runtime_rejects_memory_runargs() {
         for (run_arg, flag) in [
             ("\"--memory=16g\"", "--memory"),
-            ("\"--memory-swap=16g\"", "--memory-swap"),
+            ("\"--memory-swap=-1\"", "--memory-swap"),
         ] {
             let workspace = TempDir::new().unwrap();
             write_project_config(
@@ -8190,6 +8246,135 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("dev up --rebuild"), "{warning}");
+    }
+
+    fn memory_run_args(
+        memory: Option<i64>,
+        memory_swap: Option<i64>,
+    ) -> crate::devcontainer::run_args::ResolvedRunArgs {
+        crate::devcontainer::run_args::ResolvedRunArgs {
+            memory,
+            memory_swap,
+            ..Default::default()
+        }
+    }
+
+    const GIB: i64 = 1024 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_changed_memory_limit_on_a_reused_container_says_rebuild() {
+        let rt = UpFakeRuntime::ok().with_memory_limits(8 * GIB, 16 * GIB);
+        let wanted = memory_run_args(Some(16 * GIB), None);
+        let warning = super::memory_limits_warning(&rt, &running_container(), &wanted)
+            .await
+            .expect("a warning");
+        assert!(warning.starts_with("Warning: "), "{warning}");
+        assert!(
+            warning.contains("created with memory 8g and swap 16g"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("ask for memory 16g and swap the runtime default"),
+            "{warning}"
+        );
+        assert!(warning.contains("dev up --rebuild"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn a_removed_memory_limit_or_a_changed_swap_limit_also_says_rebuild() {
+        let limited = UpFakeRuntime::ok().with_memory_limits(8 * GIB, 16 * GIB);
+        let removed = memory_run_args(None, None);
+        assert!(
+            super::memory_limits_warning(&limited, &running_container(), &removed)
+                .await
+                .is_some()
+        );
+        let swap_changed = memory_run_args(Some(8 * GIB), Some(-1));
+        assert!(
+            super::memory_limits_warning(&limited, &running_container(), &swap_changed)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_memory_warning_when_limits_match_or_swap_was_left_to_the_daemon() {
+        let rt = UpFakeRuntime::ok().with_memory_limits(8 * GIB, 16 * GIB);
+        for wanted in [
+            memory_run_args(Some(8 * GIB), None),
+            memory_run_args(Some(8 * GIB), Some(16 * GIB)),
+        ] {
+            assert_eq!(
+                super::memory_limits_warning(&rt, &running_container(), &wanted).await,
+                None,
+                "{wanted:?}"
+            );
+        }
+        let unlimited = UpFakeRuntime::ok().with_memory_limits(0, 0);
+        assert_eq!(
+            super::memory_limits_warning(
+                &unlimited,
+                &running_container(),
+                &memory_run_args(None, None)
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_memory_read_warns_only_when_limits_were_asked_for() {
+        let rt = UpFakeRuntime::ok().memory_limits_failing();
+        let wanted = memory_run_args(Some(8 * GIB), None);
+        let warning = super::memory_limits_warning(&rt, &running_container(), &wanted)
+            .await
+            .expect("a warning");
+        assert!(
+            warning.contains("could not read the memory limits"),
+            "{warning}"
+        );
+        assert!(!warning.contains(ENV_READ_SENTINEL), "{warning}");
+        assert_eq!(
+            super::memory_limits_warning(&rt, &running_container(), &memory_run_args(None, None))
+                .await,
+            None
+        );
+        let declined = UpFakeRuntime::ok();
+        assert_eq!(
+            super::memory_limits_warning(&declined, &running_container(), &wanted).await,
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_reuse_paths_check_for_changed_memory_limits() {
+        for stopped in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let config_path = write_project_config(
+                &workspace,
+                r#"{"image":"ubuntu:24.04","runArgs":["--memory=16g"]}"#,
+            );
+            let rt = UpFakeRuntime::ok().with_memory_limits(8 * GIB, 16 * GIB);
+            let rt = if stopped {
+                rt.already_stopped(workspace.path(), &config_path)
+            } else {
+                rt.already_running(workspace.path(), &config_path)
+            };
+            let home = TempDir::new().unwrap();
+            let (result, warnings) = run_up_capturing_warnings(
+                &rt,
+                &workspace,
+                &registry_with(&workspace, &all_values_fake()),
+                &DevHome::at(home.path()),
+            )
+            .await;
+            result.unwrap();
+            assert!(
+                warnings.contains("runArgs now ask for memory 16g"),
+                "stopped: {stopped}: {warnings}"
+            );
+            assert!(!rt.create_was_attempted(), "stopped: {stopped}");
+        }
     }
 
     #[tokio::test]

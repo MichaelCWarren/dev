@@ -20,7 +20,7 @@ use crate::runtime::terminal_relay::{
 };
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageInfo, ImageMetadata, PipedStdio, env_assignments,
+    ExecResult, ImageInfo, ImageMetadata, MemoryLimits, PipedStdio, env_assignments,
 };
 
 /// The raw stream half of a started exec, as bollard hands it back.
@@ -1209,6 +1209,19 @@ impl BollardRuntime {
         Ok(resp.config.and_then(|c| c.env).unwrap_or_default())
     }
 
+    async fn container_memory_limits_impl(&self, id: &str) -> Result<MemoryLimits, DevError> {
+        let host = self
+            .client
+            .inspect_container(id, None)
+            .await?
+            .host_config
+            .unwrap_or_default();
+        Ok(MemoryLimits {
+            memory: host.memory.unwrap_or(0),
+            memory_swap: host.memory_swap.unwrap_or(0),
+        })
+    }
+
     #[allow(dead_code)]
     async fn inspect_container_impl(&self, id: &str) -> Result<ContainerInfo, DevError> {
         let resp = self.client.inspect_container(id, None).await?;
@@ -1378,6 +1391,11 @@ impl ContainerRuntime for BollardRuntime {
     fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
         let id = id.to_string();
         Box::pin(async move { self.container_env_impl(&id).await })
+    }
+
+    fn container_memory_limits(&self, id: &str) -> BoxFut<'_, MemoryLimits> {
+        let id = id.to_string();
+        Box::pin(async move { self.container_memory_limits_impl(&id).await })
     }
 
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
@@ -1569,6 +1587,10 @@ impl ContainerRuntime for DockerRuntime {
 
     fn container_env(&self, id: &str) -> BoxFut<'_, Vec<String>> {
         self.0.container_env(id)
+    }
+
+    fn container_memory_limits(&self, id: &str) -> BoxFut<'_, MemoryLimits> {
+        self.0.container_memory_limits(id)
     }
 
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
@@ -2445,6 +2467,37 @@ mod tests {
 
         assert_eq!(env, vec!["B=2", "A=1"]);
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn container_memory_limits_read_the_host_config_and_default_to_zero() {
+        let limited = ScriptedExecDaemon::start(ExecScript {
+            container_body: r#"{"Id":"c1","HostConfig":{"Memory":8589934592,"MemorySwap":-1}}"#
+                .to_string(),
+            ..ExecScript::default()
+        });
+        let unlimited = ScriptedExecDaemon::start(ExecScript {
+            container_body: r#"{"Id":"c1"}"#.to_string(),
+            ..ExecScript::default()
+        });
+
+        let limits = docker_over(&limited)
+            .container_memory_limits("c1")
+            .await
+            .unwrap();
+        let none = docker_over(&unlimited)
+            .container_memory_limits("c1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            limits,
+            MemoryLimits {
+                memory: 8 * 1024 * 1024 * 1024,
+                memory_swap: -1
+            }
+        );
+        assert_eq!(none, MemoryLimits::default());
     }
 
     /// Live checks for what the scripted daemon cannot show: how a real

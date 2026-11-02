@@ -158,6 +158,15 @@ pub struct ContainerConfig {
     pub extra_hosts: Vec<String>,
 }
 
+/// A container's memory limits in bytes, as the daemon reports them: 0 is no
+/// limit and a swap of -1 is unlimited. With no `--memory-swap`, the daemon
+/// fills in its own swap default, so this swap is not always what was asked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryLimits {
+    pub memory: i64,
+    pub memory_swap: i64,
+}
+
 /// Wraps the env map so `ContainerConfig`'s `Debug` prints keys without values.
 /// Values may be resolved secrets; see the secrets design doc's security rules.
 struct RedactedValues<'a>(&'a HashMap<String, String>);
@@ -441,6 +450,17 @@ pub trait ContainerRuntime: Send + Sync {
         Box::pin(async move {
             Err(DevError::Runtime(format!(
                 "piped exec is not supported by the {name} runtime"
+            )))
+        })
+    }
+
+    /// The memory limits a container was created with, as the runtime reports
+    /// them. The default declines, like `container_env`.
+    fn container_memory_limits(&self, _id: &str) -> BoxFut<'_, MemoryLimits> {
+        let name = self.runtime_name();
+        Box::pin(async move {
+            Err(DevError::Unsupported(format!(
+                "reading a container's memory limits is not supported by the {name} runtime"
             )))
         })
     }

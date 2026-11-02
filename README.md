@@ -347,7 +347,7 @@ previously every `runArg` was parsed and then dropped.)
 | `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
 | `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
 | `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
-| `--memory` | `--memory SIZE`, `--memory=SIZE`, `-m SIZE` | HostConfig `Memory` in bytes; last value wins |
+| `--memory` | `--memory SIZE`, `--memory=SIZE`, `-m SIZE`, `-mSIZE`, `-m=SIZE` | HostConfig `Memory` in bytes; last value wins |
 | `--memory-swap` | `--memory-swap SIZE`, `--memory-swap=SIZE` | HostConfig `MemorySwap` in bytes, `-1` for unlimited; last value wins |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
 | `--init` | `--init` only | HostConfig `Init=true` |
@@ -357,11 +357,20 @@ preserved; repeated duplicate capabilities/security options are sent once in
 stable order after feature-contributed values. Boolean assignments such as
 `--init=true` and `--privileged=false` are rejected; use the bare flag. For
 value-taking two-token forms, the next token must be a non-empty value, not
-another flag. The one exception is `--memory-swap -1`.
+another flag. A negative number after `--memory` or `--memory-swap` is read as
+its value, so `--memory-swap -1` works.
 
-Sizes follow Docker's parser: a number with an optional unit `b`, `k`, `m`, or
-`g`, in binary multiples, case-insensitive, with an optional trailing `b`
-(`16g`, `16GB`, `512m`, `1.5g`). An invalid size fails before side effects.
+Sizes follow Docker's parser (go-units `RAMInBytes`): a number, then an
+optional space and an optional unit `k`, `m`, `g`, `t`, or `p` in binary
+multiples, case-insensitive, optionally followed by `b` or `ib`; a bare `b` means
+bytes (`16g`, `16GB`, `16GiB`, `512m`, `1.5g`). `dev` also checks what the daemon
+would refuse at create: `--memory` under 6m, `--memory-swap` without
+`--memory`, and `--memory-swap` below `--memory` (it is memory plus swap). Both
+checks fail before side effects.
+
+A container keeps the limits it was created with. When `dev up` reuses one whose
+`--memory` or `--memory-swap` differs from the config, it warns and says to run
+`dev up --rebuild`.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
 and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
