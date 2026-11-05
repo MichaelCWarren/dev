@@ -134,19 +134,44 @@ fn remove_site_config(app_name: &str) -> anyhow::Result<()> {
 
 /// Write the root Caddyfile that imports all site fragments (idempotent).
 fn ensure_root_caddyfile() -> anyhow::Result<()> {
-    let path = caddyfile_path();
-    if path.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(caddy_dir())?;
-    std::fs::create_dir_all(caddy_dir().join("sites"))?;
+    ensure_root_caddyfile_in(&caddy_dir())
+}
 
-    let content = format!(
-        "# Managed by dev CLI — do not edit manually\nimport {}/sites/*.caddy\n",
-        caddy_dir().display()
-    );
-    std::fs::write(&path, content)?;
+/// Writes the root Caddyfile into `dir` if it is missing, and upgrades one that still holds
+/// exactly what an older `dev` wrote. Anything else is a hand edit and is left alone.
+fn ensure_root_caddyfile_in(dir: &Path) -> anyhow::Result<()> {
+    let path = dir.join("Caddyfile");
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if existing != legacy_root_caddyfile(dir) => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir.join("sites"))?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    std::fs::write(&path, root_caddyfile(dir))?;
     Ok(())
+}
+
+/// The root Caddyfile: quiet admin logging, then every site fragment.
+///
+/// `exclude admin.api` drops the info line Caddy logs for every admin request. Anything that
+/// polls the admin API (DevPM checks it every 10 seconds) otherwise fills `caddy.log` with
+/// "received request" lines: 8 MB in three days, and unbounded once Caddy runs under a
+/// LaunchAgent instead of being restarted, and its log truncated, by each `caddy start`.
+fn root_caddyfile(dir: &Path) -> String {
+    format!(
+        "# Managed by dev CLI — do not edit manually\n{{\n\tlog default {{\n\t\texclude admin.api\n\t}}\n}}\nimport {}/sites/*.caddy\n",
+        dir.display()
+    )
+}
+
+/// What `dev` wrote before `root_caddyfile` quieted the admin log.
+fn legacy_root_caddyfile(dir: &Path) -> String {
+    format!(
+        "# Managed by dev CLI — do not edit manually\nimport {}/sites/*.caddy\n",
+        dir.display()
+    )
 }
 
 /// Signal Caddy to reload. Best-effort — prints hints if Caddy isn't available.
@@ -321,6 +346,46 @@ mod tests {
             "suggest.chuckos.test"
         );
         assert_eq!(qualify_hostname(" Api.ChuckOS.test "), "api.chuckos.test");
+    }
+
+    #[test]
+    fn a_missing_root_caddyfile_is_written_with_the_admin_log_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_root_caddyfile_in(dir.path()).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("Caddyfile")).unwrap();
+        assert_eq!(written, root_caddyfile(dir.path()));
+        assert!(written.contains("exclude admin.api"));
+        assert!(dir.path().join("sites").is_dir());
+    }
+
+    #[test]
+    fn a_root_caddyfile_an_older_dev_wrote_is_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Caddyfile"),
+            legacy_root_caddyfile(dir.path()),
+        )
+        .unwrap();
+
+        ensure_root_caddyfile_in(dir.path()).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("Caddyfile")).unwrap();
+        assert_eq!(written, root_caddyfile(dir.path()));
+    }
+
+    #[test]
+    fn a_hand_edited_root_caddyfile_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let edited = "{\n\tdebug\n}\nimport sites/*.caddy\n";
+        std::fs::write(dir.path().join("Caddyfile"), edited).unwrap();
+
+        ensure_root_caddyfile_in(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Caddyfile")).unwrap(),
+            edited
+        );
     }
 
     #[test]
