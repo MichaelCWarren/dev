@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 # One in-flight run per branch: pushing a fixup to a PR cancels the superseded
-# run instead of leaving both to finish. Matters most for the macos-latest job,
+# run instead of leaving both to finish. Matters most for the macOS job,
 # which bills at 10x the Linux rate and compiles the whole tonic/prost tree.
 # Pushes to main are exempt, so every commit on the default branch keeps its own
 # pass/fail status for bisecting and release gating.
@@ -64,7 +64,13 @@ jobs:
 
   macos:
     name: Build, test, and lint (macOS, --features apple)
-    runs-on: macos-latest
+    # Intel, not macos-latest. Since 2026-11-02 every arm64 macOS job in this
+    # repo (macos-latest, macos-26 and macos-15 alike) has sat in the queue
+    # and been cancelled after 15 minutes with "The job was not acquired by
+    # Runner of type hosted even after multiple attempts", while Intel jobs
+    # start in seconds. The Apple runtime is gated on target_os, not on the
+    # CPU, so this job still compiles, tests, and lints all of it.
+    runs-on: macos-26-intel
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,14 +89,10 @@ jobs:
           workspaces: . -> target
           key: apple
 
-      # crates/apple-container's build script runs tonic-build, which shells
-      # out to `protoc`. macOS runners do not ship it, and the ubuntu job never
-      # compiles this crate, so this is the only job that needs it.
+      # The ubuntu job never compiles crates/apple-container, so this is the
+      # only CI job that needs protoc.
       - name: Install protoc
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-          HOMEBREW_NO_INSTALL_CLEANUP: 1
-        run: brew install protobuf
+        uses: ./.github/actions/install-protoc
 
       # Covers the macOS-only Apple Containers path gated behind
       # #[cfg(all(target_os = "macos", feature = "apple"))], which the

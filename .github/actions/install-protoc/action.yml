@@ -1,0 +1,27 @@
+name: Install protoc
+description: >-
+  Put a pinned, checksum-verified protoc on the macOS runner and point
+  prost-build at it through PROTOC.
+
+# crates/apple-container's build script runs tonic-build, which shells out to
+# protoc, and macOS runners do not ship it. This used to be `brew install
+# protobuf`, but the macOS jobs now run on Intel and Homebrew no longer bottles
+# everything for Intel, so a brew install could turn into a source build. The
+# universal binary runs on either Mac architecture.
+runs:
+  using: composite
+  steps:
+    - name: Download and verify protoc
+      shell: bash
+      env:
+        PROTOC_VERSION: "36.2"
+        PROTOC_SHA256: 83d0dc80672f53486f54299bca6177159f9cad1fd54d4d3143eeea53c4423e1b
+      run: |
+        set -euo pipefail
+        zip="protoc-$PROTOC_VERSION-osx-universal_binary.zip"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/$zip" \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$zip"
+        echo "$PROTOC_SHA256  $RUNNER_TEMP/$zip" | shasum -a 256 -c -
+        unzip -q -o "$RUNNER_TEMP/$zip" -d "$RUNNER_TEMP/protoc"
+        echo "PROTOC=$RUNNER_TEMP/protoc/bin/protoc" >> "$GITHUB_ENV"
+        "$RUNNER_TEMP/protoc/bin/protoc" --version
