@@ -1,0 +1,20 @@
+name: Probe macOS runner pools
+
+# Temporary: finds which hosted macOS pools hand out a runner right now.
+on:
+  push:
+    branches: [fix/ci-timeout]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-26, macos-15, macos-14, macos-26-intel, macos-15-intel]
+    steps:
+      - run: uname -m && sw_vers
