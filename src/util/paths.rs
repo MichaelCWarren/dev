@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
+fn user_home() -> PathBuf {
+    dirs::home_dir().expect("could not determine home directory")
+}
+
 /// Root of user-level dev config: `~/.dev/`
 pub fn dev_home() -> PathBuf {
-    dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".dev")
+    user_home().join(".dev")
 }
 
 /// Global templates directory: `~/.dev/global/`
@@ -31,6 +33,9 @@ pub fn base_config_dir() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct DevHome {
     root: PathBuf,
+    /// The user's home, for the few files `dev` reads from outside `~/.dev`.
+    /// Under test it is the test root, so those files stay inside the temp tree.
+    user_home: PathBuf,
 }
 
 impl DevHome {
@@ -45,13 +50,20 @@ impl DevHome {
             "tests must use DevHome::at(<tempdir>); DevHome::current() reads the developer's real ~/.dev"
         );
         #[cfg(not(test))]
-        DevHome { root: dev_home() }
+        DevHome {
+            root: dev_home(),
+            user_home: user_home(),
+        }
     }
 
     /// A `~/.dev/`-shaped layout rooted at an arbitrary directory.
     #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        DevHome { root: root.into() }
+        let root = root.into();
+        DevHome {
+            user_home: root.clone(),
+            root,
+        }
     }
 
     /// The global templates directory, `~/.dev/global/`.
@@ -85,6 +97,12 @@ impl DevHome {
     /// upgrades what the next image build installs.
     pub fn staged_feature_dir(&self, name: &str) -> PathBuf {
         self.root.join("features").join(name)
+    }
+
+    /// usher's devcontainer feature, `~/.usher/feature/`. `usherd install`
+    /// writes it, so it always matches the installed usher client.
+    pub fn usher_feature_dir(&self) -> PathBuf {
+        self.user_home.join(".usher/feature")
     }
 
     /// The base config file, `~/.dev/base/devcontainer.json`.

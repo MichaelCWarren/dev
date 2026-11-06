@@ -88,6 +88,7 @@ const MAP_FIELDS: &[&str] = &[
     "cmux",
     "sshAgent",
     "sshServer",
+    "usher",
 ];
 
 /// Fields that are feature maps (special merge: union of keys).
@@ -607,6 +608,22 @@ mod tests {
         let ssh_server = json["sshServer"].as_object().unwrap();
         assert_eq!(ssh_server["enabled"], true);
         assert_eq!(ssh_server["note"], "from base");
+    }
+
+    #[test]
+    fn test_merge_usher_per_sub_key() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"usher": {"note": "from base"}}"#,
+            r#"{"usher": {"enabled": true}}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let usher = json["usher"].as_object().unwrap();
+        assert_eq!(usher["enabled"], true);
+        assert_eq!(usher["note"], "from base");
     }
 
     #[test]

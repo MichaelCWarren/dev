@@ -531,6 +531,33 @@ mod tests {
         assert!(!config.ssh_server_enabled());
     }
 
+    #[test]
+    fn a_base_layer_may_turn_usher_on() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(&home, r#"{"usher": {"enabled": true}}"#);
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(config.usher_enabled());
+    }
+
+    #[test]
+    fn a_project_turns_off_usher_the_base_turned_on() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "usher": {"enabled": false}}"#,
+        );
+        let base_path = write_base_config(&home, r#"{"usher": {"enabled": true}}"#);
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(!config.usher_enabled());
+    }
+
     fn effective_value(
         config_path: &Path,
         include_base: bool,

@@ -201,7 +201,7 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
 | Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
-| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy`, `cmux`, `sshAgent`, `sshServer` |
+| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv`, `caddy`, `cmux`, `sshAgent`, `sshServer`, `usher` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
@@ -593,6 +593,20 @@ To keep T3's `~/.t3/userdata/environment-id` stable across rebuilds, mount a nam
 ### Troubleshooting
 
 The `ssh server` row of `dev status` checks that the alias file is there, that `/usr/sbin/sshd` is in the image, and that a real `ssh` round trip through `ssh-proxy` runs `true`. It reads only the alias file, not your `~/.ssh/config`, so use `ssh -G <alias>` to check the `Include` line.
+
+## usher (`usher`)
+
+[usher](https://github.com/MichaelCWarren/usher) is a job queue on the host that containers send their heavy commands through. `usher.enabled` adds its devcontainer feature to the build:
+
+```sh
+dev base config set usher.enabled true
+```
+
+It is off by default. Like `sshServer`, the base layer may turn it on, and a project's `"usher": {"enabled": false}` turns it off again.
+
+`dev` does not carry this feature. `usherd install` writes it to `~/.usher/feature`, and `dev` builds with that folder, so the feature always matches the usher client you installed. If the key is on and the folder has no `devcontainer-feature.json`, `dev up` and `dev build` stop before they pull or build anything and tell you to run `usherd install --client <path-to-usher-linux-arm64>`. A config that already lists `~/.usher/feature` by absolute path under `features` keeps that entry, and the feature is not added twice.
+
+The feature is baked in at build time, so an existing container needs `dev up --rebuild` once. Upgrading usher rewrites the folder, which changes the project's `devcontainer-lock.json` entry for it on the next build.
 
 ## Local `.test` domains
 
