@@ -1,0 +1,42 @@
+name: Verify release build (temporary)
+
+# Temporary: runs the Release workflow's binaries steps, minus the upload, so
+# the cross-compiled macOS asset is proven before merge. Removed before review.
+on:
+  push:
+    branches: [fix/ci-timeout]
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            features: ""
+          - os: macos-26-intel
+            name: macos-arm64
+            target: aarch64-apple-darwin
+            features: "--features apple"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+          cache: false
+      - if: runner.os == 'macOS'
+        uses: ./.github/actions/install-protoc
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+      - if: runner.os != 'macOS'
+        run: ./target/${{ matrix.target }}/release/dev --version
+      - if: runner.os == 'macOS'
+        run: lipo -verify_arch arm64 target/${{ matrix.target }}/release/dev && file target/${{ matrix.target }}/release/dev
