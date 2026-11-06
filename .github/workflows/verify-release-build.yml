@@ -39,4 +39,4 @@ jobs:
       - if: runner.os != 'macOS'
         run: ./target/${{ matrix.target }}/release/dev --version
       - if: runner.os == 'macOS'
-        run: lipo -verify_arch arm64 target/${{ matrix.target }}/release/dev && file target/${{ matrix.target }}/release/dev
+        run: lipo target/${{ matrix.target }}/release/dev -verify_arch arm64 && file target/${{ matrix.target }}/release/dev

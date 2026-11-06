@@ -269,7 +269,7 @@ jobs:
 
       - name: Check the binary is arm64
         if: runner.os == 'macOS'
-        run: lipo -verify_arch arm64 target/${{ matrix.target }}/release/dev
+        run: lipo target/${{ matrix.target }}/release/dev -verify_arch arm64
 
       - name: Attach it to the draft release
         env:
