@@ -11,6 +11,7 @@ pub mod session;
 pub mod ssh_agent;
 pub mod ssh_server;
 pub mod tui;
+pub mod usher;
 pub mod util;
 
 pub use cli::Cli;

@@ -11,6 +11,7 @@ mod session;
 mod ssh_agent;
 mod ssh_server;
 mod tui;
+mod usher;
 mod util;
 
 use std::path::PathBuf;

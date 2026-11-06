@@ -236,6 +236,9 @@ fn empty_dir(dir: &std::path::Path) {
 /// They are independent keys and each gets its own condition here: a user who
 /// wants one capability must not have to carry another's image layer to get it.
 ///
+/// `usher.enabled` works the same way, except that `usherd install` writes its
+/// feature to `~/.usher/feature` instead of `dev` carrying a copy.
+///
 /// This is the one choke point every build path calls, which is why the
 /// injection lives here rather than at each of `up` and `build`'s call sites.
 /// The relay's layer follows the resolved decision rather than the project's
@@ -264,6 +267,12 @@ pub fn resolve_features_in(
 
     if config.ssh_server_enabled() {
         push_staged(&mut resolved, crate::ssh_server::stage_feature_in(home)?);
+    }
+
+    if let Some(dir) = crate::usher::feature_dir_in(config, home)?
+        && !resolved.iter().any(|f| std::path::Path::new(&f.id) == dir)
+    {
+        push_staged(&mut resolved, dir);
     }
 
     Ok(resolved)
@@ -1946,6 +1955,79 @@ mod tests {
         ];
         let ids: Vec<&str> = ordered.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn usher_adds_the_feature_usherd_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+        let dir = crate::usher::write_test_feature(&home);
+
+        let resolved = resolve_features_in(
+            &config_with(r#"{"usher": {"enabled": true}}"#),
+            &home,
+            RelayDecision::Off,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, dir.to_string_lossy());
+    }
+
+    /// The feature is installed in every row, so only the key can keep it out.
+    #[test]
+    fn without_usher_nothing_is_added_for_it() {
+        for json in [
+            r#"{"image": "alpine"}"#,
+            r#"{"usher": {}}"#,
+            r#"{"usher": {"enabled": false}}"#,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = DevHome::at(tmp.path());
+            crate::usher::write_test_feature(&home);
+            let resolved =
+                resolve_features_in(&config_with(json), &home, RelayDecision::Off).unwrap();
+            assert!(resolved.is_empty(), "{json} added a feature");
+        }
+    }
+
+    #[test]
+    fn usher_on_without_the_feature_fails_to_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let error = resolve_features_in(
+            &config_with(r#"{"usher": {"enabled": true}}"#),
+            &DevHome::at(tmp.path()),
+            RelayDecision::Off,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("usherd install"), "{error}");
+    }
+
+    /// A config that already names the feature by path, as stock `dev` needed,
+    /// keeps its own entry and options, trailing slash or not.
+    #[test]
+    fn usher_listed_by_path_is_not_added_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DevHome::at(tmp.path());
+        let dir = crate::usher::write_test_feature(&home);
+        for listed in [
+            dir.to_string_lossy().into_owned(),
+            format!("{}/", dir.display()),
+        ] {
+            let mut config = config_with(r#"{"usher": {"enabled": true}}"#);
+            config.features = Some(HashMap::from([(
+                listed.clone(),
+                serde_json::json!({"note": "mine"}),
+            )]));
+
+            let resolved = resolve_features_in(&config, &home, RelayDecision::Off).unwrap();
+
+            assert_eq!(resolved.len(), 1, "{listed}");
+            assert_eq!(resolved[0].id, listed);
+            assert_eq!(resolved[0].options["note"], "mine");
+        }
     }
 
     /// Reference form a local feature directory is named by in devcontainer.json.

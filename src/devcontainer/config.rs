@@ -197,6 +197,8 @@ pub struct DevcontainerConfig {
     pub ssh_agent: Option<SshAgentSettings>,
     /// SSH server configuration.
     pub ssh_server: Option<SshServerSettings>,
+    /// usher job queue configuration.
+    pub usher: Option<UsherSettings>,
 }
 
 /// Configuration for cloning a dotfiles repository into the container.
@@ -258,6 +260,18 @@ pub struct SshServerSettings {
     pub enabled: bool,
 }
 
+/// A dev-only extension, not part of the devcontainer spec, so other tooling
+/// ignores it.
+///
+/// The base layer may turn this on, like `sshServer`. The feature it adds is
+/// not carried by `dev`: `usherd install` writes it to `~/.usher/feature`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsherSettings {
+    /// Whether to add usher's devcontainer feature to the build.
+    pub enabled: bool,
+}
+
 impl DevcontainerConfig {
     /// Read and parse a devcontainer.json file (supports JSONC with comments).
     pub fn from_path(path: &Path) -> Result<Self, DevError> {
@@ -302,6 +316,11 @@ impl DevcontainerConfig {
     /// True only when `sshServer.enabled` is present and true.
     pub fn ssh_server_enabled(&self) -> bool {
         self.ssh_server.as_ref().is_some_and(|s| s.enabled)
+    }
+
+    /// True only when `usher.enabled` is present and true.
+    pub fn usher_enabled(&self) -> bool {
+        self.usher.as_ref().is_some_and(|u| u.enabled)
     }
 
     /// Returns the effective workspace bind-mount target inside the container,
@@ -436,6 +455,7 @@ mod workspace_mount_tests {
             cmux: None,
             ssh_agent: None,
             ssh_server: None,
+            usher: None,
         }
     }
 
@@ -904,5 +924,23 @@ mod tests {
             assert!(!parse(json).ssh_server_enabled(), "{json} turned it on");
         }
         assert!(parse(r#"{"sshServer": {"enabled": true}}"#).ssh_server_enabled());
+    }
+
+    #[test]
+    fn usher_parses_the_enabled_flag() {
+        let config = parse(r#"{"usher": {"enabled": true}}"#);
+        assert!(config.usher.unwrap().enabled);
+    }
+
+    #[test]
+    fn usher_enabled_requires_present_true() {
+        for json in [
+            r#"{"image": "alpine:latest"}"#,
+            r#"{"usher": {}}"#,
+            r#"{"usher": {"enabled": false}}"#,
+        ] {
+            assert!(!parse(json).usher_enabled(), "{json} turned it on");
+        }
+        assert!(parse(r#"{"usher": {"enabled": true}}"#).usher_enabled());
     }
 }

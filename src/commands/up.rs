@@ -370,6 +370,9 @@ pub(crate) async fn run_with_runtime_with_providers(
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
     let ssh_alias = SshAliasPlan::decide(&config, no_base);
+    // `resolve_features_in` checks this too, but only after a rebuild has removed the
+    // old container or Compose has built its services.
+    crate::usher::feature_dir_in(&config, dev_home)?;
 
     // Two files decide the relay and only one of them is the project's, so
     // resolve it once here: the image layer, the listener, and a reused
@@ -9771,6 +9774,28 @@ mod tests {
         assert_eq!(ssh_alias_text(&dev_home, &workspace), before);
         assert!(dev_home.ssh_client_key(&hash).exists());
         assert!(dev_home.ssh_host_key(&hash).exists());
+    }
+
+    /// Feature resolution comes after a rebuild removes the old container, so a
+    /// missing usher feature has to be caught before that.
+    #[tokio::test]
+    async fn up_with_usher_missing_fails_before_initialize_command() {
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("initialized");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized","usher":{"enabled":true}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+
+        let err = run_up_with_base(&rt, &workspace, &DevHome::at(home.path()), false)
+            .await
+            .expect_err("a missing usher feature must stop dev up");
+
+        assert!(format!("{err}").contains("usherd install"), "{err}");
+        assert!(!marker.exists(), "initializeCommand must not run");
+        assert!(!rt.create_was_attempted());
     }
 
     #[tokio::test(start_paused = true)]

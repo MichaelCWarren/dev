@@ -174,6 +174,7 @@ mod tests {
             cmux: None,
             ssh_agent: None,
             ssh_server: None,
+            usher: None,
         }
     }
 

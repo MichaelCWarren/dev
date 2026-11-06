@@ -168,6 +168,10 @@
   read the real home, so neither surfaced as a failure. The rule generalizes past `DevHome` —
   `wanted_endpoint_from` exists as a seam beside `wanted_endpoint` because `SSH_AUTH_SOCK` had
   the same shape. Check the call tree, not the signature.
+- `usher.enabled` builds with `~/.usher/feature`, which `usherd install` writes; `dev` embeds no
+  copy. Files outside `~/.dev` go through `DevHome` too (`usher_feature_dir`): `DevHome::at(root)`
+  makes `root` the user home as well, so tests never read the real `~/.usher`. `dev up` checks the
+  folder early because `resolve_features_in` runs after a rebuild has removed the old container.
 - Under `#[cfg(test)]`, `DevHome::current()` panics. Before that guard, `up.rs` helpers went
   through `run_with_runtime` (real home, `with_builtins`), and once the user's base declared an
   `op` secret every `cargo test` raised Touch ID prompts. Never weaken the guard to pass a test;
